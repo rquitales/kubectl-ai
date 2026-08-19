@@ -612,3 +612,19 @@ func TestAgentHandleModelChoice(t *testing.T) {
 		t.Errorf("Model changed on invalid selection: %q", a.Model)
 	}
 }
+
+func TestAgentToggleSkipPermissions(t *testing.T) {
+	a := &Agent{}
+	if got := a.ToggleSkipPermissions(); got != true {
+		t.Errorf("first toggle = %v, want true", got)
+	}
+	if !a.SkipPermissionsEnabled() {
+		t.Error("expected SkipPermissionsEnabled true after toggle")
+	}
+	if got := a.ToggleSkipPermissions(); got != false {
+		t.Errorf("second toggle = %v, want false", got)
+	}
+	if a.SkipPermissionsEnabled() {
+		t.Error("expected SkipPermissionsEnabled false after second toggle")
+	}
+}
