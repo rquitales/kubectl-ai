@@ -15,6 +15,7 @@
 package ui
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"os"
@@ -292,27 +293,27 @@ func TestHistoryNavigation(t *testing.T) {
 	m := newModel(nil)
 	m.messages = historyTestMessages()
 
-	press := func(k tea.KeyType) {
-		_, _ = m.handleKey(tea.KeyMsg{Type: k})
+	press := func(k tea.KeyType, alt bool) {
+		_, _ = m.handleKey(tea.KeyMsg{Type: k, Alt: alt})
 	}
 
-	press(tea.KeyCtrlP)
+	press(tea.KeyUp, true)
 	if got := m.input.Value(); got != "second query" {
-		t.Errorf("after 1st ctrl+p: input = %q, want %q", got, "second query")
+		t.Errorf("after 1st alt+up: input = %q, want %q", got, "second query")
 	}
-	press(tea.KeyCtrlP)
+	press(tea.KeyUp, true)
 	if got := m.input.Value(); got != "first query" {
-		t.Errorf("after 2nd ctrl+p: input = %q, want %q", got, "first query")
+		t.Errorf("after 2nd alt+up: input = %q, want %q", got, "first query")
 	}
-	press(tea.KeyCtrlP) // at oldest: stays
+	press(tea.KeyUp, true) // at oldest: stays
 	if got := m.input.Value(); got != "first query" {
 		t.Errorf("at oldest: input = %q, want %q", got, "first query")
 	}
-	press(tea.KeyCtrlN)
+	press(tea.KeyDown, true)
 	if got := m.input.Value(); got != "second query" {
-		t.Errorf("after ctrl+n: input = %q, want %q", got, "second query")
+		t.Errorf("after alt+down: input = %q, want %q", got, "second query")
 	}
-	press(tea.KeyCtrlN) // past newest: restores (empty) draft
+	press(tea.KeyDown, true) // past newest: restores (empty) draft
 	if got := m.input.Value(); got != "" {
 		t.Errorf("past newest: input = %q, want %q", got, "")
 	}
@@ -326,11 +327,11 @@ func TestHistoryRestoresDraft(t *testing.T) {
 	m.messages = historyTestMessages()
 
 	m.input.SetValue("my draft")
-	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlP})
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyUp, Alt: true})
 	if got := m.input.Value(); got != "second query" {
 		t.Fatalf("after ctrl+p: input = %q, want %q", got, "second query")
 	}
-	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlN})
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyDown, Alt: true})
 	if got := m.input.Value(); got != "my draft" {
 		t.Errorf("after ctrl+n: input = %q, want draft %q", got, "my draft")
 	}
@@ -840,5 +841,136 @@ func TestMultipleSameSizePastesExpandInInsertionOrder(t *testing.T) {
 	want := "first\npaste\nhere\n\nand\n\nsecond\npaste\nhere"
 	if query != want {
 		t.Errorf("query = %q, want %q", query, want)
+	}
+}
+
+func TestEscInterruptsRunningAgent(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateRunning}}
+	m := newModel(a)
+
+	runCtx := a.StartRun(context.Background())
+	_, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyEsc})
+	if cmd == nil {
+		t.Fatal("expected an interrupt command")
+	}
+	go cmd()
+	select {
+	case <-runCtx.Done():
+	case <-time.After(time.Second):
+		t.Error("expected esc to cancel the running agent")
+	}
+	// The input must NOT be cleared by an interrupt.
+	if m.input.Value() != "" {
+		t.Error("expected input untouched by interrupt")
+	}
+}
+
+func TestEscClearsInputWhenIdle(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.input.SetValue("draft")
+
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyEsc})
+	if got := m.input.Value(); got != "" {
+		t.Errorf("expected esc to clear input when idle, got %q", got)
+	}
+}
+
+func TestEscDeclinesPermissionPrompt(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateWaitingForInput}, Input: make(chan any, 1)}
+	m := newModel(a)
+	m.inChoiceMode = true
+	m.choiceType = "confirm"
+
+	_, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyEsc})
+	if m.inChoiceMode {
+		t.Error("expected choice mode to close on esc")
+	}
+	if cmd == nil {
+		t.Fatal("expected a decline command")
+	}
+	go cmd()
+	got := <-a.Input
+	resp, ok := got.(*api.UserChoiceResponse)
+	if !ok {
+		t.Fatalf("expected *api.UserChoiceResponse, got %T", got)
+	}
+	if resp.Choice != 3 {
+		t.Errorf("expected decline (choice 3), got %d", resp.Choice)
+	}
+}
+
+func TestPaletteOpenNavigateClose(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.width, m.height = 100, 40
+	m.resize()
+
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlP})
+	if !m.paletteOpen {
+		t.Fatal("expected palette to open on ctrl+p")
+	}
+	if got := m.View(); !strings.Contains(got, "Commands") {
+		t.Error("expected palette to render in the view")
+	}
+
+	n := len(m.paletteItems())
+	if n == 0 {
+		t.Fatal("expected palette items")
+	}
+	_, _ = m.handlePaletteKey(tea.KeyMsg{Type: tea.KeyDown})
+	if m.paletteIndex != 1 {
+		t.Errorf("paletteIndex = %d, want 1", m.paletteIndex)
+	}
+	_, _ = m.handlePaletteKey(tea.KeyMsg{Type: tea.KeyUp})
+	if m.paletteIndex != 0 {
+		t.Errorf("paletteIndex = %d, want 0", m.paletteIndex)
+	}
+	// Wrap around.
+	_, _ = m.handlePaletteKey(tea.KeyMsg{Type: tea.KeyUp})
+	if m.paletteIndex != n-1 {
+		t.Errorf("paletteIndex = %d, want %d (wrapped)", m.paletteIndex, n-1)
+	}
+
+	_, _ = m.handlePaletteKey(tea.KeyMsg{Type: tea.KeyEsc})
+	if m.paletteOpen {
+		t.Error("expected palette to close on esc")
+	}
+}
+
+func TestPaletteModelSendsSlashQuery(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}, Input: make(chan any, 1)}
+	m := newModel(a)
+
+	// Find the Switch model action and run it.
+	var item *paletteItem
+	for i, it := range m.paletteItems() {
+		if it.label == "Switch model" {
+			item = &m.paletteItems()[i]
+			break
+		}
+	}
+	if item == nil {
+		t.Fatal("expected a Switch model action")
+	}
+	_, cmd := item.run(&m)
+	if cmd == nil {
+		t.Fatal("expected a command")
+	}
+	go cmd()
+	got := <-a.Input
+	resp, ok := got.(*api.UserInputResponse)
+	if !ok || resp.Query != "/model" {
+		t.Errorf("expected /model query, got %v", got)
+	}
+}
+
+func TestPaletteAutoModeToggleInstant(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+
+	_, _ = m.toggleAutoMode()
+	if !a.SkipPermissionsEnabled() {
+		t.Error("expected auto mode on after palette toggle")
 	}
 }

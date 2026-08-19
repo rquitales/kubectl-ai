@@ -628,3 +628,26 @@ func TestAgentToggleSkipPermissions(t *testing.T) {
 		t.Error("expected SkipPermissionsEnabled false after second toggle")
 	}
 }
+
+func TestAgentCancelRun(t *testing.T) {
+	a := &Agent{}
+	if a.CancelRun() {
+		t.Error("expected CancelRun false with no run in progress")
+	}
+
+	ctx := a.StartRun(context.Background())
+	if !a.CancelRun() {
+		t.Error("expected CancelRun true during a run")
+	}
+	if ctx.Err() == nil {
+		t.Error("expected run context to be cancelled")
+	}
+	if !a.interruptRequested(context.Canceled) {
+		t.Error("expected interruptRequested to detect the cancellation")
+	}
+
+	a.endRun()
+	if a.CancelRun() {
+		t.Error("expected CancelRun false after endRun")
+	}
+}
