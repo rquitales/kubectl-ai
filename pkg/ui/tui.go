@@ -188,12 +188,16 @@ const (
 )
 
 // pastedBlock holds the contents of a large paste. Instead of flooding the
-// input with the full text, the paste is attached to the draft and shown as
-// a compact "[+N lines]" chip below the input (like opencode). The attached
-// content is appended to the message when it is submitted.
+// input with the full text, a compact "[+N lines]" placeholder token is
+// inserted at the cursor in the draft (like opencode), so users can keep
+// typing before or after it. On submit the token expands back to the full
+// content in place, preserving the order the user arranged. If the input is
+// nearly full, the paste falls back to a bottom-attached chip (token == "")
+// appended on submit.
 type pastedBlock struct {
 	id      int
 	lines   int
+	token   string // empty for chip-fallback blocks
 	content string
 }
 
@@ -553,8 +557,11 @@ func (m *model) inputBlockHeight() int {
 		return 3 // one-line hint/spinner box + 2 borders
 	}
 	h := m.inputHeight + 2 // +2 for the box borders
-	if len(m.pastes) > 0 {
-		h++ // paste attachment chips line
+	for _, p := range m.pastes {
+		if p.token == "" {
+			h++ // chip-fallback pastes line
+			break
+		}
 	}
 	return h
 }
@@ -700,7 +707,18 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.inChoiceMode {
 			return m, nil
 		}
-		// With an empty input, Backspace detaches the most recent paste.
+		// Backspace right after an inline paste placeholder removes the
+		// whole placeholder and its paste (like deleting an attachment in
+		// opencode).
+		if m.input.Line() == m.input.LineCount()-1 {
+			if token, ok := m.tokenAtEndOfInput(); ok {
+				m.removeToken(token)
+				m.syncInputHeight()
+				return m, nil
+			}
+		}
+		// With an empty input, Backspace detaches the most recent
+		// chip-fallback paste.
 		if m.input.Value() == "" && len(m.pastes) > 0 {
 			m.pastes = m.pastes[:len(m.pastes)-1]
 			m.syncInputHeight()
@@ -828,10 +846,69 @@ func normalizePasteContent(runes []rune) string {
 	return strings.TrimSuffix(content, "\n")
 }
 
-// handlePaste inserts pasted text into the input. Large multi-line pastes are
-// attached to the draft and shown as a compact "[+N lines]" chip below the
-// input (like opencode) instead of flooding the input; the attached content
-// is appended to the message on submit. Short pastes are inserted verbatim.
+// tokenAtEndOfInput returns the paste placeholder token (if any) that the
+// current input value ends with.
+func (m *model) tokenAtEndOfInput() (string, bool) {
+	value := m.input.Value()
+	for i := len(m.pastes) - 1; i >= 0; i-- {
+		if t := m.pastes[i].token; t != "" && strings.HasSuffix(value, t) {
+			return t, true
+		}
+	}
+	return "", false
+}
+
+// removeToken removes the last paste block with the given placeholder token
+// and deletes the token text (and its separator space) from the input.
+func (m *model) removeToken(token string) {
+	v := strings.TrimSuffix(m.input.Value(), token)
+	v = strings.TrimSuffix(v, " ") // the separator added at insert time
+	m.input.SetValue(v)
+	for i := len(m.pastes) - 1; i >= 0; i-- {
+		if m.pastes[i].token == token {
+			m.pastes = append(m.pastes[:i], m.pastes[i+1:]...)
+			return
+		}
+	}
+}
+
+// expandPasteToken replaces the first occurrence of token in value with
+// content, separating the pasted content from adjacent typed text with a
+// blank line when they would otherwise be glued together.
+func expandPasteToken(value, token, content string) string {
+	idx := strings.Index(value, token)
+	if idx < 0 {
+		return value
+	}
+	end := idx + len(token)
+
+	pre := ""
+	if idx > 0 {
+		if value[idx-1] == ' ' || value[idx-1] == '\t' {
+			idx-- // absorb the space into the separator
+			pre = "\n\n"
+		} else if value[idx-1] != '\n' {
+			pre = "\n\n"
+		}
+	}
+	post := ""
+	if end < len(value) {
+		if value[end] == ' ' || value[end] == '\t' {
+			end++ // absorb the space into the separator
+			post = "\n\n"
+		} else if value[end] != '\n' {
+			post = "\n\n"
+		}
+	}
+	return value[:idx] + pre + content + post + value[end:]
+}
+
+// handlePaste inserts pasted text into the input. Large multi-line pastes
+// are collapsed into a compact "[+N lines]" placeholder token inserted at
+// the cursor (like opencode), so the user can keep typing before or after
+// the paste; the token expands back to the full content on submit. If the
+// token doesn't fit (CharLimit), the paste attaches as a bottom chip
+// instead. Short pastes are inserted verbatim.
 func (m *model) handlePaste(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.inChoiceMode {
 		return m, nil
@@ -844,7 +921,19 @@ func (m *model) handlePaste(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	if n := strings.Count(content, "\n") + 1; n >= pasteCollapseLines {
 		m.nextPasteID++
-		m.pastes = append(m.pastes, pastedBlock{id: m.nextPasteID, lines: n, content: content})
+		token := fmt.Sprintf("[+%d lines]", n)
+		block := pastedBlock{id: m.nextPasteID, lines: n, content: content}
+		// Insert the placeholder inline at the cursor when it fits;
+		// otherwise attach it as a bottom chip.
+		if m.input.CharLimit == 0 || m.input.CharLimit-m.input.Length() >= len(token) {
+			block.token = token
+			// Keep a space between the token and preceding text.
+			if v := m.input.Value(); v != "" && !strings.HasSuffix(v, " ") && !strings.HasSuffix(v, "\n") {
+				m.input.InsertString(" ")
+			}
+			m.input.InsertString(token)
+		}
+		m.pastes = append(m.pastes, block)
 	} else {
 		m.input.InsertString(content)
 	}
@@ -1002,15 +1091,24 @@ func (m *model) handleEnter() (tea.Model, tea.Cmd) {
 	}
 
 	value := m.input.Value()
-	// Attach the full content of collapsed pastes to the submitted message.
-	if len(m.pastes) > 0 {
+	// Expand inline paste placeholders back to their full content, in
+	// insertion order (so typed text and pastes keep the order the user
+	// arranged). Placeholders the user deleted simply drop their paste.
+	// Chip-fallback blocks (no token) are appended at the end.
+	var tail []string
+	for _, p := range m.pastes {
+		if p.token != "" {
+			value = expandPasteToken(value, p.token, p.content)
+		} else {
+			tail = append(tail, p.content)
+		}
+	}
+	if len(tail) > 0 {
 		var parts []string
 		if strings.TrimSpace(value) != "" {
 			parts = append(parts, value)
 		}
-		for _, p := range m.pastes {
-			parts = append(parts, p.content)
-		}
+		parts = append(parts, tail...)
 		value = strings.Join(parts, "\n\n")
 	}
 	value = strings.TrimSpace(value)
@@ -1460,13 +1558,18 @@ func (m model) viewInput(state api.AgentState) string {
 	}
 	content := strings.Join(lines, "\n")
 
-	// Collapsed pastes are shown as chips below the input.
+	// Chip-fallback pastes (those that didn't fit inline) are shown as
+	// chips below the input.
 	if len(m.pastes) > 0 {
-		chips := make([]string, len(m.pastes))
-		for i, p := range m.pastes {
-			chips[i] = warnText.Render(fmt.Sprintf("[+%d lines]", p.lines))
+		var chips []string
+		for _, p := range m.pastes {
+			if p.token == "" {
+				chips = append(chips, warnText.Render(fmt.Sprintf("[+%d lines]", p.lines)))
+			}
 		}
-		content += "\n" + strings.Join(chips, " ")
+		if len(chips) > 0 {
+			content += "\n" + strings.Join(chips, " ")
+		}
 	}
 
 	return lipgloss.NewStyle().Padding(0, 1).Render(inputBox.Width(m.width - 4).Render(content))

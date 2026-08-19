@@ -49,9 +49,12 @@ func TestHandlePasteCollapsesLargePastes(t *testing.T) {
 	if m.pastes[0].lines != 4 {
 		t.Errorf("stored paste lines = %d, want 4", m.pastes[0].lines)
 	}
-	// The paste must NOT flood the input; it is attached as a chip.
-	if got := m.input.Value(); got != "" {
-		t.Errorf("input value = %q, want empty (paste attached as chip)", got)
+	if m.pastes[0].token != "[+4 lines]" {
+		t.Errorf("stored paste token = %q, want %q", m.pastes[0].token, "[+4 lines]")
+	}
+	// The paste must NOT flood the input; only a placeholder is inserted.
+	if got := m.input.Value(); got != "[+4 lines]" {
+		t.Errorf("input value = %q, want placeholder token", got)
 	}
 }
 
@@ -773,5 +776,69 @@ func TestCtrlYWritesOSC52(t *testing.T) {
 	}
 	if len(m.messages) == 0 || m.messages[len(m.messages)-1].Payload != "📋 Copied last response to clipboard." {
 		t.Error("expected a transcript confirmation message")
+	}
+}
+
+func TestTypeAfterPastePreservesOrder(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}, Input: make(chan any, 1)}
+	m := newModel(a)
+
+	// Paste first, then type a message after it.
+	_, _ = m.handleKey(pasteMsg("line one\nline two\nline three"))
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("what is wrong with this pod?")})
+
+	_, cmd := m.handleEnter()
+	if cmd == nil {
+		t.Fatal("expected a submit command")
+	}
+	go cmd()
+	got := <-a.Input
+	query := got.(*api.UserInputResponse).Query
+	want := "line one\nline two\nline three\n\nwhat is wrong with this pod?"
+	if query != want {
+		t.Errorf("query = %q, want %q", query, want)
+	}
+}
+
+func TestExpansionSeparatesGluedTextAndPaste(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}, Input: make(chan any, 1)}
+	m := newModel(a)
+
+	// Type first, paste immediately after: the submitted message must
+	// separate them with a blank line, not glue them.
+	m.input.SetValue("explain this")
+	_, _ = m.handleKey(pasteMsg("a\nb\nc\nd"))
+
+	_, cmd := m.handleEnter()
+	if cmd == nil {
+		t.Fatal("expected a submit command")
+	}
+	go cmd()
+	got := <-a.Input
+	query := got.(*api.UserInputResponse).Query
+	want := "explain this\n\na\nb\nc\nd"
+	if query != want {
+		t.Errorf("query = %q, want %q", query, want)
+	}
+}
+
+func TestMultipleSameSizePastesExpandInInsertionOrder(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}, Input: make(chan any, 1)}
+	m := newModel(a)
+
+	_, _ = m.handleKey(pasteMsg("first\npaste\nhere"))
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(" and ")})
+	_, _ = m.handleKey(pasteMsg("second\npaste\nhere"))
+
+	_, cmd := m.handleEnter()
+	if cmd == nil {
+		t.Fatal("expected a submit command")
+	}
+	go cmd()
+	got := <-a.Input
+	query := got.(*api.UserInputResponse).Query
+	want := "first\npaste\nhere\n\nand\n\nsecond\npaste\nhere"
+	if query != want {
+		t.Errorf("query = %q, want %q", query, want)
 	}
 }
