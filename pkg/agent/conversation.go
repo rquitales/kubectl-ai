@@ -133,6 +133,10 @@ type Agent struct {
 	// lastErr is the most recent error run into, for use across the stack
 	lastErr error
 
+	// pendingModelChoice, when non-nil, holds the model IDs offered by an
+	// open /model picker; the next UserChoiceResponse selects among them.
+	pendingModelChoice []string
+
 	// cancel is the function to cancel the agent's context
 	cancel context.CancelFunc
 }
@@ -286,6 +290,29 @@ func (s *Agent) Init(ctx context.Context) error {
 	s.Tools.RegisterTool(tools.NewBashTool(s.executor))
 	s.Tools.RegisterTool(tools.NewKubectlTool(s.executor))
 
+	if err := s.rebuildChat(ctx); err != nil {
+		return err
+	}
+
+	if s.MCPClientEnabled {
+		if err := s.InitializeMCPClient(ctx); err != nil {
+			klog.Errorf("Failed to initialize MCP client: %v", err)
+			return fmt.Errorf("failed to initialize MCP client: %w", err)
+		}
+
+		// Update MCP status in session
+		if err := s.UpdateMCPStatus(ctx, s.MCPClientEnabled); err != nil {
+			klog.Warningf("Failed to update MCP status: %v", err)
+		}
+	}
+
+	return nil
+}
+
+// rebuildChat (re)creates the LLM chat for the current model with the full
+// system prompt and the session's conversation history. Used at Init time
+// and when switching models mid-session.
+func (s *Agent) rebuildChat(ctx context.Context) error {
 	systemPrompt, err := s.generatePrompt(ctx, defaultSystemPromptTemplate, PromptData{
 		Tools:             s.Tools,
 		EnableToolUseShim: s.EnableToolUseShim,
@@ -307,21 +334,8 @@ func (s *Agent) Init(ctx context.Context) error {
 			Jitter:         true,
 		},
 	)
-	err = s.llmChat.Initialize(s.Session.ChatMessageStore.ChatMessages())
-	if err != nil {
+	if err := s.llmChat.Initialize(s.Session.ChatMessageStore.ChatMessages()); err != nil {
 		return fmt.Errorf("initializing chat session: %w", err)
-	}
-
-	if s.MCPClientEnabled {
-		if err := s.InitializeMCPClient(ctx); err != nil {
-			klog.Errorf("Failed to initialize MCP client: %v", err)
-			return fmt.Errorf("failed to initialize MCP client: %w", err)
-		}
-
-		// Update MCP status in session
-		if err := s.UpdateMCPStatus(ctx, s.MCPClientEnabled); err != nil {
-			klog.Warningf("Failed to update MCP status: %v", err)
-		}
 	}
 
 	if !s.EnableToolUseShim {
@@ -564,6 +578,10 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 						continue
 
 					case *api.UserChoiceResponse:
+						if c.pendingModelChoice != nil {
+							c.handleModelChoice(ctx, response)
+							continue
+						}
 						dispatchToolCalls := c.handleChoice(ctx, response)
 						if dispatchToolCalls {
 							if err := c.DispatchToolCalls(ctx); err != nil {
@@ -909,7 +927,8 @@ func (c *Agent) handleMetaQuery(ctx context.Context, query string) (answer strin
 		c.setAgentState(api.AgentStateExited)
 		return "It has been a pleasure assisting you. Have a great day!", true, nil
 	case "model":
-		return "Current model is `" + c.Model + "`", true, nil
+		// Bare "model" opens an interactive model picker.
+		return c.openModelPicker(ctx)
 	case "models":
 		models, err := c.listModels(ctx)
 		if err != nil {
@@ -979,6 +998,17 @@ func (c *Agent) handleMetaQuery(ctx context.Context, query string) (answer strin
 			return "", false, err
 		}
 		return fmt.Sprintf("Resumed session %s.", sessionID), true, nil
+	}
+
+	if strings.HasPrefix(query, "model ") {
+		modelID := strings.TrimSpace(strings.TrimPrefix(query, "model "))
+		if modelID == "" {
+			return "Invalid command. Usage: model <model_id>", true, nil
+		}
+		if err := c.switchModel(ctx, modelID); err != nil {
+			return "", false, err
+		}
+		return fmt.Sprintf("Switched to model `%s`.", modelID), true, nil
 	}
 
 	if query == "rename-session" || strings.HasPrefix(query, "rename-session ") {
@@ -1171,6 +1201,94 @@ func (c *Agent) LoadSession(sessionID string) error {
 		}
 	}
 
+	return nil
+}
+
+// openModelPicker presents an interactive picker of the provider's models
+// (used by the bare "model" meta query).
+func (c *Agent) openModelPicker(ctx context.Context) (answer string, handled bool, err error) {
+	models, err := c.listModels(ctx)
+	if err != nil {
+		return "", false, fmt.Errorf("listing models: %w", err)
+	}
+	if len(models) == 0 {
+		return fmt.Sprintf("Current model is `%s` (no models reported by the provider).", c.Model), true, nil
+	}
+
+	options := make([]api.UserChoiceOption, len(models))
+	for i, m := range models {
+		label := m
+		if m == c.Model {
+			label = m + " (current)"
+		}
+		options[i] = api.UserChoiceOption{Label: label, Value: m}
+	}
+
+	c.pendingModelChoice = models
+	c.setAgentState(api.AgentStateWaitingForInput)
+	c.addMessage(api.MessageSourceAgent, api.MessageTypeUserChoiceRequest, &api.UserChoiceRequest{
+		Prompt:  "Select a model:",
+		Options: options,
+	})
+	return "", true, nil
+}
+
+// handleModelChoice applies the selection from an open /model picker.
+func (c *Agent) handleModelChoice(ctx context.Context, response *api.UserChoiceResponse) {
+	models := c.pendingModelChoice
+	c.pendingModelChoice = nil
+	c.setAgentState(api.AgentStateDone)
+
+	idx := response.Choice - 1
+	if idx < 0 || idx >= len(models) {
+		c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Invalid model selection.")
+		return
+	}
+	if err := c.switchModel(ctx, models[idx]); err != nil {
+		c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error switching model: "+err.Error())
+		return
+	}
+	c.addMessage(api.MessageSourceAgent, api.MessageTypeText, fmt.Sprintf("Switched to model `%s`.", models[idx]))
+}
+
+// switchModel changes the current model, preserving the conversation: the
+// session's ModelID is updated and persisted, and the chat is rebuilt with
+// the full history and tool definitions.
+func (c *Agent) switchModel(ctx context.Context, modelID string) error {
+	models, err := c.listModels(ctx)
+	if err != nil {
+		return fmt.Errorf("listing models: %w", err)
+	}
+	found := false
+	for _, m := range models {
+		if m == modelID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("unknown model %q. Available models: %s", modelID, strings.Join(models, ", "))
+	}
+
+	c.sessionMu.Lock()
+	c.Model = modelID
+	c.Session.ModelID = modelID
+	c.Session.LastModified = time.Now()
+	session := c.Session
+	c.sessionMu.Unlock()
+
+	// Persist the model change so resumed sessions keep it.
+	manager, err := sessions.NewSessionManager(c.SessionBackend)
+	if err != nil {
+		return fmt.Errorf("failed to create session manager: %w", err)
+	}
+	if err := manager.UpdateLastAccessed(session); err != nil {
+		klog.Warningf("Failed to persist model change for session %q: %v", session.ID, err)
+	}
+
+	if err := c.rebuildChat(ctx); err != nil {
+		return fmt.Errorf("rebuilding chat for model %q: %w", modelID, err)
+	}
 	return nil
 }
 
