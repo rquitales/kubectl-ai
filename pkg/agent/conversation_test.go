@@ -450,3 +450,39 @@ func TestFirstUserMessage(t *testing.T) {
 		t.Errorf("expected truncation with ellipsis, got %q", got)
 	}
 }
+
+func TestNormalizeSlashCommand(t *testing.T) {
+	cases := []struct {
+		in     string
+		want   string
+		wantOK bool
+	}{
+		{"/sessions", "sessions", true},
+		{"/session", "session", true},
+		{"/new", "new-session", true},
+		{"/rename my session", "rename-session my session", true},
+		{"/rename  spaced  name", "rename-session spaced  name", true},
+		{"/resume 20260101-0001", "resume-session 20260101-0001", true},
+		{"/save", "save-session", true},
+		{"/clear", "clear", true},
+		{"/exit", "exit", true},
+		{"/MODELS", "models", true},
+		{"/tools", "tools", true},
+		{"/unknown", "", false},
+		{"/", "", false},
+		{"/foobar some args", "", false},
+	}
+	for _, c := range cases {
+		got, ok := normalizeSlashCommand(c.in)
+		if ok != c.wantOK || got != c.want {
+			t.Errorf("normalizeSlashCommand(%q) = %q, %v; want %q, %v", c.in, got, ok, c.want, c.wantOK)
+		}
+	}
+}
+
+func TestUnknownCommandMessageListsCommands(t *testing.T) {
+	msg := unknownCommandMessage("/nonsense")
+	if !strings.Contains(msg, "/nonsense") || !strings.Contains(msg, "/sessions") || !strings.Contains(msg, "/rename") {
+		t.Errorf("unexpected unknown-command message: %q", msg)
+	}
+}
