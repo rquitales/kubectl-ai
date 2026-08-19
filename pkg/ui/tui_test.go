@@ -353,7 +353,7 @@ func TestUpMovesCursorWithinMultiLineDraft(t *testing.T) {
 	}
 }
 
-func TestUpDownScrollsViewportOnSingleLineDraft(t *testing.T) {
+func TestPgUpPgDownScrollsViewport(t *testing.T) {
 	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
 	m := newModel(a)
 	m.width, m.height = 100, 24
@@ -373,17 +373,35 @@ func TestUpDownScrollsViewportOnSingleLineDraft(t *testing.T) {
 		t.Fatal("precondition: viewport should be scrolled to the bottom with tall content")
 	}
 
-	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyUp})
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyPgUp})
 	if m.viewport.YOffset >= atBottom {
-		t.Error("expected KeyUp to scroll the viewport up (away from bottom)")
+		t.Error("expected PgUp to scroll the viewport up (away from bottom)")
+	}
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyPgDown})
+	if m.viewport.YOffset != atBottom {
+		t.Errorf("expected PgDown to scroll back to bottom: YOffset = %d, want %d", m.viewport.YOffset, atBottom)
+	}
+}
+
+func TestUpDownRecallsHistory(t *testing.T) {
+	m := newModel(nil)
+	m.messages = historyTestMessages()
+
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyUp})
+	if got := m.input.Value(); got != "second query" {
+		t.Errorf("after up: input = %q, want %q", got, "second query")
+	}
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyUp})
+	if got := m.input.Value(); got != "first query" {
+		t.Errorf("after 2nd up: input = %q, want %q", got, "first query")
 	}
 	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyDown})
-	if m.viewport.YOffset != atBottom {
-		t.Errorf("expected KeyDown to scroll back to bottom: YOffset = %d, want %d", m.viewport.YOffset, atBottom)
+	if got := m.input.Value(); got != "second query" {
+		t.Errorf("after down: input = %q, want %q", got, "second query")
 	}
-	// History must NOT be triggered by plain Up/Down.
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyDown})
 	if got := m.input.Value(); got != "" {
-		t.Errorf("expected input to stay empty on Up/Down scroll, got %q", got)
+		t.Errorf("past newest: input = %q, want empty", got)
 	}
 }
 
