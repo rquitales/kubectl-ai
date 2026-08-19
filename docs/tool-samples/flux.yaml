@@ -1,0 +1,23 @@
+- name: flux
+  description: "The GitOps toolkit for Kubernetes (fluxcd.io). Use it to manage continuous delivery of cluster resources and applications from Git, Helm, OCI, or S3-compatible sources."
+  command: "flux"
+  command_desc: |
+    The flux command-line interface. Most commands accept a namespace via `-n/--namespace`; flux controllers usually run in the `flux-system` namespace.
+
+    Core subcommands and usage patterns:
+    - `flux check`: Run pre-flight checks to verify the cluster and flux installation are healthy.
+    - `flux version`: Print the flux CLI and installed controller versions.
+    - `flux get sources all`: List all sources (GitRepository, HelmRepository, Bucket, OCIRepository) managed by flux.
+    - `flux get source git <name> [flags]`: Show details of a Git source; also `helm`, `bucket`, `oci` for other source kinds.
+    - `flux get kustomizations [flags]`: List all Kustomizations (alias: `flux get ks`).
+    - `flux get helmreleases [flags]`: List all HelmReleases (alias: `flux get hr`).
+    - `flux reconcile kustomization <name> [--with-source]`: Trigger reconciliation of a Kustomization, optionally pulling the latest source first (also `helmrelease <name> [--with-source]`).
+    - `flux suspend kustomization <name>`: Pause reconciliation of a Kustomization (also `helmrelease <name>`).
+    - `flux resume kustomization <name>`: Resume reconciliation of a Kustomization (also `helmrelease <name>`).
+    - `flux diff kustomization <name> [flags]`: Show the diff between the cluster state and the source state for a Kustomization.
+    - `flux tree kustomization <name> [flags]`: Show the resource tree (owned objects) of a Kustomization.
+    - `flux export kustomization <name> [flags]`: Print the YAML of a Kustomization or other flux object (e.g. `flux export source git <name>`).
+    - `flux logs [--follow] [--level=info|error]`: Read controller logs, optionally streaming them.
+    - `flux uninstall`: Remove flux components from the cluster (destructive).
+
+    Use `flux --help` or `flux <command> --help` for full syntax and available flags.
