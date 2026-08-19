@@ -212,6 +212,13 @@ const (
 // session browser.
 type sessionRenamedMsg struct{ err error }
 
+// sessionDeletedMsg reports the result of a delete attempt from the
+// session browser.
+type sessionDeletedMsg struct {
+	id  string
+	err error
+}
+
 // browserStatusMsg is a transient status line shown in the session browser
 // footer; isErr selects error vs info styling.
 type browserStatusMsg struct {
@@ -301,6 +308,7 @@ type model struct {
 	browserStatus   browserStatusMsg // transient info/error shown in the browser footer
 	renaming        bool
 	renameInput     textinput.Model
+	pendingDeleteID string // session staged for deletion, awaiting 'y'
 	// Command palette state
 	paletteOpen  bool
 	paletteIndex int
@@ -432,6 +440,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.openBrowser([]api.SessionInfo(msg))
 		m.updateViewportHeight()
 		return m, nil
+
+	case sessionDeletedMsg:
+		if msg.err != nil {
+			m.setBrowserStatus("Delete failed: "+msg.err.Error(), true)
+			return m, nil
+		}
+		m.setBrowserStatus("Deleted "+msg.id, false)
+		// Refresh the browser contents, keeping the browser open.
+		return m, m.fetchSessions
 
 	case sessionRenamedMsg:
 		if msg.err != nil {
@@ -1171,6 +1188,21 @@ func (m *model) handleBrowserKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// A staged delete confirmation captures y/n before anything else.
+	if m.pendingDeleteID != "" {
+		if msg.String() == "y" {
+			id := m.pendingDeleteID
+			m.pendingDeleteID = ""
+			return m, func() tea.Msg {
+				return sessionDeletedMsg{err: m.agent.DeleteSession(id), id: id}
+			}
+		}
+		// Anything else cancels.
+		m.pendingDeleteID = ""
+		m.browserStatus = browserStatusMsg{}
+		return m, nil
+	}
+
 	m.browserStatus = browserStatusMsg{}
 
 	// Pastes land in the rename field while renaming; otherwise they would
@@ -1260,6 +1292,21 @@ func (m *model) handleBrowserKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, func() tea.Msg {
 			m.agent.Input <- &api.NewSessionRequest{}
 			return nil
+		}
+	case "d":
+		if m.browserIndex < len(m.browserSessions) {
+			s := m.browserSessions[m.browserIndex]
+			if cur := m.agent.GetSession(); cur != nil && cur.ID == s.ID {
+				m.setBrowserStatus("Can't delete the current session", true)
+				return m, nil
+			}
+			m.pendingDeleteID = s.ID
+			label := s.Name
+			if label == "" {
+				label = s.ID
+			}
+			m.setBrowserStatus(fmt.Sprintf("Delete %q? (y to confirm)", label), true)
+			return m, nil
 		}
 	}
 	return m, nil
@@ -1750,7 +1797,7 @@ func (m model) viewSessionBrowser() string {
 			sb.WriteString(successText.Render(m.browserStatus.text))
 		}
 	default:
-		hint := "↑/↓/j/k: navigate • enter: switch • r: rename • ctrl+n: new • esc: close"
+		hint := "↑/↓/j/k: navigate • enter: switch • r: rename • d: delete • ctrl+n: new • esc: close"
 		if len(m.browserSessions) > m.browserRows() {
 			hint += fmt.Sprintf(" • %d/%d", m.browserIndex+1, len(m.browserSessions))
 		}

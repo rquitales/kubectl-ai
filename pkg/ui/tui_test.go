@@ -1106,3 +1106,108 @@ func TestRenameWithArgsAppliesImmediately(t *testing.T) {
 		t.Errorf("session name = %q, want %q", a.Session.Name, "quick name")
 	}
 }
+
+func TestBrowserDeleteFlow(t *testing.T) {
+	mgr, err := sessions.NewSessionManager("memory")
+	if err != nil {
+		t.Fatalf("NewSessionManager: %v", err)
+	}
+	cur, _ := mgr.NewSession(sessions.Metadata{ModelID: "m"})
+	other, _ := mgr.NewSession(sessions.Metadata{ModelID: "m"})
+	_ = mgr.RenameSession(other.ID, "delete me")
+	t.Cleanup(func() { _ = mgr.DeleteSession(cur.ID); _ = mgr.DeleteSession(other.ID) })
+
+	a := &agent.Agent{
+		Session:        cur,
+		SessionBackend: "memory",
+		Input:          make(chan any, 1),
+	}
+	m := newModel(a)
+	m.width, m.height = 100, 40
+	m.resize()
+
+	sessionsList := []api.SessionInfo{
+		{ID: cur.ID, Name: "current", LastModified: time.Now()},
+		{ID: other.ID, Name: "delete me", LastModified: time.Now().Add(-time.Hour)},
+	}
+	m.openBrowser(sessionsList)
+	m.browserIndex = 1
+
+	// 'd' stages the delete with a confirmation prompt.
+	_, _ = m.handleBrowserKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("d")})
+	if m.pendingDeleteID != other.ID {
+		t.Fatalf("expected pendingDeleteID %q, got %q", other.ID, m.pendingDeleteID)
+	}
+
+	// 'y' confirms and deletes.
+	_, cmd := m.handleBrowserKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	if m.pendingDeleteID != "" {
+		t.Error("expected pending delete to clear after confirm")
+	}
+	if cmd == nil {
+		t.Fatal("expected a delete command")
+	}
+	msg := cmd()
+	if _, ok := msg.(sessionDeletedMsg); !ok {
+		t.Fatalf("expected sessionDeletedMsg, got %T", msg)
+	}
+	if _, err := mgr.FindSessionByID(other.ID); err == nil {
+		t.Error("expected session to be deleted from the store")
+	}
+}
+
+func TestBrowserDeleteCancelOnOtherKey(t *testing.T) {
+	mgr, err := sessions.NewSessionManager("memory")
+	if err != nil {
+		t.Fatalf("NewSessionManager: %v", err)
+	}
+	cur, _ := mgr.NewSession(sessions.Metadata{ModelID: "m"})
+	other, _ := mgr.NewSession(sessions.Metadata{ModelID: "m"})
+	t.Cleanup(func() { _ = mgr.DeleteSession(cur.ID); _ = mgr.DeleteSession(other.ID) })
+
+	a := &agent.Agent{Session: cur, SessionBackend: "memory", Input: make(chan any, 1)}
+	m := newModel(a)
+	m.width, m.height = 100, 40
+	m.resize()
+	m.openBrowser([]api.SessionInfo{{ID: cur.ID, LastModified: time.Now()}, {ID: other.ID, LastModified: time.Now()}})
+	m.browserIndex = 1
+
+	_, _ = m.handleBrowserKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("d")})
+	if m.pendingDeleteID != other.ID {
+		t.Fatal("expected staged delete")
+	}
+	_, cmd := m.handleBrowserKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	if m.pendingDeleteID != "" {
+		t.Error("expected delete to be cancelled on any other key")
+	}
+	if cmd != nil {
+		t.Error("expected no command after cancel")
+	}
+	if _, err := mgr.FindSessionByID(other.ID); err != nil {
+		t.Error("expected session NOT to be deleted after cancel")
+	}
+}
+
+func TestBrowserCannotDeleteCurrentSession(t *testing.T) {
+	mgr, err := sessions.NewSessionManager("memory")
+	if err != nil {
+		t.Fatalf("NewSessionManager: %v", err)
+	}
+	cur, _ := mgr.NewSession(sessions.Metadata{ModelID: "m"})
+	t.Cleanup(func() { _ = mgr.DeleteSession(cur.ID) })
+
+	a := &agent.Agent{Session: cur, SessionBackend: "memory", Input: make(chan any, 1)}
+	m := newModel(a)
+	m.width, m.height = 100, 40
+	m.resize()
+	m.openBrowser([]api.SessionInfo{{ID: cur.ID, LastModified: time.Now()}})
+	m.browserIndex = 0
+
+	_, _ = m.handleBrowserKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("d")})
+	if m.pendingDeleteID != "" {
+		t.Error("expected no staged delete for the current session")
+	}
+	if m.browserStatus.text == "" {
+		t.Error("expected an error status about not deleting the current session")
+	}
+}
