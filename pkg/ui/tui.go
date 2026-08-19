@@ -16,6 +16,7 @@ package ui
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"log"
@@ -118,14 +119,12 @@ type TUI struct {
 }
 
 func NewTUI(agent *agent.Agent) *TUI {
-	// Mouse capture is enabled for smooth wheel scrolling. Text can still be
-	// selected/copied with the terminal's standard bypass for mouse-capturing
-	// apps (hold Shift on most terminals, Option on iTerm2, while dragging) —
-	// the same convention opencode, vim and tmux users are used to. We do NOT
-	// use WithMouseAllMotion: we only care about the wheel, and cell motion
-	// keeps the event volume down.
+	// Mouse capture is intentionally NOT enabled: selecting text with the
+	// mouse copies natively in every terminal (no modifier keys). Scrolling
+	// still works because terminals translate the wheel to arrow keys in
+	// alt-screen mode, which scroll the viewport (plus PgUp/PgDn).
 	return &TUI{
-		program: tea.NewProgram(newModel(agent), tea.WithAltScreen(), tea.WithMouseCellMotion()),
+		program: tea.NewProgram(newModel(agent), tea.WithAltScreen()),
 		agent:   agent,
 	}
 }
@@ -321,10 +320,6 @@ func newModel(agent *agent.Agent) model {
 	// Enter submits the message (handled by us); Ctrl+J or Alt+Enter inserts
 	// a newline.
 	ti.KeyMap.InsertNewline = key.NewBinding(key.WithKeys("ctrl+j", "alt+enter"))
-	// Plain Up/Down are handled by us (input history navigation, and cursor
-	// movement within multi-line drafts); Ctrl+P/N also moves between lines.
-	ti.KeyMap.LinePrevious = key.NewBinding(key.WithKeys("ctrl+p"))
-	ti.KeyMap.LineNext = key.NewBinding(key.WithKeys("ctrl+n"))
 
 	sp := spinner.New()
 	sp.Spinner = spinner.MiniDot
@@ -378,15 +373,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		return m.handleKey(msg)
-
-	case tea.MouseMsg:
-		switch msg.Button {
-		case tea.MouseButtonWheelUp:
-			m.viewport.ScrollUp(3)
-		case tea.MouseButtonWheelDown:
-			m.viewport.ScrollDown(3)
-		}
-		return m, nil
 
 	case *api.Message:
 		return m.handleAgentMsg(msg)
@@ -678,13 +664,14 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.navigateList(tea.KeyUp)
 		}
 		// Within a multi-line draft, Up moves the cursor until the first
-		// line; from there (and for single-line drafts) it recalls older
-		// input history, like opencode and Claude Code.
+		// line. Otherwise it scrolls the transcript — importantly, this is
+		// also what the mouse wheel does, since terminals translate the
+		// wheel to arrow keys in alt-screen mode.
 		if m.input.LineCount() > 1 && m.input.Line() > 0 {
 			m.input.CursorUp()
 			return m, nil
 		}
-		m.historyPrev()
+		m.viewport.ScrollUp(1)
 	case tea.KeyDown:
 		if m.inChoiceMode {
 			return m, m.navigateList(tea.KeyDown)
@@ -693,7 +680,18 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.input.CursorDown()
 			return m, nil
 		}
-		m.historyNext()
+		m.viewport.ScrollDown(1)
+	case tea.KeyCtrlP:
+		// Input history navigation (readline-style; plain Up/Down scroll).
+		if !m.inChoiceMode {
+			m.historyPrev()
+		}
+	case tea.KeyCtrlN:
+		if !m.inChoiceMode {
+			m.historyNext()
+		}
+	case tea.KeyCtrlY:
+		return m.copyLastResponse()
 	case tea.KeyPgUp:
 		m.viewport.ScrollUp(m.viewport.Height / 2)
 	case tea.KeyPgDown:
@@ -786,6 +784,39 @@ func (m *model) historyNext() {
 		m.historyDraft = ""
 	}
 	m.syncInputHeight()
+}
+
+// copyLastResponse copies the most recent agent/model text message to the
+// system clipboard via the OSC 52 escape sequence (supported by iTerm2,
+// kitty, WezTerm, foot and Windows Terminal), and confirms in the transcript.
+func (m *model) copyLastResponse() (tea.Model, tea.Cmd) {
+	payload, ok := m.lastCopyableText()
+	if !ok {
+		m.appendLocalMessage("Nothing to copy yet.")
+		return m, nil
+	}
+	m.appendLocalMessage("📋 Copied last response to clipboard.")
+	return m, func() tea.Msg {
+		// Written directly (zero visual output, so the renderer's cursor
+		// accounting is unaffected; tea.Println is a no-op in alt-screen).
+		fmt.Fprintf(os.Stdout, "\x1b]52;c;%s\a", base64.StdEncoding.EncodeToString([]byte(payload)))
+		return nil
+	}
+}
+
+// lastCopyableText returns the payload of the most recent agent/model text
+// message, suitable for copying.
+func (m *model) lastCopyableText() (string, bool) {
+	for i := len(m.messages) - 1; i >= 0; i-- {
+		msg := m.messages[i]
+		if (msg.Source == api.MessageSourceModel || msg.Source == api.MessageSourceAgent) &&
+			msg.Type == api.MessageTypeText {
+			if payload, ok := msg.Payload.(string); ok && strings.TrimSpace(payload) != "" {
+				return payload, true
+			}
+		}
+	}
+	return "", false
 }
 
 // normalizePasteContent normalizes line endings in pasted runes and drops a
@@ -1100,7 +1131,7 @@ func (m model) renderMessages() string {
 			mutedStyle.PaddingLeft(1).Render("Your AI-powered Kubernetes assistant"),
 			dimStyle.PaddingLeft(1).Render("Type a message to get started"),
 			dimStyle.PaddingLeft(1).Render("Type /sessions to browse and resume past sessions"),
-			dimStyle.PaddingLeft(1).Render("Hold Shift (Option on iTerm2) and drag to copy text")))
+			dimStyle.PaddingLeft(1).Render("Drag-select with your mouse to copy, or press Ctrl+Y to copy the last reply")))
 	} else {
 		width := min(m.viewport.Width-6, 90)
 		if width < 40 {
@@ -1451,7 +1482,7 @@ func (m model) viewHelp(state api.AgentState) string {
 	case state == api.AgentStateRunning:
 		hints = []string{"Ctrl+C: cancel"}
 	default:
-		hints = []string{"Enter: send", "Ctrl+J: newline", "↑/↓: history", "Shift+Tab: auto", "Esc: clear", "Ctrl+C: quit"}
+		hints = []string{"Enter: send", "Ctrl+J: newline", "Ctrl+P/N: history", "Ctrl+Y: copy", "Shift+Tab: auto", "Esc: clear", "Ctrl+C: quit"}
 		if m.viewport.TotalLineCount() > m.viewport.Height {
 			hints = append(hints, "PgUp/PgDn: scroll")
 		}
