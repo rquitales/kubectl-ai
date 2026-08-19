@@ -200,7 +200,7 @@ func (o *Options) InitDefaults() {
 	o.ResumeSession = ""
 	o.ListSessions = false
 	o.DeleteSession = ""
-	o.SessionBackend = "memory"
+	o.SessionBackend = "filesystem"
 
 	// By default, hide tool outputs
 	o.ShowToolOutput = false
