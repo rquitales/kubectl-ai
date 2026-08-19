@@ -30,6 +30,7 @@ import (
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textarea"
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
@@ -164,13 +165,13 @@ func (u *TUI) ClearScreen() {}
 
 type sessionListMsg []api.SessionInfo
 
+// sessionListErrMsg reports a failure to list sessions.
+type sessionListErrMsg struct{ err error }
+
 func (m *model) fetchSessions() tea.Msg {
 	sessions, err := m.agent.ListSessions()
 	if err != nil {
-		return api.Message{
-			Type:    api.MessageTypeError,
-			Payload: fmt.Sprintf("Failed to list sessions: %v", err),
-		}
+		return sessionListErrMsg{err: err}
 	}
 	return sessionListMsg(sessions)
 }
@@ -195,6 +196,23 @@ type pastedBlock struct {
 	id      int
 	lines   int
 	content string
+}
+
+const (
+	// maxBrowserRows is the maximum number of sessions listed in the
+	// session browser before the list starts scrolling.
+	maxBrowserRows = 8
+)
+
+// sessionRenamedMsg reports the result of a rename attempt from the
+// session browser.
+type sessionRenamedMsg struct{ err error }
+
+// browserStatusMsg is a transient status line shown in the session browser
+// footer; isErr selects error vs info styling.
+type browserStatusMsg struct {
+	text  string
+	isErr bool
 }
 
 // Render cache for markdown
@@ -272,6 +290,13 @@ type model struct {
 	choiceOptionID string // Track which choice request we initialized for
 	choiceType     string // "confirm" or "session"
 	sessionIDs     []string
+	// Session browser state
+	browserOpen     bool
+	browserSessions []api.SessionInfo
+	browserIndex    int
+	browserStatus   browserStatusMsg // transient info/error shown in the browser footer
+	renaming        bool
+	renameInput     textinput.Model
 }
 
 func newModel(agent *agent.Agent) model {
@@ -314,6 +339,13 @@ func newModel(agent *agent.Agent) model {
 
 	vp := viewport.New(80, 20)
 
+	ri := textinput.New()
+	ri.Prompt = ""
+	ri.CharLimit = 128
+	ri.TextStyle = textStyle
+	ri.PlaceholderStyle = dimStyle
+	ri.Cursor.Style = primaryText
+
 	return model{
 		agent:       agent,
 		input:       ti,
@@ -323,6 +355,7 @@ func newModel(agent *agent.Agent) model {
 		spinner:     sp,
 		list:        l,
 		cache:       newRenderCache(),
+		renameInput: ri,
 		dirty:       true,
 	}
 }
@@ -367,6 +400,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.tick()
 
 	case sessionListMsg:
+		// A refresh landing after the user closed the browser must not
+		// reopen it.
+		if m.browserOpen {
+			m.openBrowser([]api.SessionInfo(msg))
+			m.updateViewportHeight()
+			return m, nil
+		}
 		if len(msg) == 0 {
 			m.messages = append(m.messages, &api.Message{
 				Source:    api.MessageSourceAgent,
@@ -379,30 +419,107 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.GotoBottom()
 			return m, nil
 		}
-
-		items := make([]list.Item, len(msg))
-		ids := make([]string, len(msg))
-		for i, s := range msg {
-			label := fmt.Sprintf("%s (%s) • %d msgs", s.ID, s.ModelID, s.MessageCount)
-			if s.Name != "" {
-				label = fmt.Sprintf("%s (%s) • %s • %d msgs", s.Name, s.ModelID, s.ID, s.MessageCount)
-			}
-			items[i] = item(label)
-			ids[i] = s.ID
+		if m.inChoiceMode {
+			// Don't stack the browser on top of an active choice picker.
+			m.messages = append(m.messages, &api.Message{
+				Source:    api.MessageSourceAgent,
+				Type:      api.MessageTypeText,
+				Payload:   "Finish the current prompt, then try 'sessions' again.",
+				Timestamp: time.Now(),
+			})
+			m.dirty = true
+			m.refresh()
+			m.viewport.GotoBottom()
+			return m, nil
 		}
-		m.list.SetItems(items)
-		m.list.Select(0)
-		m.inChoiceMode = true
-		m.choicePrompt = "Select a session to resume"
-		m.choiceOptionID = "manual-session-picker"
-		m.choiceType = "session"
-		m.sessionIDs = ids
+		m.openBrowser([]api.SessionInfo(msg))
+		m.updateViewportHeight()
+		return m, nil
+
+	case sessionRenamedMsg:
+		if msg.err != nil {
+			if m.browserOpen {
+				m.setBrowserStatus("Rename failed: "+msg.err.Error(), true)
+				return m, nil
+			}
+			m.messages = append(m.messages, &api.Message{
+				Source:    api.MessageSourceAgent,
+				Type:      api.MessageTypeError,
+				Payload:   "Rename failed: " + msg.err.Error(),
+				Timestamp: time.Now(),
+			})
+			m.dirty = true
+			m.refresh()
+			m.viewport.GotoBottom()
+			return m, nil
+		}
+		if m.browserOpen {
+			m.setBrowserStatus("Renamed ✓", false)
+			// Refresh the browser contents, keeping the browser open.
+			return m, m.fetchSessions
+		}
+		return m, nil
+
+	case sessionListErrMsg:
+		if m.browserOpen {
+			m.setBrowserStatus("Failed to list sessions: "+msg.err.Error(), true)
+			return m, nil
+		}
+		m.messages = append(m.messages, &api.Message{
+			Source:    api.MessageSourceAgent,
+			Type:      api.MessageTypeError,
+			Payload:   "Failed to list sessions: " + msg.err.Error(),
+			Timestamp: time.Now(),
+		})
 		m.dirty = true
 		m.refresh()
 		m.viewport.GotoBottom()
 		return m, nil
 	}
 	return m, nil
+}
+
+// setBrowserStatus shows a transient status line in the browser footer.
+func (m *model) setBrowserStatus(text string, isErr bool) {
+	m.browserStatus = browserStatusMsg{text: text, isErr: isErr}
+}
+
+// openBrowser opens the session browser with the given sessions, selecting
+// the current session when possible and preserving the selection across
+// refreshes by session ID. When the browser is already open (a refresh),
+// the footer status and rename state are preserved.
+func (m *model) openBrowser(sessions []api.SessionInfo) {
+	selectedID := ""
+	if m.browserOpen && m.browserIndex >= 0 && m.browserIndex < len(m.browserSessions) {
+		selectedID = m.browserSessions[m.browserIndex].ID
+	} else if s := m.agent.GetSession(); s != nil {
+		selectedID = s.ID
+	}
+
+	m.browserSessions = sessions
+	m.browserIndex = 0
+	for i, s := range sessions {
+		if s.ID == selectedID {
+			m.browserIndex = i
+			break
+		}
+	}
+	if !m.browserOpen {
+		m.browserStatus = browserStatusMsg{}
+		m.renaming = false
+	}
+	m.browserOpen = true
+	m.dirty = true
+	m.refresh()
+	m.viewport.GotoBottom()
+}
+
+// closeBrowser closes the session browser.
+func (m *model) closeBrowser() {
+	m.browserOpen = false
+	m.renaming = false
+	m.browserStatus = browserStatusMsg{}
+	m.updateViewportHeight()
 }
 
 func (m *model) resize() {
@@ -412,6 +529,7 @@ func (m *model) resize() {
 	// so rendered lines never reach the terminal's last column and wrap.
 	m.input.SetWidth(max(m.width-8, 20))
 	m.list.SetWidth(m.width - 4)
+	m.renameInput.Width = max(m.width-30, 10)
 	m.updateViewportHeight()
 	m.refresh()
 	m.viewport.GotoBottom()
@@ -420,6 +538,9 @@ func (m *model) resize() {
 func (m *model) updateViewportHeight() {
 	// Layout: status(1) + 2 dividers(2) + input block + help(1) + bottom padding(1)
 	contentH := m.height - (m.inputBlockHeight() + 5)
+	if m.browserOpen && m.width > 0 {
+		contentH -= lipgloss.Height(m.viewSessionBrowser())
+	}
 
 	contentH = max(contentH, 5)
 	m.viewport.Height = contentH
@@ -492,6 +613,12 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// the next draft.
 			return m, nil
 		}
+	}
+
+	// While the session browser is open it captures all keys except quit
+	// (including pastes, which are routed by handleBrowserKey).
+	if m.browserOpen && msg.Type != tea.KeyCtrlC && msg.Type != tea.KeyCtrlD {
+		return m.handleBrowserKey(msg)
 	}
 
 	// Bracketed paste arrives as a single key message with Paste set.
@@ -635,6 +762,15 @@ func (m *model) historyNext() {
 	m.syncInputHeight()
 }
 
+// normalizePasteContent normalizes line endings in pasted runes and drops a
+// single trailing newline (almost always a copy artifact, so pasting one
+// line doesn't grow the input).
+func normalizePasteContent(runes []rune) string {
+	content := strings.ReplaceAll(string(runes), "\r\n", "\n")
+	content = strings.ReplaceAll(content, "\r", "\n")
+	return strings.TrimSuffix(content, "\n")
+}
+
 // handlePaste inserts pasted text into the input. Large multi-line pastes are
 // attached to the draft and shown as a compact "[+N lines]" chip below the
 // input (like opencode) instead of flooding the input; the attached content
@@ -644,11 +780,7 @@ func (m *model) handlePaste(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	content := strings.ReplaceAll(string(msg.Runes), "\r\n", "\n")
-	content = strings.ReplaceAll(content, "\r", "\n")
-	// A trailing newline is almost always a copy artifact; drop it so that
-	// pasting a single line doesn't grow the input.
-	content = strings.TrimSuffix(content, "\n")
+	content := normalizePasteContent(msg.Runes)
 	if content == "" {
 		return m, nil
 	}
@@ -661,6 +793,120 @@ func (m *model) handlePaste(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	m.syncInputHeight()
 	return m, nil
+}
+
+// handleBrowserKey routes keys while the session browser is open.
+func (m *model) handleBrowserKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Scrolling the transcript works even with the browser open, and must
+	// not dismiss a status line.
+	if msg.Type == tea.KeyPgUp {
+		m.viewport.ScrollUp(m.viewport.Height / 2)
+		return m, nil
+	}
+	if msg.Type == tea.KeyPgDown {
+		m.viewport.ScrollDown(m.viewport.Height / 2)
+		return m, nil
+	}
+
+	m.browserStatus = browserStatusMsg{}
+
+	// Pastes land in the rename field while renaming; otherwise they would
+	// silently accumulate in the hidden main input.
+	if msg.Paste {
+		if m.renaming {
+			// textinput has no insert-at-cursor API; appending is fine for a
+			// rename field.
+			m.renameInput.SetValue(m.renameInput.Value() + normalizePasteContent(msg.Runes))
+			m.renameInput.CursorEnd()
+			return m, nil
+		}
+		m.setBrowserStatus("Close the browser (esc) to paste into the input", false)
+		return m, nil
+	}
+
+	// Rename mode captures all input for the rename field.
+	if m.renaming {
+		switch msg.Type {
+		case tea.KeyEnter:
+			newName := strings.TrimSpace(m.renameInput.Value())
+			m.renaming = false
+			m.renameInput.Blur()
+			if newName == "" || m.browserIndex >= len(m.browserSessions) {
+				return m, nil
+			}
+			sessionID := m.browserSessions[m.browserIndex].ID
+			return m, func() tea.Msg {
+				return sessionRenamedMsg{err: m.agent.RenameSession(sessionID, newName)}
+			}
+		case tea.KeyEsc:
+			m.renaming = false
+			m.renameInput.Blur()
+			return m, nil
+		default:
+			var cmd tea.Cmd
+			m.renameInput, cmd = m.renameInput.Update(msg)
+			return m, cmd
+		}
+	}
+
+	switch msg.Type {
+	case tea.KeyEsc:
+		m.closeBrowser()
+		return m, nil
+	case tea.KeyUp:
+		m.moveBrowserSelection(-1)
+		return m, nil
+	case tea.KeyDown:
+		m.moveBrowserSelection(1)
+		return m, nil
+	case tea.KeyEnter:
+		if m.browserIndex >= len(m.browserSessions) {
+			return m, nil
+		}
+		selectedID := m.browserSessions[m.browserIndex].ID
+		// The agent only reads its input channel when idle; while it is
+		// running, the switch queues up. Say so instead of pretending the
+		// switch already happened.
+		if s := m.agentState(); s == api.AgentStateRunning || s == api.AgentStateInitializing {
+			m.setBrowserStatus("Agent is busy — it will switch when done", false)
+		} else {
+			m.closeBrowser()
+		}
+		return m, func() tea.Msg {
+			m.agent.Input <- &api.SessionPickerResponse{SessionID: selectedID}
+			return nil
+		}
+	}
+
+	switch msg.String() {
+	case "k":
+		m.moveBrowserSelection(-1)
+	case "j":
+		m.moveBrowserSelection(1)
+	case "r":
+		if m.browserIndex < len(m.browserSessions) {
+			m.renaming = true
+			s := m.browserSessions[m.browserIndex]
+			m.renameInput.SetValue(s.Name)
+			m.renameInput.Placeholder = s.ID
+			m.renameInput.CursorEnd()
+			return m, m.renameInput.Focus()
+		}
+	case "ctrl+n":
+		m.closeBrowser()
+		return m, func() tea.Msg {
+			m.agent.Input <- &api.NewSessionRequest{}
+			return nil
+		}
+	}
+	return m, nil
+}
+
+func (m *model) moveBrowserSelection(delta int) {
+	if len(m.browserSessions) == 0 {
+		return
+	}
+	m.browserIndex = (m.browserIndex + delta + len(m.browserSessions)) % len(m.browserSessions)
 }
 
 func (m *model) handleEnter() (tea.Model, tea.Cmd) {
@@ -753,6 +999,10 @@ func (m *model) handleAgentMsg(msg *api.Message) (tea.Model, tea.Cmd) {
 	// Check if we're entering choice mode - use the incoming message directly
 	// to avoid race conditions where the message isn't yet in AllMessages()
 	if msg.Type == api.MessageTypeUserChoiceRequest {
+		// A permission prompt supersedes the session browser.
+		if m.browserOpen {
+			m.closeBrowser()
+		}
 		if req, ok := msg.Payload.(*api.UserChoiceRequest); ok {
 			items := make([]list.Item, len(req.Options))
 			for i, opt := range req.Options {
@@ -942,14 +1192,109 @@ func (m model) View() string {
 	}
 
 	session := m.agent.GetSession()
-	return lipgloss.JoinVertical(lipgloss.Left,
+	sections := []string{
 		m.viewStatus(session),
 		m.viewDivider(),
 		lipgloss.NewStyle().PaddingLeft(1).Render(m.viewport.View()),
+	}
+	if m.browserOpen {
+		sections = append(sections, m.viewSessionBrowser())
+	}
+	sections = append(sections,
 		m.viewDivider(),
 		m.viewInput(session.AgentState),
 		m.viewHelp(session.AgentState),
 	)
+	return lipgloss.JoinVertical(lipgloss.Left, sections...)
+}
+
+// browserRows is the number of session rows the browser shows, adapted to
+// the terminal height so the whole frame always fits on screen.
+func (m *model) browserRows() int {
+	n := len(m.browserSessions)
+	if n == 0 {
+		n = 1 // the "no sessions" row
+	}
+	// Reserve: browser chrome (title+blank+footer+2 borders = 5) and at
+	// least 5 transcript lines.
+	avail := m.height - m.inputBlockHeight() - 5 - 5 - 5
+	if avail < 2 {
+		avail = 2
+	}
+	return min(min(n, maxBrowserRows), avail)
+}
+
+// viewSessionBrowser renders the session browser panel shown above the input.
+func (m model) viewSessionBrowser() string {
+	var sb strings.Builder
+	sb.WriteString(primaryText.Render("Sessions"))
+	sb.WriteString("\n\n")
+
+	if len(m.browserSessions) == 0 {
+		sb.WriteString(mutedStyle.Render("  No sessions found."))
+		sb.WriteString("\n")
+	} else {
+		currentID := ""
+		if s := m.agent.GetSession(); s != nil {
+			currentID = s.ID
+		}
+
+		// Scroll window around the selected row.
+		rows := m.browserRows()
+		start := 0
+		if m.browserIndex >= rows {
+			start = m.browserIndex - rows + 1
+		}
+		end := min(start+rows, len(m.browserSessions))
+
+		for i := start; i < end; i++ {
+			s := m.browserSessions[i]
+			name := s.Name
+			nameStyle := textStyle
+			if name == "" {
+				// Unnamed sessions get a first-message preview (or the bare
+				// ID) as a fallback title, shown dimmed.
+				nameStyle = mutedStyle
+				if s.FirstMessage != "" {
+					name = s.FirstMessage
+				} else {
+					name = s.ID
+				}
+			}
+			meta := fmt.Sprintf("%s • %d msgs • %s", s.ModelID, s.MessageCount, formatRelativeTime(s.LastModified))
+			if s.ID == currentID {
+				meta = "current • " + meta
+			}
+
+			if i == m.browserIndex {
+				sb.WriteString(primaryText.Render("> "+name) + "  " + dimStyle.Render(meta))
+			} else {
+				sb.WriteString("  " + nameStyle.Render(name) + "  " + dimStyle.Render(meta))
+			}
+			sb.WriteString("\n")
+		}
+	}
+
+	sb.WriteString("\n")
+	switch {
+	case m.renaming:
+		sb.WriteString(warnText.Render("Rename: ") + m.renameInput.View() + dimStyle.Render("  (enter: save • esc: cancel)"))
+	case m.browserStatus.text != "":
+		if m.browserStatus.isErr {
+			sb.WriteString(errorText.Render(m.browserStatus.text))
+		} else {
+			sb.WriteString(successText.Render(m.browserStatus.text))
+		}
+	default:
+		hint := "↑/↓/j/k: navigate • enter: switch • r: rename • ctrl+n: new • esc: close"
+		if len(m.browserSessions) > m.browserRows() {
+			hint += fmt.Sprintf(" • %d/%d", m.browserIndex+1, len(m.browserSessions))
+		}
+		sb.WriteString(dimStyle.Render(hint))
+	}
+
+	return lipgloss.NewStyle().Padding(0, 1).Render(
+		inputBox.Width(max(m.width-4, 20)).Render(sb.String()))
 }
 
 func (m model) viewStatus(session *api.Session) string {
@@ -959,19 +1304,46 @@ func (m model) viewStatus(session *api.Session) string {
 	if name == "" {
 		name = session.ID
 	}
-	left := primaryText.Render("kubectl-ai") + sep + mutedStyle.Render(name) + sep + m.viewState(session.AgentState)
+	name = truncateRunes(name, 40)
 
 	model := session.ModelID
 	if model == "" {
 		model = "unknown"
 	}
+	model = truncateRunes(model, 30)
+
+	left := primaryText.Render("kubectl-ai") + sep + mutedStyle.Render(name) + sep + m.viewState(session.AgentState)
 	right := lipgloss.NewStyle().Foreground(colorSecondary).Render(model)
+
+	// The status bar must always be exactly one line, no matter the
+	// terminal width: shrink the name (then the model) until it fits.
+	for lipgloss.Width(left)+lipgloss.Width(right) > m.width-2 && len([]rune(name)) > 8 {
+		name = truncateRunes(name, len([]rune(name))-4)
+		left = primaryText.Render("kubectl-ai") + sep + mutedStyle.Render(name) + sep + m.viewState(session.AgentState)
+	}
+	for lipgloss.Width(left)+lipgloss.Width(right) > m.width-2 && len([]rune(model)) > 7 {
+		model = truncateRunes(model, len([]rune(model))-4)
+		right = lipgloss.NewStyle().Foreground(colorSecondary).Render(model)
+	}
 
 	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right) - 2
 	if gap < 0 {
 		gap = 0
 	}
 	return statusBar.Width(m.width).Render(" " + left + strings.Repeat(" ", gap) + right + " ")
+}
+
+// truncateRunes shortens s to at most n runes, ending with an ellipsis when
+// truncated.
+func truncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	if n <= 1 {
+		return "…"
+	}
+	return string(r[:n-1]) + "…"
 }
 
 func (m model) viewState(state api.AgentState) string {
@@ -1042,17 +1414,38 @@ func (m model) viewInput(state api.AgentState) string {
 
 func (m model) viewHelp(state api.AgentState) string {
 	var hints []string
-	if m.inChoiceMode {
+	switch {
+	case m.browserOpen:
+		return "" // the browser renders its own key hints
+	case m.inChoiceMode:
 		hints = []string{"↑/↓: navigate", "Enter: select", "Ctrl+C: quit"}
-	} else if state == api.AgentStateRunning {
+	case state == api.AgentStateRunning:
 		hints = []string{"Ctrl+C: cancel"}
-	} else {
+	default:
 		hints = []string{"Enter: send", "Ctrl+J: newline", "↑/↓: history", "Esc: clear", "Ctrl+C: quit"}
 		if m.viewport.TotalLineCount() > m.viewport.Height {
 			hints = append(hints, "PgUp/PgDn: scroll")
 		}
 	}
 	return dimStyle.Padding(0, 2, 1, 2).Render(strings.Join(hints, " • "))
+}
+
+// formatRelativeTime renders t as a short relative duration like "5m ago".
+func formatRelativeTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	d := time.Since(t)
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
+	}
 }
 
 func formatDuration(d time.Duration) string {

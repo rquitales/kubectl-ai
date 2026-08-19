@@ -15,12 +15,15 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/agent"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 func pasteMsg(s string) tea.KeyMsg {
@@ -392,5 +395,230 @@ func TestPhantomLFAfterSubmitIsSwallowed(t *testing.T) {
 	}
 	if m.inputHeight != 1 {
 		t.Errorf("inputHeight = %d, want 1", m.inputHeight)
+	}
+}
+
+func testSessions() []api.SessionInfo {
+	return []api.SessionInfo{
+		{ID: "s1", Name: "first", ModelID: "model-a", LastModified: time.Now(), MessageCount: 3},
+		{ID: "s2", Name: "second", ModelID: "model-b", LastModified: time.Now().Add(-time.Hour), MessageCount: 5},
+		{ID: "s3", ModelID: "model-c", LastModified: time.Now().Add(-24 * time.Hour), MessageCount: 1},
+	}
+}
+
+func newBrowserModel() model {
+	a := &agent.Agent{
+		Session: &api.Session{ID: "s2", AgentState: api.AgentStateIdle},
+		Input:   make(chan any, 1),
+	}
+	m := newModel(a)
+	m.width, m.height = 100, 40
+	m.resize()
+	return m
+}
+
+func TestBrowserOpensWithCurrentSessionSelected(t *testing.T) {
+	m := newBrowserModel()
+	m.openBrowser(testSessions())
+
+	if !m.browserOpen {
+		t.Fatal("expected browser to be open")
+	}
+	if m.browserIndex != 1 {
+		t.Errorf("browserIndex = %d, want 1 (current session s2)", m.browserIndex)
+	}
+}
+
+func TestBrowserNavigationWraps(t *testing.T) {
+	m := newBrowserModel()
+	m.openBrowser(testSessions())
+
+	m.moveBrowserSelection(-1)
+	if m.browserIndex != 0 {
+		t.Errorf("browserIndex = %d, want 0", m.browserIndex)
+	}
+	m.moveBrowserSelection(-1)
+	if m.browserIndex != 2 {
+		t.Errorf("browserIndex = %d, want 2 (wrapped)", m.browserIndex)
+	}
+	m.moveBrowserSelection(1)
+	if m.browserIndex != 0 {
+		t.Errorf("browserIndex = %d, want 0 (wrapped)", m.browserIndex)
+	}
+}
+
+func TestBrowserEnterSwitchesSession(t *testing.T) {
+	m := newBrowserModel()
+	m.openBrowser(testSessions())
+
+	_, cmd := m.handleBrowserKey(tea.KeyMsg{Type: tea.KeyEnter})
+	if m.browserOpen {
+		t.Error("expected browser to close after enter")
+	}
+	if cmd == nil {
+		t.Fatal("expected a command sending the picker response")
+	}
+	go cmd()
+	got := <-m.agent.Input
+	resp, ok := got.(*api.SessionPickerResponse)
+	if !ok {
+		t.Fatalf("expected *api.SessionPickerResponse, got %T", got)
+	}
+	if resp.SessionID != "s2" {
+		t.Errorf("SessionID = %q, want %q", resp.SessionID, "s2")
+	}
+}
+
+func TestBrowserRenameFlow(t *testing.T) {
+	m := newBrowserModel()
+	m.openBrowser(testSessions())
+
+	// 'r' starts rename with the current name prefilled.
+	_, _ = m.handleBrowserKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	if !m.renaming {
+		t.Fatal("expected rename mode to start")
+	}
+	if got := m.renameInput.Value(); got != "second" {
+		t.Errorf("rename input = %q, want %q", got, "second")
+	}
+
+	// Esc cancels without renaming.
+	_, _ = m.handleBrowserKey(tea.KeyMsg{Type: tea.KeyEsc})
+	if m.renaming {
+		t.Error("expected rename mode to end on esc")
+	}
+}
+
+func TestBrowserNewSession(t *testing.T) {
+	m := newBrowserModel()
+	m.openBrowser(testSessions())
+
+	// Single 'n' must NOT create a session (too easy to hit accidentally).
+	if _, cmd := m.handleBrowserKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")}); cmd != nil {
+		t.Error("expected 'n' alone to be a no-op")
+	}
+	if !m.browserOpen {
+		t.Error("expected browser to stay open on 'n'")
+	}
+
+	_, cmd := m.handleBrowserKey(tea.KeyMsg{Type: tea.KeyCtrlN})
+	if m.browserOpen {
+		t.Error("expected browser to close on ctrl+n")
+	}
+	if cmd == nil {
+		t.Fatal("expected a command sending the new-session request")
+	}
+	go cmd()
+	got := <-m.agent.Input
+	if _, ok := got.(*api.NewSessionRequest); !ok {
+		t.Fatalf("expected *api.NewSessionRequest, got %T", got)
+	}
+}
+
+func TestBrowserPasteGoesToRenameField(t *testing.T) {
+	m := newBrowserModel()
+	m.openBrowser(testSessions())
+
+	// Start renaming, then paste: it must land in the rename field, not the
+	// hidden main input.
+	_, _ = m.handleBrowserKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	if !m.renaming {
+		t.Fatal("expected rename mode to start")
+	}
+	_, _ = m.handleBrowserKey(pasteMsg("pasted-name"))
+	if got := m.renameInput.Value(); got != "secondpasted-name" {
+		t.Errorf("rename input = %q, want %q", got, "secondpasted-name")
+	}
+	if got := m.input.Value(); got != "" {
+		t.Errorf("main input must stay empty, got %q", got)
+	}
+}
+
+func TestBrowserPasteOutsideRenameIsSwallowedWithNote(t *testing.T) {
+	m := newBrowserModel()
+	m.openBrowser(testSessions())
+
+	_, _ = m.handleBrowserKey(pasteMsg("a\nb\nc\nd"))
+	if len(m.pastes) != 0 {
+		t.Errorf("expected no pastes attached while browsing, got %d", len(m.pastes))
+	}
+	if got := m.input.Value(); got != "" {
+		t.Errorf("main input must stay empty, got %q", got)
+	}
+	if m.browserStatus.text == "" {
+		t.Error("expected a footer note explaining the paste was swallowed")
+	}
+}
+
+func TestBrowserEnterQueuesSwitchWhenAgentBusy(t *testing.T) {
+	m := newBrowserModel()
+	m.agent.Session.AgentState = api.AgentStateRunning
+	m.openBrowser(testSessions())
+
+	_, cmd := m.handleBrowserKey(tea.KeyMsg{Type: tea.KeyEnter})
+	if !m.browserOpen {
+		t.Error("expected browser to stay open when the agent is busy")
+	}
+	if m.browserStatus.text == "" {
+		t.Error("expected a status note about the queued switch")
+	}
+	if cmd == nil {
+		t.Fatal("expected a command sending the picker response")
+	}
+	go cmd()
+	got := <-m.agent.Input
+	if resp, ok := got.(*api.SessionPickerResponse); !ok || resp.SessionID != "s2" {
+		t.Errorf("expected picker response for s2, got %v", got)
+	}
+}
+
+func TestBrowserAdaptsRowsToSmallTerminal(t *testing.T) {
+	m := newBrowserModel()
+	m.height = 22
+	sessions := testSessions()
+	for i := 0; i < 10; i++ {
+		sessions = append(sessions, api.SessionInfo{ID: fmt.Sprintf("sx%d", i), ModelID: "m", LastModified: time.Now()})
+	}
+	m.openBrowser(sessions)
+	m.updateViewportHeight()
+
+	frameHeight := lipgloss.Height(m.View())
+	if frameHeight > m.height {
+		t.Errorf("frame height %d exceeds terminal height %d", frameHeight, m.height)
+	}
+}
+
+func TestBrowserRenameErrorShownInFooter(t *testing.T) {
+	m := newBrowserModel()
+	m.openBrowser(testSessions())
+
+	updated, _ := m.Update(sessionRenamedMsg{err: errTest})
+	got := updated.(model)
+	if got.browserStatus.text == "" || !got.browserStatus.isErr {
+		t.Errorf("expected rename error in browser footer, got %+v", got.browserStatus)
+	}
+	if !got.browserOpen {
+		t.Error("expected browser to stay open after rename error")
+	}
+}
+
+var errTest = &testError{}
+
+type testError struct{}
+
+func (e *testError) Error() string { return "boom" }
+
+func TestBrowserShrinksViewport(t *testing.T) {
+	m := newBrowserModel()
+	before := m.viewport.Height
+	m.openBrowser(testSessions())
+	m.updateViewportHeight()
+	if m.viewport.Height >= before {
+		t.Errorf("expected viewport to shrink with browser open: before=%d after=%d", before, m.viewport.Height)
+	}
+
+	// Rendering the whole view with the browser open must not panic.
+	if got := m.View(); got == "" {
+		t.Error("expected non-empty view with browser open")
 	}
 }
