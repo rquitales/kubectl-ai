@@ -187,3 +187,35 @@ func TestCreateSessionRefusesToClobberExisting(t *testing.T) {
 		t.Errorf("existing session was clobbered: name = %q", loaded.Name)
 	}
 }
+
+func TestFileChatMessageStoreLargeMessages(t *testing.T) {
+	store := NewFileChatMessageStore(t.TempDir())
+
+	small := &api.Message{ID: "1", Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "hi", Timestamp: time.Now()}
+	if err := store.AddChatMessage(small); err != nil {
+		t.Fatal(err)
+	}
+
+	// A message whose JSON line exceeds bufio's default 64KB token limit:
+	// previously this made the whole history unreadable.
+	big := &api.Message{ID: "2", Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: strings.Repeat("x", 200*1024), Timestamp: time.Now()}
+	if err := store.AddChatMessage(big); err != nil {
+		t.Fatal(err)
+	}
+
+	small2 := &api.Message{ID: "3", Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "after big", Timestamp: time.Now()}
+	if err := store.AddChatMessage(small2); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs := store.ChatMessages()
+	if len(msgs) != 3 {
+		t.Fatalf("expected 3 messages, got %d (history wiped by oversized line?)", len(msgs))
+	}
+	if msgs[1].Payload.(string) != big.Payload {
+		t.Errorf("big message payload corrupted")
+	}
+	if msgs[2].Payload != "after big" {
+		t.Errorf("message after the big one = %q", msgs[2].Payload)
+	}
+}

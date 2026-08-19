@@ -319,6 +319,10 @@ func (s *FileChatMessageStore) readMessages() ([]*api.Message, error) {
 
 	// JSONL format
 	scanner := bufio.NewScanner(f)
+	// LLM responses and tool outputs can be large; the default 64KB token
+	// limit would make the whole history unreadable once a single message
+	// exceeds it. Allow up to 10MB per line.
+	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -333,7 +337,9 @@ func (s *FileChatMessageStore) readMessages() ([]*api.Message, error) {
 	}
 
 	if err := scanner.Err(); err != nil {
-		return nil, err
+		// A partial history is strictly better than no history: return what
+		// was read so far instead of wiping the whole transcript.
+		return messages, nil
 	}
 
 	return messages, nil
