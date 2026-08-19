@@ -685,3 +685,56 @@ func TestAgentDeleteSession(t *testing.T) {
 		t.Error("expected other session to be deleted")
 	}
 }
+
+func TestAgentCloseDeletesEmptySession(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+
+	mgr, err := sessions.NewSessionManager("filesystem")
+	if err != nil {
+		t.Fatalf("NewSessionManager: %v", err)
+	}
+	s, err := mgr.NewSession(sessions.Metadata{ModelID: "m"})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	a := &Agent{
+		Session:        s,
+		SessionBackend: "filesystem",
+	}
+	if err := a.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	if _, err := mgr.FindSessionByID(s.ID); err == nil {
+		t.Error("expected empty session to be deleted on exit")
+	}
+}
+
+func TestAgentCloseKeepsSessionWithMessages(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+
+	mgr, err := sessions.NewSessionManager("filesystem")
+	if err != nil {
+		t.Fatalf("NewSessionManager: %v", err)
+	}
+	s, err := mgr.NewSession(sessions.Metadata{ModelID: "m"})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if err := s.ChatMessageStore.AddChatMessage(&api.Message{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "hello"}); err != nil {
+		t.Fatalf("AddChatMessage: %v", err)
+	}
+
+	a := &Agent{
+		Session:        s,
+		SessionBackend: "filesystem",
+	}
+	if err := a.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	if _, err := mgr.FindSessionByID(s.ID); err != nil {
+		t.Error("expected session with messages to be kept on exit")
+	}
+}

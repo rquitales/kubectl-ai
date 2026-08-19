@@ -409,6 +409,18 @@ func (s *Agent) rebuildChat(ctx context.Context) error {
 }
 
 func (c *Agent) Close() error {
+	// An exit check: a session with no conversation leaves nothing behind.
+	// Sessions with any messages are always kept.
+	if c.Session != nil && len(c.Session.AllMessages()) == 0 {
+		if manager, err := sessions.NewSessionManager(c.SessionBackend); err == nil {
+			if err := manager.DeleteSession(c.Session.ID); err != nil {
+				klog.Warningf("failed to delete empty session %s: %v", c.Session.ID, err)
+			} else {
+				klog.Infof("Deleted empty session %s on exit", c.Session.ID)
+			}
+		}
+	}
+
 	if c.workDir != "" {
 		if c.RemoveWorkDir {
 			if err := os.RemoveAll(c.workDir); err != nil {
