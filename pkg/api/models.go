@@ -107,6 +107,9 @@ type SessionInfo struct {
 	CreatedAt    time.Time `json:"createdAt"`
 	LastModified time.Time `json:"lastModified"`
 	MessageCount int       `json:"messageCount"`
+	// FirstMessage is a short preview of the first user message, used as a
+	// fallback title when the session has no name.
+	FirstMessage string `json:"firstMessage,omitempty"`
 }
 
 // SessionPickerResponse is sent when user selects a session
@@ -114,6 +117,11 @@ type SessionPickerResponse struct {
 	SessionID string `json:"sessionId"`
 	Cancelled bool   `json:"cancelled"`
 }
+
+// NewSessionRequest is sent by UIs to ask the agent to create and switch to
+// a new session directly, without going through a meta query (which would
+// record a synthetic user message in the old session's transcript).
+type NewSessionRequest struct{}
 
 // MCPStatus represents the overall status of MCP servers and tools
 type MCPStatus struct {
@@ -157,6 +165,6 @@ func (s *Session) AllMessages() []*Message {
 }
 
 func (s *Session) String() string {
-	return fmt.Sprintf("Session ID: %s\nProvider: %s\nModel: %s\nCreated At: %s\nLast Modified: %s\nAgent State: %s",
-		s.ID, s.ProviderID, s.ModelID, s.CreatedAt.Format(time.RFC3339), s.LastModified.Format(time.RFC3339), s.AgentState)
+	return fmt.Sprintf("Session ID: %s\nName: %s\nProvider: %s\nModel: %s\nCreated At: %s\nLast Modified: %s\nAgent State: %s",
+		s.ID, s.Name, s.ProviderID, s.ModelID, s.CreatedAt.Format(time.RFC3339), s.LastModified.Format(time.RFC3339), s.AgentState)
 }

@@ -464,10 +464,20 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 						continue
 					}
 
+					if _, ok := userInput.(*api.NewSessionRequest); ok {
+						if err := c.createAndSwitchSession(); err != nil {
+							log.Error(err, "error creating new session")
+							c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error creating new session: "+err.Error())
+						}
+						continue
+					}
+
 					query, ok := userInput.(*api.UserInputResponse)
 					if !ok {
-						log.Error(nil, "Received unexpected input from channel", "userInput", userInput)
-						return
+						// Ignore unexpected input rather than dying: a dead loop
+						// leaves every UI producer blocked on the input channel.
+						log.Error(nil, "Received unexpected input from channel; ignoring", "userInput", userInput)
+						continue
 					}
 					if strings.TrimSpace(query.Query) == "" {
 						log.Info("No query provided, skipping agentic loop")
@@ -545,6 +555,14 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 						c.setAgentState(api.AgentStateDone)
 						continue
 
+					case *api.NewSessionRequest:
+						if err := c.createAndSwitchSession(); err != nil {
+							log.Error(err, "error creating new session")
+							c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error creating new session: "+err.Error())
+						}
+						c.setAgentState(api.AgentStateDone)
+						continue
+
 					case *api.UserChoiceResponse:
 						dispatchToolCalls := c.handleChoice(ctx, response)
 						if dispatchToolCalls {
@@ -575,8 +593,10 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 						}
 
 					default:
-						log.Error(nil, "Received unexpected input from channel", "userInput", userInput)
-						return
+						// Ignore unexpected input rather than dying: a dead loop
+						// leaves every UI producer blocked on the input channel.
+						log.Error(nil, "Received unexpected input from channel; ignoring", "userInput", userInput)
+						continue
 					}
 				}
 			case api.AgentStateRunning:
@@ -815,11 +835,14 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 }
 
 func (c *Agent) handleMetaQuery(ctx context.Context, query string) (answer string, handled bool, err error) {
+	// UIs may forward the query with surrounding whitespace/newlines.
+	query = strings.TrimSpace(query)
 	switch query {
 	case "clear", "reset":
 		c.sessionMu.Lock()
 		// TODO: Remove this check when session persistence is default
 		if err := c.Session.ChatMessageStore.ClearChatMessages(); err != nil {
+			c.sessionMu.Unlock()
 			return "Failed to clear the conversation", false, err
 		}
 		c.llmChat.Initialize(c.Session.ChatMessageStore.ChatMessages())
@@ -851,6 +874,12 @@ func (c *Agent) handleMetaQuery(ctx context.Context, query string) (answer strin
 		}
 		return "Saved session as " + savedSessionID, true, nil
 
+	case "new-session":
+		if err := c.createAndSwitchSession(); err != nil {
+			return "", false, fmt.Errorf("failed to create new session: %w", err)
+		}
+		return fmt.Sprintf("Created and switched to new session %s.", c.Session.ID), true, nil
+
 	case "sessions":
 		sessions, err := c.ListSessions()
 		if err != nil {
@@ -862,12 +891,17 @@ func (c *Agent) handleMetaQuery(ctx context.Context, query string) (answer strin
 		// Add ```text so markdown doesn't wreck the format
 		availableSessions := "```text"
 		availableSessions += "Available sessions:\n\n"
-		availableSessions += "ID\t\t\tCreated\t\t\tLast Accessed\t\tModel\t\tProvider\n"
-		availableSessions += "--\t\t\t-------\t\t\t-------------\t\t-----\t\t--------\n"
+		availableSessions += "ID\t\t\tName\t\t\tCreated\t\t\tLast Accessed\t\tModel\t\tProvider\n"
+		availableSessions += "--\t\t\t----\t\t\t-------\t\t\t-------------\t\t-----\t\t--------\n"
 
 		for _, session := range sessions {
-			availableSessions += fmt.Sprintf("%s\t%s\t%s\t%s\t%s\n",
+			name := session.Name
+			if name == "" {
+				name = "-"
+			}
+			availableSessions += fmt.Sprintf("%s\t%s\t%s\t%s\t%s\t%s\n",
 				session.ID,
+				name,
 				session.CreatedAt.Format("2006-01-02 15:04"),
 				session.LastModified.Format("2006-01-02 15:04"),
 				session.ModelID,
@@ -878,7 +912,7 @@ func (c *Agent) handleMetaQuery(ctx context.Context, query string) (answer strin
 		return availableSessions, true, nil
 	}
 
-	if strings.HasPrefix(query, "resume-session") {
+	if query == "resume-session" || strings.HasPrefix(query, "resume-session ") {
 		parts := strings.Split(query, " ")
 		if len(parts) != 2 {
 			return "Invalid command. Usage: resume-session <session_id>", true, nil
@@ -890,7 +924,37 @@ func (c *Agent) handleMetaQuery(ctx context.Context, query string) (answer strin
 		return fmt.Sprintf("Resumed session %s.", sessionID), true, nil
 	}
 
+	if query == "rename-session" || strings.HasPrefix(query, "rename-session ") {
+		parts := strings.SplitN(query, " ", 2)
+		if len(parts) != 2 || strings.TrimSpace(parts[1]) == "" {
+			return "Invalid command. Usage: rename-session <name>", true, nil
+		}
+		name := strings.TrimSpace(parts[1])
+		if err := c.RenameSession(c.Session.ID, name); err != nil {
+			return "", false, err
+		}
+		return fmt.Sprintf("Renamed session to %q.", sessions.SanitizeSessionName(name)), true, nil
+	}
+
 	return "", false, nil
+}
+
+// createAndSwitchSession creates a new session, switches the agent to it,
+// and announces the switch. It is used both by the "new-session" meta query
+// and by NewSessionRequest messages from UIs.
+func (c *Agent) createAndSwitchSession() error {
+	newSessionID, err := c.NewSession()
+	if err != nil {
+		return err
+	}
+	name := newSessionID
+	c.sessionMu.Lock()
+	if c.Session != nil && c.Session.Name != "" {
+		name = c.Session.Name
+	}
+	c.sessionMu.Unlock()
+	c.addMessage(api.MessageSourceAgent, api.MessageTypeText, fmt.Sprintf("Created and switched to new session %s (%s)", name, newSessionID))
+	return nil
 }
 
 func (c *Agent) NewSession() (string, error) {
@@ -1053,12 +1117,48 @@ func (c *Agent) LoadSession(sessionID string) error {
 	return nil
 }
 
+// RenameSession renames a session. If the renamed session is the agent's
+// current session, the in-memory state is updated as well so UIs reflect
+// the new name immediately.
+func (c *Agent) RenameSession(sessionID, name string) error {
+	if sessions.SanitizeSessionName(name) == "" {
+		return fmt.Errorf("session name cannot be empty")
+	}
+
+	manager, err := sessions.NewSessionManager(c.SessionBackend)
+	if err != nil {
+		return fmt.Errorf("failed to create session manager: %w", err)
+	}
+
+	// Hold the lock across the whole operation: with the memory backend the
+	// store hands out shared *api.Session pointers, so the rename can
+	// otherwise race the agent loop and UI readers.
+	c.sessionMu.Lock()
+	defer c.sessionMu.Unlock()
+
+	if err := manager.RenameSession(sessionID, name); err != nil {
+		return fmt.Errorf("failed to rename session %q: %w", sessionID, err)
+	}
+
+	if c.Session != nil && c.Session.ID == sessionID {
+		c.Session.Name = sessions.SanitizeSessionName(name)
+	}
+
+	return nil
+}
+
 // ListSessions returns available sessions for UI pickers
 func (c *Agent) ListSessions() ([]api.SessionInfo, error) {
 	manager, err := sessions.NewSessionManager(c.SessionBackend)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create session manager: %w", err)
 	}
+
+	// Hold the lock while reading session fields: with the memory backend
+	// the store hands out shared *api.Session pointers which the agent loop
+	// mutates under sessionMu.
+	c.sessionMu.Lock()
+	defer c.sessionMu.Unlock()
 
 	sessionList, err := manager.ListSessions()
 	if err != nil {
@@ -1067,9 +1167,9 @@ func (c *Agent) ListSessions() ([]api.SessionInfo, error) {
 
 	sessionInfos := make([]api.SessionInfo, len(sessionList))
 	for i, session := range sessionList {
-		msgCount := 0
+		var messages []*api.Message
 		if session.ChatMessageStore != nil {
-			msgCount = len(session.ChatMessageStore.ChatMessages())
+			messages = session.ChatMessageStore.ChatMessages()
 		}
 		sessionInfos[i] = api.SessionInfo{
 			ID:           session.ID,
@@ -1078,10 +1178,35 @@ func (c *Agent) ListSessions() ([]api.SessionInfo, error) {
 			ProviderID:   session.ProviderID,
 			CreatedAt:    session.CreatedAt,
 			LastModified: session.LastModified,
-			MessageCount: msgCount,
+			MessageCount: len(messages),
+			FirstMessage: firstUserMessage(messages),
 		}
 	}
 	return sessionInfos, nil
+}
+
+// firstUserMessage returns a short preview of the first user message, for
+// displaying as a fallback session title.
+func firstUserMessage(messages []*api.Message) string {
+	const maxLen = 80
+	for _, msg := range messages {
+		if msg.Source != api.MessageSourceUser || msg.Type != api.MessageTypeText {
+			continue
+		}
+		p, ok := msg.Payload.(string)
+		if !ok {
+			continue
+		}
+		p = strings.Join(strings.Fields(p), " ") // collapse whitespace/newlines
+		if p == "" {
+			continue
+		}
+		if r := []rune(p); len(r) > maxLen {
+			p = string(r[:maxLen]) + "…"
+		}
+		return p
+	}
+	return ""
 }
 
 func (c *Agent) listModels(ctx context.Context) ([]string, error) {

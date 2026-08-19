@@ -47,7 +47,7 @@ func (m *memoryStore) CreateSession(session *api.Session) error {
 	defer m.mu.Unlock()
 
 	if _, exists := m.sessions[session.ID]; exists {
-		return errors.New("session already exists")
+		return ErrSessionExists
 	}
 
 	if session.ChatMessageStore == nil {

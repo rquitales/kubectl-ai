@@ -18,6 +18,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -55,6 +56,7 @@ func (f *filesystemStore) GetSession(id string) (*api.Session, error) {
 	chatStore := NewFileChatMessageStore(sessionPath)
 	return &api.Session{
 		ID:               id,
+		Name:             meta.Name,
 		ProviderID:       meta.ProviderID,
 		ModelID:          meta.ModelID,
 		AgentState:       api.AgentStateIdle,
@@ -66,6 +68,10 @@ func (f *filesystemStore) GetSession(id string) (*api.Session, error) {
 
 func (f *filesystemStore) CreateSession(session *api.Session) error {
 	sessionPath := filepath.Join(f.basePath, session.ID)
+	if _, err := os.Stat(sessionPath); err == nil {
+		// Refuse to clobber an existing session's metadata.
+		return fmt.Errorf("%w: %s", ErrSessionExists, session.ID)
+	}
 	if err := os.MkdirAll(sessionPath, 0o755); err != nil {
 		return err
 	}
@@ -74,6 +80,7 @@ func (f *filesystemStore) CreateSession(session *api.Session) error {
 	session.ChatMessageStore = chatStore
 
 	meta := Metadata{
+		Name:         session.Name,
 		ProviderID:   session.ProviderID,
 		ModelID:      session.ModelID,
 		CreatedAt:    session.CreatedAt,
@@ -85,7 +92,7 @@ func (f *filesystemStore) CreateSession(session *api.Session) error {
 		return err
 	}
 
-	return os.WriteFile(filepath.Join(sessionPath, "metadata.yaml"), data, 0o644)
+	return writeFileAtomic(filepath.Join(sessionPath, "metadata.yaml"), data, 0o644)
 }
 
 func (f *filesystemStore) UpdateSession(session *api.Session) error {
@@ -105,6 +112,7 @@ func (f *filesystemStore) UpdateSession(session *api.Session) error {
 		return err
 	}
 
+	meta.Name = session.Name
 	meta.ProviderID = session.ProviderID
 	meta.ModelID = session.ModelID
 	meta.LastAccessed = session.LastModified
@@ -114,7 +122,27 @@ func (f *filesystemStore) UpdateSession(session *api.Session) error {
 		return err
 	}
 
-	return os.WriteFile(metadataPath, data, 0o644)
+	return writeFileAtomic(metadataPath, data, 0o644)
+}
+
+// writeFileAtomic writes data to path atomically via a temp file + rename, so
+// concurrent readers never observe a truncated/partial metadata file.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }
 
 func (f *filesystemStore) ListSessions() ([]*api.Session, error) {
@@ -199,11 +227,14 @@ func (s *FileChatMessageStore) AddChatMessage(record *api.Message) error {
 		return s.writeMessages(messages)
 	}
 
-	// Normal append for JSONL or new files
+	// Normal append for JSONL or new files. The record and its trailing
+	// newline go out in a single Write so concurrent readers of the file
+	// never observe a torn line.
 	data, err := json.Marshal(record)
 	if err != nil {
 		return err
 	}
+	data = append(data, '\n')
 
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
@@ -211,13 +242,8 @@ func (s *FileChatMessageStore) AddChatMessage(record *api.Message) error {
 	}
 	defer f.Close()
 
-	if _, err := f.Write(data); err != nil {
-		return err
-	}
-	if _, err := f.WriteString("\n"); err != nil {
-		return err
-	}
-	return nil
+	_, err = f.Write(data)
+	return err
 }
 
 // SetChatMessages replaces the history file with the provided messages.

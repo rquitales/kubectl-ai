@@ -15,6 +15,7 @@
 package sessions
 
 import (
+	"errors"
 	"fmt"
 	"math/rand"
 	"time"
@@ -48,25 +49,35 @@ func NewSessionManager(backend string) (*SessionManager, error) {
 }
 
 func (sm *SessionManager) NewSession(meta Metadata) (*api.Session, error) {
-	suffix := fmt.Sprintf("%04d", rand.Intn(10000))
-	sessionID := time.Now().Format("20060102") + "-" + suffix
+	// Session IDs embed random suffixes; retry a few times on the (rare)
+	// birthday-paradox collision instead of clobbering or failing.
+	var lastErr error
+	for attempt := 0; attempt < 10; attempt++ {
+		suffix := fmt.Sprintf("%04d", rand.Intn(10000))
+		sessionID := time.Now().Format("20060102") + "-" + suffix
 
-	now := time.Now()
-	session := &api.Session{
-		ID:           sessionID,
-		Name:         "Session " + sessionID,
-		ProviderID:   meta.ProviderID,
-		ModelID:      meta.ModelID,
-		AgentState:   api.AgentStateIdle,
-		CreatedAt:    now,
-		LastModified: now,
+		now := time.Now()
+		session := &api.Session{
+			ID:           sessionID,
+			Name:         "Session " + sessionID,
+			ProviderID:   meta.ProviderID,
+			ModelID:      meta.ModelID,
+			AgentState:   api.AgentStateIdle,
+			CreatedAt:    now,
+			LastModified: now,
+		}
+
+		if err := sm.store.CreateSession(session); err != nil {
+			if errors.Is(err, ErrSessionExists) {
+				lastErr = err
+				continue
+			}
+			return nil, err
+		}
+
+		return session, nil
 	}
-
-	if err := sm.store.CreateSession(session); err != nil {
-		return nil, err
-	}
-
-	return session, nil
+	return nil, fmt.Errorf("failed to allocate a unique session ID: %w", lastErr)
 }
 
 func (sm *SessionManager) ListSessions() ([]*api.Session, error) {
@@ -79,6 +90,21 @@ func (sm *SessionManager) FindSessionByID(id string) (*api.Session, error) {
 
 func (sm *SessionManager) DeleteSession(id string) error {
 	return sm.store.DeleteSession(id)
+}
+
+// RenameSession sets a new display name for the session with the given ID.
+// The name is sanitized before being stored.
+func (sm *SessionManager) RenameSession(id, name string) error {
+	name = SanitizeSessionName(name)
+	if name == "" {
+		return errors.New("session name cannot be empty")
+	}
+	session, err := sm.store.GetSession(id)
+	if err != nil {
+		return err
+	}
+	session.Name = name
+	return sm.store.UpdateSession(session)
 }
 
 func (sm *SessionManager) GetLatestSession() (*api.Session, error) {
