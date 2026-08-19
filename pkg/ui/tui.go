@@ -21,6 +21,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -671,11 +672,6 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.inChoiceMode {
 			return m, m.navigateList(tea.KeyUp)
 		}
-		if msg.Alt {
-			// Alt+Up recalls older input history.
-			m.historyPrev()
-			return m, nil
-		}
 		// Within a multi-line draft, Up moves the cursor until the first
 		// line. Otherwise it scrolls the transcript — importantly, this is
 		// also what the mouse wheel does, since terminals translate the
@@ -688,11 +684,6 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyDown:
 		if m.inChoiceMode {
 			return m, m.navigateList(tea.KeyDown)
-		}
-		if msg.Alt {
-			// Alt+Down recalls newer input history.
-			m.historyNext()
-			return m, nil
 		}
 		if m.input.LineCount() > 1 && m.input.Line() < m.input.LineCount()-1 {
 			m.input.CursorDown()
@@ -740,6 +731,17 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			// Don't let keystrokes accumulate invisibly in the input
 			// while a choice picker is active.
+			return m, nil
+		}
+		switch msg.String() {
+		case "alt+p":
+			// Alt+P recalls older input history (emacs M-p style; works on
+			// macOS terminals where Alt+arrows aren't delivered).
+			m.historyPrev()
+			return m, nil
+		case "alt+n":
+			// Alt+N recalls newer input history.
+			m.historyNext()
 			return m, nil
 		}
 		// Default: send to text input
@@ -807,8 +809,9 @@ func (m *model) historyNext() {
 }
 
 // copyLastResponse copies the most recent agent/model text message to the
-// system clipboard via the OSC 52 escape sequence (supported by iTerm2,
-// kitty, WezTerm, foot and Windows Terminal), and confirms in the transcript.
+// system clipboard, and confirms in the transcript. On macOS it uses pbcopy
+// (always works, no terminal support needed); elsewhere it falls back to the
+// OSC 52 escape sequence (iTerm2, kitty, WezTerm, foot, Windows Terminal).
 func (m *model) copyLastResponse() (tea.Model, tea.Cmd) {
 	payload, ok := m.lastCopyableText()
 	if !ok {
@@ -817,11 +820,30 @@ func (m *model) copyLastResponse() (tea.Model, tea.Cmd) {
 	}
 	m.appendLocalMessage("📋 Copied last response to clipboard.")
 	return m, func() tea.Msg {
-		// Written directly (zero visual output, so the renderer's cursor
-		// accounting is unaffected; tea.Println is a no-op in alt-screen).
-		fmt.Fprintf(os.Stdout, "\x1b]52;c;%s\a", base64.StdEncoding.EncodeToString([]byte(payload)))
+		_ = copyToClipboard(payload)
 		return nil
 	}
+}
+
+// copyToClipboard puts s on the system clipboard, preferring pbcopy (macOS)
+// and falling back to OSC 52.
+func copyToClipboard(s string) error {
+	if path, err := exec.LookPath("pbcopy"); err == nil {
+		cmd := exec.Command(path)
+		cmd.Stdin = strings.NewReader(s)
+		if err := cmd.Run(); err == nil {
+			return nil
+		}
+	}
+	// Fallback: OSC 52 (zero visual output, so the renderer's cursor
+	// accounting is unaffected; tea.Println is a no-op in alt-screen).
+	osc52Write(s)
+	return nil
+}
+
+// osc52Write emits the OSC 52 clipboard sequence to the terminal.
+func osc52Write(s string) {
+	fmt.Fprintf(os.Stdout, "\x1b]52;c;%s\a", base64.StdEncoding.EncodeToString([]byte(s)))
 }
 
 // lastCopyableText returns the payload of the most recent agent/model text
@@ -1795,7 +1817,7 @@ func (m model) viewHelp(state api.AgentState) string {
 	case state == api.AgentStateRunning:
 		hints = []string{"Ctrl+C: cancel"}
 	default:
-		hints = []string{"Enter: send", "Ctrl+J: newline", "Ctrl+P: commands", "Alt+↑/↓: history", "Ctrl+Y: copy", "Shift+Tab: auto", "Esc: clear/stop", "Ctrl+C: quit"}
+		hints = []string{"Enter: send", "Ctrl+J: newline", "Ctrl+P: commands", "Alt+P/N: history", "Ctrl+Y: copy", "Shift+Tab: auto", "Esc: clear/stop", "Ctrl+C: quit"}
 		if m.viewport.TotalLineCount() > m.viewport.Height {
 			hints = append(hints, "PgUp/PgDn: scroll")
 		}

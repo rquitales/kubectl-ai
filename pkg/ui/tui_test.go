@@ -19,6 +19,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -293,27 +294,27 @@ func TestHistoryNavigation(t *testing.T) {
 	m := newModel(nil)
 	m.messages = historyTestMessages()
 
-	press := func(k tea.KeyType, alt bool) {
-		_, _ = m.handleKey(tea.KeyMsg{Type: k, Alt: alt})
+	altKey := func(r rune) {
+		_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}, Alt: true})
 	}
 
-	press(tea.KeyUp, true)
+	altKey('p')
 	if got := m.input.Value(); got != "second query" {
-		t.Errorf("after 1st alt+up: input = %q, want %q", got, "second query")
+		t.Errorf("after 1st alt+p: input = %q, want %q", got, "second query")
 	}
-	press(tea.KeyUp, true)
+	altKey('p')
 	if got := m.input.Value(); got != "first query" {
-		t.Errorf("after 2nd alt+up: input = %q, want %q", got, "first query")
+		t.Errorf("after 2nd alt+p: input = %q, want %q", got, "first query")
 	}
-	press(tea.KeyUp, true) // at oldest: stays
+	altKey('p') // at oldest: stays
 	if got := m.input.Value(); got != "first query" {
 		t.Errorf("at oldest: input = %q, want %q", got, "first query")
 	}
-	press(tea.KeyDown, true)
+	altKey('n')
 	if got := m.input.Value(); got != "second query" {
-		t.Errorf("after alt+down: input = %q, want %q", got, "second query")
+		t.Errorf("after alt+n: input = %q, want %q", got, "second query")
 	}
-	press(tea.KeyDown, true) // past newest: restores (empty) draft
+	altKey('n') // past newest: restores (empty) draft
 	if got := m.input.Value(); got != "" {
 		t.Errorf("past newest: input = %q, want %q", got, "")
 	}
@@ -327,11 +328,11 @@ func TestHistoryRestoresDraft(t *testing.T) {
 	m.messages = historyTestMessages()
 
 	m.input.SetValue("my draft")
-	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyUp, Alt: true})
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p"), Alt: true})
 	if got := m.input.Value(); got != "second query" {
 		t.Fatalf("after ctrl+p: input = %q, want %q", got, "second query")
 	}
-	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyDown, Alt: true})
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n"), Alt: true})
 	if got := m.input.Value(); got != "my draft" {
 		t.Errorf("after ctrl+n: input = %q, want draft %q", got, "my draft")
 	}
@@ -746,25 +747,14 @@ func TestLastCopyableText(t *testing.T) {
 	}
 }
 
-func TestCtrlYWritesOSC52(t *testing.T) {
-	m := newModel(nil)
-	m.messages = []*api.Message{
-		{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "copy me"},
-	}
-
+func TestOsc52Write(t *testing.T) {
 	r, w, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
 	orig := os.Stdout
 	os.Stdout = w
-	defer func() { os.Stdout = orig }()
-
-	_, cmd := m.copyLastResponse()
-	if cmd == nil {
-		t.Fatal("expected a command writing the OSC52 sequence")
-	}
-	cmd()
+	osc52Write("copy me")
 	w.Close()
 	os.Stdout = orig
 
@@ -775,6 +765,38 @@ func TestCtrlYWritesOSC52(t *testing.T) {
 	if out != want {
 		t.Errorf("OSC52 output = %q, want %q", out, want)
 	}
+}
+
+func TestCopyToClipboard(t *testing.T) {
+	if _, err := exec.LookPath("pbcopy"); err != nil {
+		t.Skip("pbcopy not available on this platform")
+	}
+	if _, err := exec.LookPath("pbpaste"); err != nil {
+		t.Skip("pbpaste not available on this platform")
+	}
+	if err := copyToClipboard("kubectl-ai clipboard test"); err != nil {
+		t.Fatalf("copyToClipboard failed: %v", err)
+	}
+	out, err := exec.Command("pbpaste").Output()
+	if err != nil {
+		t.Fatalf("pbpaste failed: %v", err)
+	}
+	if string(out) != "kubectl-ai clipboard test" {
+		t.Errorf("clipboard = %q, want %q", string(out), "kubectl-ai clipboard test")
+	}
+}
+
+func TestCtrlYConfirmsAndCopies(t *testing.T) {
+	m := newModel(nil)
+	m.messages = []*api.Message{
+		{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "copy me"},
+	}
+
+	_, cmd := m.copyLastResponse()
+	if cmd == nil {
+		t.Fatal("expected a copy command")
+	}
+	cmd()
 	if len(m.messages) == 0 || m.messages[len(m.messages)-1].Payload != "📋 Copied last response to clipboard." {
 		t.Error("expected a transcript confirmation message")
 	}
