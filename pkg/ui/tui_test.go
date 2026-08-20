@@ -924,6 +924,73 @@ func TestCtrlYConfirmsAndCopies(t *testing.T) {
 	}
 }
 
+func TestCopyToolCommandAndOutput(t *testing.T) {
+	m := newModel(nil)
+	m.messages = []*api.Message{
+		{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "here is the plan"},
+		{Source: api.MessageSourceModel, Type: api.MessageTypeToolCallRequest, Payload: "kubectl get pods -n kube-system"},
+		{Source: api.MessageSourceAgent, Type: api.MessageTypeToolCallResponse, Payload: map[string]any{"stdout": "coredns 1/1\nkube-proxy 1/1\n"}},
+	}
+
+	// lastToolCommand finds the most recent tool-call request.
+	cmd, ok := m.lastToolCommand()
+	if !ok || cmd != "kubectl get pods -n kube-system" {
+		t.Fatalf("lastToolCommand = %q ok=%v, want the kubectl command", cmd, ok)
+	}
+	// lastToolOutput finds the most recent tool-call response's text.
+	out, ok := m.lastToolOutput()
+	if !ok || !strings.Contains(out, "coredns") {
+		t.Fatalf("lastToolOutput = %q ok=%v, want the pod list", out, ok)
+	}
+
+	// copyToolCommand confirms in the transcript.
+	_, cmdFn := m.copyToolCommand()
+	if cmdFn == nil {
+		t.Fatal("expected a copy command")
+	}
+	cmdFn()
+	if len(m.messages) == 0 || m.messages[len(m.messages)-1].Payload != "📋 Copied last command to clipboard." {
+		t.Error("expected a 'Copied last command' confirmation")
+	}
+
+	// copyToolOutput confirms in the transcript.
+	_, outFn := m.copyToolOutput()
+	if outFn == nil {
+		t.Fatal("expected a copy command")
+	}
+	outFn()
+	last := m.messages[len(m.messages)-1].Payload
+	if last != "📋 Copied last output to clipboard." {
+		t.Errorf("expected a 'Copied last output' confirmation, got %v", last)
+	}
+}
+
+func TestCopyToolNothingToCopy(t *testing.T) {
+	m := newModel(nil)
+	// No tool calls: both report nothing to copy.
+	_, cmdFn := m.copyToolCommand()
+	if cmdFn != nil {
+		t.Error("expected no command when there's no tool call")
+	}
+	if len(m.messages) == 0 || m.messages[len(m.messages)-1].Payload != "Nothing to copy yet." {
+		t.Error("expected a 'Nothing to copy' note")
+	}
+}
+
+func TestPaletteHasCopyCommandOutputActions(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	labels := make(map[string]bool)
+	for _, it := range m.paletteItems() {
+		labels[it.label] = true
+	}
+	for _, want := range []string{"Copy last response", "Copy last command", "Copy last output"} {
+		if !labels[want] {
+			t.Errorf("expected %q in the palette, missing", want)
+		}
+	}
+}
+
 func TestTypeAfterPastePreservesOrder(t *testing.T) {
 	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}, Input: make(chan any, 1)}
 	m := newModel(a)
