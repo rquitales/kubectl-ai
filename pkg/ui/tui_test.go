@@ -2618,6 +2618,33 @@ func TestRenderTextMsgShowsTokenCount(t *testing.T) {
 	}
 }
 
+func TestRenderTextMsgMarksShellEscape(t *testing.T) {
+	m := newModel(nil)
+	r, err := m.cache.getRenderer(80)
+	if err != nil {
+		t.Fatalf("getRenderer: %v", err)
+	}
+
+	// A shell-escape user message ("!command") is marked distinctly.
+	shellMsg := &api.Message{
+		Source: api.MessageSourceUser, Type: api.MessageTypeText,
+		Payload: "!kubectl get nodes", Timestamp: time.Now(),
+	}
+	got := m.renderTextMsg(shellMsg, r, 80)
+	if !strings.Contains(got, "shell") {
+		t.Errorf("expected a shell-escape marker on a '!command' user message, got:\n%s", got)
+	}
+
+	// A normal user message is not marked as a shell escape.
+	normalMsg := &api.Message{
+		Source: api.MessageSourceUser, Type: api.MessageTypeText,
+		Payload: "what pods are running?", Timestamp: time.Now(),
+	}
+	if got := m.renderTextMsg(normalMsg, r, 80); strings.Contains(got, "shell") {
+		t.Errorf("a normal user message must not show a shell marker, got:\n%s", got)
+	}
+}
+
 func TestViewStatusShowsContextBudget(t *testing.T) {
 	store := sessions.NewInMemoryChatStore()
 	_ = store.AddChatMessage(&api.Message{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "a", Tokens: 40000})
