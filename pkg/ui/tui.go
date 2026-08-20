@@ -196,6 +196,12 @@ const (
 	// worth re-rendering the transcript, so refreshes are gated (the final
 	// text message always refreshes, so the tail is never lost).
 	deltaRefreshInterval = 150 * time.Millisecond
+	// contextBudget is the assumed context window (in tokens) used to surface
+	// a rough usage indicator in the status bar. The exact limit isn't
+	// exposed to the TUI, so this is a conservative default for modern models
+	// (most are 128k+); the indicator is a guide, not a hard limit. It can be
+	// overridden by the KUBECTL_AI_CONTEXT_BUDGET env var.
+	contextBudget = 128_000
 )
 
 // pastedBlock holds the contents of a large paste. Instead of flooding the
@@ -2483,8 +2489,8 @@ func (m model) viewStatus(session *api.Session) string {
 		if kube != "" {
 			s += sep + kubeStyle.Render(kube)
 		}
-		if totalTokens > 0 {
-			s = dimStyle.Render("Σ "+formatTokens(totalTokens)) + " " + s
+		if budget := m.viewContextBudget(totalTokens); budget != "" {
+			s = budget + " " + s
 		}
 		return s
 	}
@@ -2533,6 +2539,49 @@ func formatTokens(n int) string {
 		return strconv.Itoa(n)
 	}
 	return fmt.Sprintf("%.1fk", float64(n)/1000)
+}
+
+// contextBudgetTokens is the effective context budget, overridable via the
+// KUBECTL_AI_CONTEXT_BUDGET env var (parsed as an integer token count).
+var contextBudgetTokens = contextBudget
+
+func init() {
+	if v := os.Getenv("KUBECTL_AI_CONTEXT_BUDGET"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			contextBudgetTokens = n
+		}
+	}
+}
+
+// viewContextBudget renders a compact context-usage indicator for the status
+// bar: a small fill bar plus a percentage, colored by usage tier (green low,
+// yellow moderate, red high). Returns "" when there's no usage yet. The
+// percentage is totalTokens / contextBudgetTokens, a rough guide since the
+// model's real limit isn't exposed to the TUI.
+func (m model) viewContextBudget(totalTokens int) string {
+	if totalTokens <= 0 || contextBudgetTokens <= 0 {
+		return ""
+	}
+	pct := totalTokens * 100 / contextBudgetTokens
+	if pct > 100 {
+		pct = 100
+	}
+	const barCells = 5
+	filled := pct * barCells / 100
+	if filled > barCells {
+		filled = barCells
+	}
+	bar := strings.Repeat("█", filled) + strings.Repeat("░", barCells-filled)
+
+	style := lipgloss.NewStyle().Foreground(colorSecondary) // green: low usage
+	hint := ""
+	if pct >= 80 {
+		style = lipgloss.NewStyle().Foreground(colorError) // red: compact soon
+		hint = " /compact"
+	} else if pct >= 50 {
+		style = lipgloss.NewStyle().Foreground(colorWarning) // yellow: moderate
+	}
+	return style.Render("ctx " + bar + " " + strconv.Itoa(pct) + "%" + hint)
 }
 
 func (m model) viewState(state api.AgentState) string {

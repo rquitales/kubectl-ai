@@ -2046,7 +2046,7 @@ func TestRenderTextMsgShowsTokenCount(t *testing.T) {
 	}
 }
 
-func TestViewStatusShowsTokenTotal(t *testing.T) {
+func TestViewStatusShowsContextBudget(t *testing.T) {
 	store := sessions.NewInMemoryChatStore()
 	_ = store.AddChatMessage(&api.Message{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "a", Tokens: 40000})
 	_ = store.AddChatMessage(&api.Message{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "b", Tokens: 5200})
@@ -2057,14 +2057,57 @@ func TestViewStatusShowsTokenTotal(t *testing.T) {
 	m := newModel(a)
 	m.width = 100
 
-	if got := m.viewStatus(a.GetSession()); !strings.Contains(got, "Σ 45.2k") {
-		t.Errorf("expected session token total in status bar, got:\n%s", got)
+	// 45200 / 128000 ≈ 35%: the status bar shows the context-usage indicator.
+	got := m.viewStatus(a.GetSession())
+	if !strings.Contains(got, "ctx ") || !strings.Contains(got, "35%") {
+		t.Errorf("expected a context budget indicator at 35%%, got:\n%s", got)
 	}
 
 	// Hidden when no usage was reported.
 	empty := &api.Session{ID: "test", AgentState: api.AgentStateIdle}
-	if got := m.viewStatus(empty); strings.Contains(got, "Σ") {
-		t.Errorf("expected no token total for an empty session, got:\n%s", got)
+	if g := m.viewStatus(empty); strings.Contains(g, "ctx ") {
+		t.Errorf("expected no context indicator for an empty session, got:\n%s", g)
+	}
+}
+
+func TestViewContextBudgetTiers(t *testing.T) {
+	m := newModel(nil)
+
+	// No usage: nothing rendered.
+	if got := m.viewContextBudget(0); got != "" {
+		t.Errorf("expected no indicator for 0 tokens, got %q", got)
+	}
+
+	// Low usage (<50%): contains a bar and percentage.
+	got := m.viewContextBudget(10_000) // ~7%
+	if !strings.Contains(got, "ctx ") || !strings.Contains(got, "%") {
+		t.Errorf("expected a low-usage indicator, got %q", got)
+	}
+	if !strings.Contains(got, "7%") {
+		t.Errorf("expected 7%% for 10000/128000, got %q", got)
+	}
+
+	// High usage (>=80%): still capped at 100%.
+	got = m.viewContextBudget(200_000)
+	if !strings.Contains(got, "100%") {
+		t.Errorf("expected usage capped at 100%%, got %q", got)
+	}
+	// The /compact hint appears at high usage.
+	if !strings.Contains(got, "/compact") {
+		t.Errorf("expected a /compact hint at high usage, got %q", got)
+	}
+}
+
+func TestViewContextBudgetEnvOverride(t *testing.T) {
+	// A smaller budget makes a given token count read as a higher percentage.
+	prev := contextBudgetTokens
+	contextBudgetTokens = 50_000
+	defer func() { contextBudgetTokens = prev }()
+
+	m := newModel(nil)
+	got := m.viewContextBudget(25_000) // 50% with the override
+	if !strings.Contains(got, "50%") {
+		t.Errorf("expected 50%% with a 50000 budget override, got %q", got)
 	}
 }
 
