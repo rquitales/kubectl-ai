@@ -1635,6 +1635,13 @@ func (m *model) handleEnter() (tea.Model, tea.Cmd) {
 		return m.renameCurrentSession(name)
 	}
 
+	// Intercept the help command (handled locally, prints a reference into the
+	// transcript instead of round-tripping to the LLM).
+	if v := strings.ToLower(value); v == "/help" || v == "/?" {
+		m.appendLocalMessage(helpText())
+		return m, nil
+	}
+
 	m.thinkStart = time.Now()
 
 	return m, func() tea.Msg {
@@ -2581,7 +2588,7 @@ func (m model) viewBottomDivider() string {
 var slashCommands = []string{
 	"/model", "/models", "/tools", "/sessions", "/session", "/new", "/save",
 	"/rename", "/resume", "/delete", "/delete-session", "/clear", "/exit",
-	"/quit", "/compact", "/context", "/namespace", "/ns",
+	"/quit", "/compact", "/context", "/namespace", "/ns", "/help",
 }
 
 // slashCompletions returns the commands matching the input prefix, or nil
@@ -2597,6 +2604,45 @@ func slashCompletions(input string) []string {
 		}
 	}
 	return matches
+}
+
+// helpText returns the on-demand reference printed to the transcript by the
+// /help (and /?) command: the key bindings and slash commands, grouped for
+// quick scanning. It's plain markdown so glamour renders it inline.
+func helpText() string {
+	return `## Keyboard shortcuts
+
+| Key | Action |
+| --- | --- |
+| **Enter** | send message |
+| **Ctrl+J** / **Alt+Enter** | insert newline |
+| **Ctrl+P** | command palette |
+| **↑ / ↓** | input history (or move cursor in multi-line) |
+| **Shift+Tab** | toggle auto-accept mode |
+| **Esc** | clear input / interrupt agent / decline prompt |
+| **Ctrl+C** | quit |
+| **Ctrl+L** | clear screen (scroll up to reveal) |
+| **Ctrl+Y** | copy last reply |
+| **Ctrl+O** | expand/collapse tool results |
+| **PgUp / PgDn** | scroll transcript |
+| **Tab** | autocomplete (commands, @files, /context, /namespace) |
+
+## Slash commands
+
+| Command | Action |
+| --- | --- |
+| **/sessions** | browse & resume past sessions |
+| **/context** | switch kube context (Tab to autocomplete) |
+| **/namespace** / **/ns** | switch namespace (Tab to autocomplete) |
+| **/model** | switch model |
+| **/rename** | rename this session |
+| **/compact** | summarize & free context |
+| **/clear** | clear the transcript |
+| **/help** / **/?** | show this reference |
+| **/exit** | quit |
+
+Type **!command** to run a shell command, or **@path** to attach a file.
+`
 }
 
 // lastToken returns the input's trailing whitespace-separated token
