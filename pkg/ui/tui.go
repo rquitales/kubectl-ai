@@ -1940,7 +1940,12 @@ func (m model) renderToolGroup(req, resp *api.Message, w int) string {
 	if !ok {
 		return ""
 	}
-	header := successText.Render("⚡ " + truncateRunes(cmd, max(w-4, 20)))
+	failed := toolResultFailed(resp.Payload)
+	marker, headStyle := "⚡ ", successText
+	if failed {
+		marker, headStyle = "✗ ", errorText
+	}
+	header := headStyle.Render(marker + truncateRunes(cmd, max(w-4, 20)))
 
 	body := m.renderToolResult(resp)
 	if strings.TrimSpace(body) == "" {
@@ -1971,7 +1976,15 @@ const (
 // Ctrl+O toggles expandToolResults to show the full output (still capped at
 // toolResultExpandedLines lines and toolResultExpandedWidth columns).
 func (m model) renderToolResult(msg *api.Message) string {
+	failed := toolResultFailed(msg.Payload)
 	text := toolResultText(msg.Payload)
+	if failed {
+		// For a failed command, prefer stderr/error over stdout so the cause
+		// is front and center rather than the command's normal output.
+		if s := toolResultErrorText(msg.Payload); strings.TrimSpace(s) != "" {
+			text = s
+		}
+	}
 	if strings.TrimSpace(text) == "" {
 		return ""
 	}
@@ -1986,13 +1999,24 @@ func (m model) renderToolResult(msg *api.Message) string {
 		shown = shown[:maxLines]
 	}
 
+	// Failed results render in the error color so a back-to-back run of tool
+	// calls makes the failure obvious at a glance; successes stay dim.
+	lineStyle := dimStyle
+	if failed {
+		lineStyle = lipgloss.NewStyle().Foreground(colorError)
+	}
+
 	var out []string
 	for i, l := range shown {
 		prefix := "    "
 		if i == 0 {
-			prefix = "  ⎿ "
+			if failed {
+				prefix = "  ⎿ ✗ "
+			} else {
+				prefix = "  ⎿ "
+			}
 		}
-		out = append(out, dimStyle.Render(prefix+truncateRunes(l, lineWidth)))
+		out = append(out, lineStyle.Render(prefix+truncateRunes(l, lineWidth)))
 	}
 	if len(lines) > maxLines {
 		hint := fmt.Sprintf("    +%d more lines", len(lines)-maxLines)
@@ -2001,9 +2025,9 @@ func (m model) renderToolResult(msg *api.Message) string {
 		} else {
 			hint += " (ctrl+o to expand)"
 		}
-		out = append(out, dimStyle.Render(hint))
+		out = append(out, lineStyle.Render(hint))
 	} else if m.expandToolResults {
-		out[len(out)-1] += dimStyle.Render(" (ctrl+o to collapse)")
+		out[len(out)-1] += lineStyle.Render(" (ctrl+o to collapse)")
 	}
 	return strings.Join(out, "\n") + "\n"
 }
@@ -2028,6 +2052,54 @@ func toolResultText(payload any) string {
 		}
 	}
 	return fmt.Sprintf("%v", payload)
+}
+
+// toolResultFailed reports whether a tool-call result represents a failure:
+// a non-zero exit code, a non-empty "error" field in the result map, or a
+// plain string payload emitted on the tool-error path (err.Error()). Success-
+// shaped results (empty maps, stdout/content wrappers) report false.
+func toolResultFailed(payload any) bool {
+	switch p := payload.(type) {
+	case string:
+		// The only string results are shim observations or err.Error();
+		// treat a non-empty string with no "Result of running" prefix as a
+		// failure. A shim observation wraps successful output.
+		return p != "" && !strings.HasPrefix(p, "Result of running ")
+	case map[string]any:
+		if code, ok := p["exit_code"]; ok {
+			if n, ok := toInt(code); ok && n != 0 {
+				return true
+			}
+		}
+		if e, ok := p["error"].(string); ok && e != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// toolResultErrorText extracts the failure explanation (stderr/error) from a
+// result payload, preferring the cause over normal stdout.
+func toolResultErrorText(payload any) string {
+	if p, ok := payload.(map[string]any); ok {
+		for _, k := range []string{"error", "stderr"} {
+			if s, ok := p[k].(string); ok && s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
+// toInt converts a JSON-decoded numeric value (float64) to an int.
+func toInt(v any) (int, bool) {
+	switch n := v.(type) {
+	case float64:
+		return int(n), true
+	case int:
+		return n, true
+	}
+	return 0, false
 }
 
 func (m model) renderError(msg *api.Message, w int) string {
