@@ -379,7 +379,7 @@ type model struct {
 
 func newModel(agent *agent.Agent) model {
 	ti := textarea.New()
-	ti.Placeholder = "Ask kubectl-ai anything..."
+	ti.Placeholder = "Ask anything, or / for commands, !shell, @file…"
 	ti.Focus()
 	ti.Prompt = ""
 	ti.CharLimit = 4096
@@ -1721,7 +1721,7 @@ func (m *model) enterSessionRename() {
 // exitSessionRename leaves rename mode, clearing the input.
 func (m *model) exitSessionRename() {
 	m.sessionRename = false
-	m.input.Placeholder = "Ask kubectl-ai anything..."
+	m.input.Placeholder = "Ask anything, or / for commands, !shell, @file…"
 	m.input.Reset()
 	m.syncInputHeight()
 }
