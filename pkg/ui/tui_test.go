@@ -2401,6 +2401,22 @@ func TestViewStatusShowsKubeContext(t *testing.T) {
 	}
 }
 
+func TestViewStatusOneLineAtNarrowWidth(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", ModelID: "a-very-long-model-name", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.kubeContext = kubeContextInfo{context: "gke-prod-eu-cluster", namespace: "payments"}
+	m.kubeContextOK = true
+	// At a very narrow width the shrink loop can't shrink everything to fit;
+	// the status bar must still stay on one line (truncate) rather than wrap.
+	for _, w := range []int{20, 30, 40} {
+		m.width = w
+		got := m.viewStatus(a.GetSession())
+		if n := lipgloss.Height(got); n != 1 {
+			t.Errorf("width=%d: status bar is %d lines, want 1:\n%s", w, n, got)
+		}
+	}
+}
+
 func TestViewStateShowsTurnDurationOnDone(t *testing.T) {
 	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateDone}}
 	m := newModel(a)
