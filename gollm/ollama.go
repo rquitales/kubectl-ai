@@ -289,6 +289,10 @@ func (p *OllamaPart) AsFunctionCalls() ([]FunctionCall, bool) {
 	return nil, false
 }
 
+func (p *OllamaPart) AsThinking() (string, bool) {
+	return "", false
+}
+
 func (c *OllamaChat) SetFunctionDefinitions(functionDefinitions []*FunctionDefinition) error {
 	var tools []api.Tool
 	for _, functionDefinition := range functionDefinitions {

@@ -627,6 +627,10 @@ func (p *GeminiPart) AsFunctionCalls() ([]FunctionCall, bool) {
 	return nil, false
 }
 
+func (p *GeminiPart) AsThinking() (string, bool) {
+	return "", false
+}
+
 type GeminiCompletionResponse struct {
 	geminiResponse *genai.GenerateContentResponse
 	text           string

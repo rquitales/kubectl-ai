@@ -2393,6 +2393,16 @@ func textDelta(id, payload string) *api.Message {
 	}
 }
 
+func thinkingDelta(id, payload string) *api.Message {
+	return &api.Message{
+		ID:        id,
+		Source:    api.MessageSourceModel,
+		Type:      api.MessageTypeThinkingDelta,
+		Payload:   payload,
+		Timestamp: time.Now(),
+	}
+}
+
 func TestTextDeltaUpdateInPlaceAndFinalReplacement(t *testing.T) {
 	m, store := newStreamModel()
 	const streamID = "stream-1"
@@ -2508,6 +2518,79 @@ func TestFinalTextHasNoLiveCursor(t *testing.T) {
 	}
 	if strings.Contains(got, "▋") {
 		t.Errorf("the final reply must not show a live cursor, got:\n%s", got)
+	}
+}
+
+func TestThinkingDeltaShowsStreamingHeader(t *testing.T) {
+	m, _ := newStreamModel() // AgentStateRunning
+	const thinkID = "think-1"
+	m.handleAgentMsg(thinkingDelta(thinkID, "Let me consider the pods"))
+
+	got := m.renderMessages()
+	if !strings.Contains(got, "Thinking") {
+		t.Errorf("expected a streaming thinking header, got:\n%s", got)
+	}
+	// The partial reasoning is shown dimmed while streaming.
+	if !strings.Contains(got, "consider") {
+		t.Errorf("expected the partial reasoning visible while streaming, got:\n%s", got)
+	}
+}
+
+func TestFinalThinkingCollapsesToSummary(t *testing.T) {
+	m, _ := newStreamModel()
+	const thinkID = "think-1"
+	m.handleAgentMsg(thinkingDelta(thinkID, "step one\nstep two\nstep three"))
+
+	// The final thinking message replaces the delta and collapses to a summary.
+	final := &api.Message{
+		ID: thinkID, Source: api.MessageSourceModel, Type: api.MessageTypeThinking,
+		Payload: "step one\nstep two\nstep three", Timestamp: time.Now(),
+	}
+	m.agent.Session.AgentState = api.AgentStateIdle
+	m.handleAgentMsg(final)
+
+	got := m.renderMessages()
+	if !strings.Contains(got, "Thought") {
+		t.Errorf("expected a collapsed 'Thought' summary, got:\n%s", got)
+	}
+	if !strings.Contains(got, "3 lines") {
+		t.Errorf("expected the line count in the summary, got:\n%s", got)
+	}
+	// Collapsed by default: the full reasoning isn't shown inline.
+	if strings.Contains(got, "step three") {
+		t.Errorf("collapsed thinking must not show the full reasoning, got:\n%s", got)
+	}
+}
+
+func TestCtrlTTogglesThinkingExpansion(t *testing.T) {
+	m, _ := newStreamModel()
+	const thinkID = "think-1"
+	final := &api.Message{
+		ID: thinkID, Source: api.MessageSourceModel, Type: api.MessageTypeThinking,
+		Payload: "the reasoning here", Timestamp: time.Now(),
+	}
+	m.agent.Session.AgentState = api.AgentStateIdle
+	m.handleAgentMsg(final)
+
+	collapsed := m.renderMessages()
+	if strings.Contains(collapsed, "the reasoning here") {
+		t.Errorf("expected thinking collapsed by default, got:\n%s", collapsed)
+	}
+
+	// Ctrl+T expands.
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlT})
+	if !m.expandThinking {
+		t.Fatal("expected ctrl+t to expand thinking")
+	}
+	expanded := m.renderMessages()
+	if !strings.Contains(expanded, "the reasoning here") {
+		t.Errorf("expected expanded thinking to show the reasoning, got:\n%s", expanded)
+	}
+
+	// A second Ctrl+T collapses again.
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlT})
+	if m.expandThinking {
+		t.Error("expected a second ctrl+t to collapse thinking")
 	}
 }
 
@@ -2863,7 +2946,7 @@ func TestViewHelpNeverWraps(t *testing.T) {
 func TestViewHelpWideShowsAllHints(t *testing.T) {
 	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
 	m := newModel(a)
-	m.width, m.height = 200, 40
+	m.width, m.height = 220, 40
 	m.resize()
 	// Fill the transcript so the scroll hint is added.
 	for i := 0; i < 50; i++ {

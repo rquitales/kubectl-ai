@@ -380,6 +380,10 @@ func (p *LlamaCppPart) AsFunctionCalls() ([]FunctionCall, bool) {
 	return nil, false
 }
 
+func (p *LlamaCppPart) AsThinking() (string, bool) {
+	return "", false
+}
+
 func (c *LlamaCppChat) SetFunctionDefinitions(functionDefinitions []*FunctionDefinition) error {
 	var tools []llamacppTool
 	for _, functionDefinition := range functionDefinitions {

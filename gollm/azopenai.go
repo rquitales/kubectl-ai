@@ -392,6 +392,10 @@ func (p *AzureOpenAIPart) AsFunctionCalls() ([]FunctionCall, bool) {
 	return nil, false
 }
 
+func (p *AzureOpenAIPart) AsThinking() (string, bool) {
+	return "", false
+}
+
 func (c *AzureOpenAIChat) SetFunctionDefinitions(functionDefinitions []*FunctionDefinition) error {
 	var tools []azopenai.ChatCompletionsToolDefinitionClassification
 	for _, functionDefinition := range functionDefinitions {

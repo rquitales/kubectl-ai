@@ -679,6 +679,10 @@ func (p *bedrockTextPart) AsFunctionCalls() ([]FunctionCall, bool) {
 	return nil, false
 }
 
+func (p *bedrockTextPart) AsThinking() (string, bool) {
+	return "", false
+}
+
 // bedrockToolPart implements Part for tool/function calls
 type bedrockToolPart struct {
 	toolUse *types.ToolUseBlock
@@ -718,6 +722,10 @@ func (p *bedrockToolPart) AsFunctionCalls() ([]FunctionCall, bool) {
 	}
 
 	return []FunctionCall{funcCall}, true
+}
+
+func (p *bedrockToolPart) AsThinking() (string, bool) {
+	return "", false
 }
 
 // Helper functions

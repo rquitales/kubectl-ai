@@ -485,6 +485,10 @@ func (p *grokPart) AsFunctionCalls() ([]FunctionCall, bool) {
 	return gollmCalls, true
 }
 
+func (p *grokPart) AsThinking() (string, bool) {
+	return "", false
+}
+
 // grokChatStreamResponse represents a streaming response chunk from Grok.
 type grokChatStreamResponse struct {
 	streamChunk openai.ChatCompletionChunk
@@ -632,4 +636,8 @@ func (p *grokStreamPart) AsFunctionCalls() ([]FunctionCall, bool) {
 	}
 
 	return completeCalls, len(completeCalls) > 0
+}
+
+func (p *grokStreamPart) AsThinking() (string, bool) {
+	return "", false
 }

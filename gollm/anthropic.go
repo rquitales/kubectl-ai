@@ -440,7 +440,11 @@ func (c *anthropicChatSession) SendStreaming(ctx context.Context, contents ...an
 						pt.input.WriteString(delta.PartialJSON)
 					}
 				case anthropic.ThinkingDelta:
-					// thinking content is kept in history via accumulator, not yielded to UI
+					// Surface the model's reasoning to the UI as a thinking stream,
+					// alongside (not instead of) the text it's kept in history for.
+					if !yield(&anthropicStreamResponse{thinking: delta.Thinking}, nil) {
+						return
+					}
 				}
 
 			case anthropic.ContentBlockStopEvent:
@@ -527,6 +531,7 @@ func (r *anthropicResponse) Candidates() []Candidate {
 // anthropicStreamResponse implements ChatResponse for streaming responses.
 type anthropicStreamResponse struct {
 	text         string
+	thinking     string
 	functionCall *FunctionCall
 	usage        *anthropic.Usage
 }
@@ -541,11 +546,12 @@ func (r *anthropicStreamResponse) UsageMetadata() any {
 }
 
 func (r *anthropicStreamResponse) Candidates() []Candidate {
-	if r.text == "" && r.functionCall == nil {
+	if r.text == "" && r.functionCall == nil && r.thinking == "" {
 		return nil
 	}
 	return []Candidate{&anthropicStreamCandidate{
 		text:         r.text,
+		thinking:     r.thinking,
 		functionCall: r.functionCall,
 	}}
 }
@@ -597,7 +603,11 @@ func (c *anthropicCandidate) Parts() []Part {
 				},
 			})
 		case "thinking":
-			// ThinkingBlock — do not yield to UI, skip
+			// Surface the reasoning block to the UI as a thinking part.
+			tb := block.AsThinking()
+			if tb.Thinking != "" {
+				parts = append(parts, &anthropicThinkingPart{thinking: tb.Thinking})
+			}
 		}
 	}
 	return parts
@@ -606,6 +616,7 @@ func (c *anthropicCandidate) Parts() []Part {
 // anthropicStreamCandidate implements Candidate for streaming responses.
 type anthropicStreamCandidate struct {
 	text         string
+	thinking     string
 	functionCall *FunctionCall
 }
 
@@ -623,6 +634,9 @@ func (c *anthropicStreamCandidate) String() string {
 
 func (c *anthropicStreamCandidate) Parts() []Part {
 	var parts []Part
+	if c.thinking != "" {
+		parts = append(parts, &anthropicThinkingPart{thinking: c.thinking})
+	}
 	if c.text != "" {
 		parts = append(parts, &anthropicTextPart{text: c.text})
 	}
@@ -647,6 +661,10 @@ func (p *anthropicTextPart) AsFunctionCalls() ([]FunctionCall, bool) {
 	return nil, false
 }
 
+func (p *anthropicTextPart) AsThinking() (string, bool) {
+	return "", false
+}
+
 // anthropicToolPart implements Part for tool/function calls.
 type anthropicToolPart struct {
 	functionCall FunctionCall
@@ -660,6 +678,31 @@ func (p *anthropicToolPart) AsText() (string, bool) {
 
 func (p *anthropicToolPart) AsFunctionCalls() ([]FunctionCall, bool) {
 	return []FunctionCall{p.functionCall}, true
+}
+
+func (p *anthropicToolPart) AsThinking() (string, bool) {
+	return "", false
+}
+
+// anthropicThinkingPart implements Part for the model's reasoning/thinking
+// content. It surfaces to the UI as a collapsible thinking block (the text
+// itself is kept in history via the accumulator, so it isn't double-counted).
+type anthropicThinkingPart struct {
+	thinking string
+}
+
+var _ Part = (*anthropicThinkingPart)(nil)
+
+func (p *anthropicThinkingPart) AsText() (string, bool) {
+	return "", false
+}
+
+func (p *anthropicThinkingPart) AsFunctionCalls() ([]FunctionCall, bool) {
+	return nil, false
+}
+
+func (p *anthropicThinkingPart) AsThinking() (string, bool) {
+	return p.thinking, p.thinking != ""
 }
 
 // anthropicCompletionResponse wraps a ChatResponse to implement CompletionResponse.

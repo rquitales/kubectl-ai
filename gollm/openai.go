@@ -578,6 +578,10 @@ func (p *openAIPart) AsFunctionCalls() ([]FunctionCall, bool) {
 	return convertToolCallsToFunctionCalls(p.toolCalls)
 }
 
+func (p *openAIPart) AsThinking() (string, bool) {
+	return "", false
+}
+
 // Update openAIChatStreamResponse to include accumulated content
 type openAIChatStreamResponse struct {
 	streamChunk openai.ChatCompletionChunk
@@ -660,6 +664,10 @@ func (p *openAIStreamPart) AsText() (string, bool) {
 
 func (p *openAIStreamPart) AsFunctionCalls() ([]FunctionCall, bool) {
 	return convertToolCallsToFunctionCalls(p.toolCalls)
+}
+
+func (p *openAIStreamPart) AsThinking() (string, bool) {
+	return "", false
 }
 
 // convertSchemaForOpenAI converts and transforms a schema for OpenAI compatibility
