@@ -1489,6 +1489,34 @@ func TestPaletteAutoModeToggleInstant(t *testing.T) {
 	}
 }
 
+func TestPaletteHasExpandToggles(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	labels := make(map[string]bool)
+	for _, it := range m.paletteItems() {
+		labels[it.label] = true
+	}
+	// Both expand toggles are present and reflect the (collapsed) state.
+	if !labels["Expand tool results"] {
+		t.Error("expected 'Expand tool results' in the palette")
+	}
+	if !labels["Expand thinking"] {
+		t.Error("expected 'Expand thinking' in the palette")
+	}
+	// Running the tool-results toggle flips the state and the label.
+	_, _ = m.toggleExpandToolResults()
+	if !m.expandToolResults {
+		t.Error("expected toggleExpandToolResults to expand")
+	}
+	for _, it := range m.paletteItems() {
+		if it.label == "Collapse tool results" {
+			goto found
+		}
+	}
+	t.Error("expected 'Collapse tool results' label after expanding")
+found:
+}
+
 func newRenameModel(t *testing.T) (model, *agent.Agent, string) {
 	t.Helper()
 	mgr, err := sessions.NewSessionManager("memory")

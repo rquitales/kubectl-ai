@@ -1320,6 +1320,26 @@ func (m *model) paletteItems() []paletteItem {
 		paletteItem{label: "Copy last command", hint: "", run: (*model).copyToolCommand},
 		paletteItem{label: "Copy last output", hint: "", run: (*model).copyToolOutput},
 	)
+	// Toggles that have keybindings but no palette entry, so they're discoverable
+	// only if you know the key. Surface them here; the label reflects state.
+	if m.expandToolResults {
+		items = append(items, paletteItem{label: "Collapse tool results", hint: "ctrl+o", run: func(m *model) (tea.Model, tea.Cmd) {
+			return m.toggleExpandToolResults()
+		}})
+	} else {
+		items = append(items, paletteItem{label: "Expand tool results", hint: "ctrl+o", run: func(m *model) (tea.Model, tea.Cmd) {
+			return m.toggleExpandToolResults()
+		}})
+	}
+	if m.expandThinking {
+		items = append(items, paletteItem{label: "Collapse thinking", hint: "ctrl+t", run: func(m *model) (tea.Model, tea.Cmd) {
+			return m.toggleExpandThinking()
+		}})
+	} else {
+		items = append(items, paletteItem{label: "Expand thinking", hint: "ctrl+t", run: func(m *model) (tea.Model, tea.Cmd) {
+			return m.toggleExpandThinking()
+		}})
+	}
 	if s := m.agentState(); s == api.AgentStateRunning || s == api.AgentStateInitializing || m.inChoiceMode {
 		items = append(items, paletteItem{label: "Interrupt agent", hint: "esc", run: (*model).interruptRun})
 	}
@@ -1412,6 +1432,24 @@ func (m *model) toggleAutoMode() (tea.Model, tea.Cmd) {
 	} else {
 		m.appendLocalMessage("Auto mode off — you'll be asked to approve modifying commands.")
 	}
+	return m, nil
+}
+
+// toggleExpandToolResults flips tool-result expansion (ctrl+o), exposed via the
+// command palette so it's discoverable without knowing the keybinding.
+func (m *model) toggleExpandToolResults() (tea.Model, tea.Cmd) {
+	m.expandToolResults = !m.expandToolResults
+	m.dirty = true
+	m.refresh()
+	return m, nil
+}
+
+// toggleExpandThinking flips reasoning/thinking expansion (ctrl+t), exposed via
+// the command palette so it's discoverable without knowing the keybinding.
+func (m *model) toggleExpandThinking() (tea.Model, tea.Cmd) {
+	m.expandThinking = !m.expandThinking
+	m.dirty = true
+	m.refresh()
 	return m, nil
 }
 
