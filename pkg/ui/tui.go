@@ -38,6 +38,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
+	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 )
 
@@ -187,6 +188,9 @@ const (
 	// for it to be collapsed into a compact placeholder token instead of
 	// being inserted into the input verbatim.
 	pasteCollapseLines = 3
+	// kubeContextTTL is how often the status bar's kube context is
+	// re-resolved from the kubeconfig file (driven by the 1s tick).
+	kubeContextTTL = 10 * time.Second
 )
 
 // pastedBlock holds the contents of a large paste. Instead of flooding the
@@ -299,13 +303,26 @@ type model struct {
 	// while cleared); it resets when scrolling back to the bottom or on
 	// new messages.
 	revealAll bool
+	// expandToolResults renders tool call results in full (ctrl+o toggle);
+	// collapsed results show only the first few lines plus a count.
+	expandToolResults bool
+	// Slash-command autocomplete cycling state: the matches captured when
+	// Tab was first pressed, so cycling doesn't re-narrow once the input
+	// becomes a full command name.
+	tabMatches []string
+	tabIndex   int
 	// sessionID tracks the active session so switches are detectable.
-	sessionID  string
-	width      int
-	height     int
-	dirty      bool
-	quitting   bool
-	thinkStart time.Time
+	sessionID string
+	// Kube context/namespace shown in the status bar; resolved once at
+	// startup and re-resolved on a TTL by the 1s tick (a cheap file read).
+	kubeContext     kubeContextInfo
+	kubeContextOK   bool
+	kubeContextLast time.Time
+	width           int
+	height          int
+	dirty           bool
+	quitting        bool
+	thinkStart      time.Time
 	// Choice mode tracking
 	inChoiceMode   bool
 	choicePrompt   string
@@ -388,6 +405,7 @@ func newModel(agent *agent.Agent) model {
 			m.sessionID = s.ID
 		}
 	}
+	m.resolveKubeContext()
 	return m
 }
 
@@ -419,6 +437,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 
 	case tickMsg:
+		// Re-resolve the kube context on a TTL so an external
+		// `kubectl config use-context` is reflected in the status bar.
+		if time.Since(m.kubeContextLast) > kubeContextTTL {
+			m.resolveKubeContext()
+		}
 		return m, m.tick()
 
 	case sessionListMsg:
@@ -604,6 +627,9 @@ func (m *model) inputBlockHeight() int {
 	if m.sessionRename {
 		h++ // the "Rename session:" label line
 	}
+	if len(slashCompletions(m.input.Value())) > 0 {
+		h++ // the slash-command completion hint line
+	}
 	for _, p := range m.pastes {
 		if p.token == "" {
 			h++ // chip-fallback pastes line
@@ -709,10 +735,41 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyCtrlP:
 		m.openPalette()
 		return m, nil
+	case tea.KeyCtrlO:
+		// Toggle expanded tool call results (collapsed by default so
+		// back-to-back tool calls stay compact).
+		m.expandToolResults = !m.expandToolResults
+		m.dirty = true
+		m.refresh()
+		return m, nil
 	case tea.KeyShiftTab:
 		// Toggle auto-accept mode (skip permission prompts), like opencode
 		// and Claude Code.
 		return m.toggleAutoMode()
+	case tea.KeyTab:
+		// Slash-command autocomplete: cycle the input through the matches.
+		if m.inChoiceMode {
+			return m, nil
+		}
+		if m.tabIndex < len(m.tabMatches) && m.input.Value() == m.tabMatches[m.tabIndex] {
+			// Mid-cycle: advance to the next captured match.
+			m.tabIndex = (m.tabIndex + 1) % len(m.tabMatches)
+		} else {
+			// Start a new cycle from the current prefix.
+			m.tabMatches = slashCompletions(m.input.Value())
+			m.tabIndex = 0
+		}
+		if len(m.tabMatches) > 0 {
+			m.input.SetValue(m.tabMatches[m.tabIndex])
+			m.input.CursorEnd()
+			m.syncInputHeight()
+			return m, nil
+		}
+		// Not a slash command: keep the textarea's default behavior.
+		var cmd tea.Cmd
+		m.input, cmd = m.input.Update(msg)
+		m.syncInputHeight()
+		return m, cmd
 	case tea.KeyEnter:
 		if msg.Alt {
 			// Alt+Enter inserts a newline (bound in the textarea keymap).
@@ -1727,9 +1784,24 @@ func (m model) renderToolCall(msg *api.Message, w int) string {
 	return toolBox.Width(w).Render(content) + "\n"
 }
 
+const (
+	// toolResultCollapsedLines is the number of output lines shown for a
+	// collapsed tool result.
+	toolResultCollapsedLines = 3
+	// toolResultExpandedLines caps an expanded tool result; beyond it a
+	// "+N more lines" tail is shown.
+	toolResultExpandedLines = 200
+	// toolResultCollapsedWidth and toolResultExpandedWidth cap the
+	// rendered width of each output line.
+	toolResultCollapsedWidth = 100
+	toolResultExpandedWidth  = 200
+)
+
 // renderToolResult renders a tool call's result collapsed (opencode-style):
 // the first couple of output lines plus a "+N more lines" count, so back-to-
 // back tool calls are visually distinct instead of looking duplicated.
+// Ctrl+O toggles expandToolResults to show the full output (still capped at
+// toolResultExpandedLines lines and toolResultExpandedWidth columns).
 func (m model) renderToolResult(msg *api.Message) string {
 	text := toolResultText(msg.Payload)
 	if strings.TrimSpace(text) == "" {
@@ -1737,27 +1809,35 @@ func (m model) renderToolResult(msg *api.Message) string {
 	}
 
 	lines := strings.Split(strings.TrimRight(text, "\n"), "\n")
-	const maxLines = 3
+	maxLines, lineWidth := toolResultCollapsedLines, toolResultCollapsedWidth
+	if m.expandToolResults {
+		maxLines, lineWidth = toolResultExpandedLines, toolResultExpandedWidth
+	}
 	shown := lines
 	if len(shown) > maxLines {
 		shown = shown[:maxLines]
 	}
 
-	var b strings.Builder
+	var out []string
 	for i, l := range shown {
+		prefix := "    "
 		if i == 0 {
-			b.WriteString(dimStyle.Render("  ⎿ "))
-		} else {
-			b.WriteString(dimStyle.Render("    "))
+			prefix = "  ⎿ "
 		}
-		b.WriteString(dimStyle.Render(truncateRunes(l, 100)))
-		b.WriteString("\n")
+		out = append(out, dimStyle.Render(prefix+truncateRunes(l, lineWidth)))
 	}
 	if len(lines) > maxLines {
-		b.WriteString(dimStyle.Render(fmt.Sprintf("    +%d more lines", len(lines)-maxLines)))
-		b.WriteString("\n")
+		hint := fmt.Sprintf("    +%d more lines", len(lines)-maxLines)
+		if m.expandToolResults {
+			hint += " (ctrl+o to collapse)"
+		} else {
+			hint += " (ctrl+o to expand)"
+		}
+		out = append(out, dimStyle.Render(hint))
+	} else if m.expandToolResults {
+		out[len(out)-1] += dimStyle.Render(" (ctrl+o to collapse)")
 	}
-	return b.String()
+	return strings.Join(out, "\n") + "\n"
 }
 
 // toolResultText extracts displayable output from a tool call result payload
@@ -1933,6 +2013,61 @@ func (m model) viewSessionBrowser() string {
 		inputBox.Width(max(m.width-4, 20)).Render(sb.String()))
 }
 
+// kubeContextInfo is the resolved current kube context/namespace shown in
+// the status bar.
+type kubeContextInfo struct {
+	context   string
+	namespace string
+}
+
+// String renders the info as "context/namespace", or the bare context for
+// the default namespace.
+func (k kubeContextInfo) String() string {
+	if k.namespace == "" || k.namespace == "default" {
+		return k.context
+	}
+	return k.context + "/" + k.namespace
+}
+
+// isProd reports whether the context name looks like a production cluster
+// (rendered in the warning color in the status bar).
+func (k kubeContextInfo) isProd() bool {
+	return strings.Contains(k.context, "prod")
+}
+
+// loadKubeContext reads the current context and namespace from a kubeconfig
+// file (path, or the KUBECONFIG env / ~/.kube/config default when empty)
+// using client-go — no kubectl subprocess. A missing or unreadable config
+// reports ok=false so the status bar simply omits the indicator.
+func loadKubeContext(path string) (info kubeContextInfo, ok bool) {
+	rules := clientcmd.NewDefaultClientConfigLoadingRules()
+	if path != "" {
+		rules = &clientcmd.ClientConfigLoadingRules{ExplicitPath: path}
+	}
+	cfg, err := rules.Load()
+	if err != nil || cfg.CurrentContext == "" {
+		return kubeContextInfo{}, false
+	}
+	info.context = cfg.CurrentContext
+	info.namespace = "default"
+	if ctx, ok := cfg.Contexts[cfg.CurrentContext]; ok && ctx.Namespace != "" {
+		info.namespace = ctx.Namespace
+	}
+	return info, true
+}
+
+// resolveKubeContext (re)loads the status bar's kube context, preferring
+// the agent's explicit kubeconfig path when set. Failures are silent: the
+// indicator simply disappears.
+func (m *model) resolveKubeContext() {
+	path := ""
+	if m.agent != nil {
+		path = m.agent.Kubeconfig
+	}
+	m.kubeContext, m.kubeContextOK = loadKubeContext(path)
+	m.kubeContextLast = time.Now()
+}
+
 func (m model) viewStatus(session *api.Session) string {
 	sep := dimStyle.Render(" | ")
 
@@ -1952,17 +2087,40 @@ func (m model) viewStatus(session *api.Session) string {
 	if m.agent != nil && m.agent.SkipPermissionsEnabled() {
 		left += sep + warnText.Render("⚡AUTO")
 	}
-	right := lipgloss.NewStyle().Foreground(colorSecondary).Render(model)
+
+	// The kube context sits on the right next to the model name; contexts
+	// that look like production get the warning color.
+	kubeStyle := lipgloss.NewStyle().Foreground(colorSecondary)
+	kube := ""
+	if m.kubeContextOK {
+		if m.kubeContext.isProd() {
+			kubeStyle = lipgloss.NewStyle().Foreground(colorWarning)
+		}
+		kube = "⎈ " + m.kubeContext.String()
+	}
+	renderRight := func() string {
+		s := lipgloss.NewStyle().Foreground(colorSecondary).Render(model)
+		if kube != "" {
+			s += sep + kubeStyle.Render(kube)
+		}
+		return s
+	}
+	right := renderRight()
 
 	// The status bar must always be exactly one line, no matter the
-	// terminal width: shrink the name (then the model) until it fits.
+	// terminal width: shrink the name (then the model, then the kube
+	// context) until it fits.
 	for lipgloss.Width(left)+lipgloss.Width(right) > m.width-2 && len([]rune(name)) > 8 {
 		name = truncateRunes(name, len([]rune(name))-4)
 		left = primaryText.Render("kubectl-ai") + sep + mutedStyle.Render(name) + sep + m.viewState(session.AgentState)
 	}
 	for lipgloss.Width(left)+lipgloss.Width(right) > m.width-2 && len([]rune(model)) > 7 {
 		model = truncateRunes(model, len([]rune(model))-4)
-		right = lipgloss.NewStyle().Foreground(colorSecondary).Render(model)
+		right = renderRight()
+	}
+	for lipgloss.Width(left)+lipgloss.Width(right) > m.width-2 && len([]rune(kube)) > 8 {
+		kube = truncateRunes(kube, len([]rune(kube))-4)
+		right = renderRight()
 	}
 
 	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right) - 2
@@ -2012,6 +2170,40 @@ func (m model) viewDivider() string {
 	return dimStyle.Render(strings.Repeat("─", m.width))
 }
 
+// slashCommands is the static list offered for autocomplete when the input
+// starts with "/".
+var slashCommands = []string{
+	"/model", "/models", "/tools", "/sessions", "/session", "/new", "/save",
+	"/rename", "/resume", "/delete", "/delete-session", "/clear", "/exit",
+	"/quit", "/compact",
+}
+
+// slashCompletions returns the commands matching the input prefix, or nil
+// when the input isn't a slash command.
+func slashCompletions(input string) []string {
+	if !strings.HasPrefix(input, "/") {
+		return nil
+	}
+	var matches []string
+	for _, c := range slashCommands {
+		if strings.HasPrefix(c, input) {
+			matches = append(matches, c)
+		}
+	}
+	return matches
+}
+
+// completionHint renders the dim slash-command completion line shown under
+// the input, or "" when there are no matches.
+func (m model) completionHint() string {
+	matches := slashCompletions(m.input.Value())
+	if len(matches) == 0 {
+		return ""
+	}
+	hint := "  " + strings.Join(matches, "  ")
+	return dimStyle.Render(truncateRunes(hint, max(m.input.Width(), 20)))
+}
+
 func (m model) viewInput(state api.AgentState) string {
 	// Show dimmed input hint when in choice mode (picker is inline above)
 	if m.inChoiceMode {
@@ -2041,6 +2233,10 @@ func (m model) viewInput(state api.AgentState) string {
 	if m.sessionRename {
 		content = warnText.Render("Rename session:") + "\n" + content
 	}
+	// Slash-command completions are hinted inside the input box.
+	if hint := m.completionHint(); hint != "" {
+		content += "\n" + hint
+	}
 
 	// Chip-fallback pastes (those that didn't fit inline) are shown as
 	// chips below the input.
@@ -2069,7 +2265,7 @@ func (m model) viewHelp(state api.AgentState) string {
 	case state == api.AgentStateRunning:
 		hints = []string{"Ctrl+C: cancel"}
 	default:
-		hints = []string{"Enter: send", "Ctrl+J: newline", "Ctrl+P: commands", "↑/↓: history", "Ctrl+L: clear screen", "Ctrl+Y: copy", "Shift+Tab: auto", "Esc: clear/stop", "Ctrl+C: quit"}
+		hints = []string{"Enter: send", "Ctrl+J: newline", "Ctrl+P: commands", "↑/↓: history", "Ctrl+L: clear screen", "Ctrl+Y: copy", "Ctrl+O: expand", "Shift+Tab: auto", "Esc: clear/stop", "Ctrl+C: quit"}
 		if m.viewport.TotalLineCount() > m.viewport.Height {
 			hints = append(hints, "PgUp/PgDn: scroll")
 		}
