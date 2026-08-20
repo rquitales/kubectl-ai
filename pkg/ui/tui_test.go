@@ -1264,6 +1264,88 @@ func TestCtrlLClearsViewButScrollUpReveals(t *testing.T) {
 	}
 }
 
+func TestWelcomeShowsKubeContext(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.width, m.height = 90, 30
+	m.resize()
+	m.kubeContext = kubeContextInfo{context: "dev-context", namespace: "payments"}
+	m.kubeContextOK = true
+
+	got := m.renderWelcome()
+	if !strings.Contains(got, "dev-context/payments") {
+		t.Errorf("expected the kube context in the welcome panel, got:\n%s", got)
+	}
+	if !strings.Contains(got, "Connected to") {
+		t.Errorf("expected a 'Connected to' label, got:\n%s", got)
+	}
+}
+
+func TestWelcomeFlagsProdContext(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.width, m.height = 90, 30
+	m.resize()
+	m.kubeContext = kubeContextInfo{context: "gke-prod-eu", namespace: "default"}
+	m.kubeContextOK = true
+
+	got := m.renderWelcome()
+	if !strings.Contains(got, "prod") {
+		t.Errorf("expected a prod warning label for a prod context, got:\n%s", got)
+	}
+}
+
+func TestWelcomeShowsNoKubeconfig(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.width, m.height = 90, 30
+	m.resize()
+	m.kubeContextOK = false
+
+	got := m.renderWelcome()
+	if !strings.Contains(got, "No kubeconfig") {
+		t.Errorf("expected a no-kubeconfig hint when the context is missing, got:\n%s", got)
+	}
+}
+
+func TestWelcomeListsCommands(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.width, m.height = 110, 30
+	m.resize()
+	m.kubeContext = kubeContextInfo{context: "dev"}
+	m.kubeContextOK = true
+
+	got := m.renderWelcome()
+	for _, cmd := range []string{"/sessions", "/context", "/namespace", "/model", "/rename", "/compact", "/clear", "/exit"} {
+		if !strings.Contains(got, cmd) {
+			t.Errorf("expected %q in the welcome command reference, got:\n%s", cmd, got)
+		}
+	}
+}
+
+func TestWelcomeNeverExceedsTerminalWidth(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.kubeContext = kubeContextInfo{context: "dev"}
+	m.kubeContextOK = true
+
+	// The ASCII logo is a fixed 48-column art block (pre-existing) that can't
+	// shrink, so the sweep starts at 50 — wide enough for the logo and tight
+	// enough to exercise the single-column command layout. The dynamic content
+	// (context panel, command rows, tagline, footer) must always fit.
+	for _, w := range []int{50, 60, 80, 110} {
+		m.width, m.height = w, 30
+		m.resize()
+		got := m.renderWelcome()
+		for _, line := range strings.Split(got, "\n") {
+			if lipgloss.Width(line) > w {
+				t.Errorf("width=%d: line exceeds terminal (%d): %q", w, lipgloss.Width(line), line)
+			}
+		}
+	}
+}
+
 func TestRenderToolResultCollapsed(t *testing.T) {
 	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
 	m := newModel(a)
