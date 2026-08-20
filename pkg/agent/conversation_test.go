@@ -16,6 +16,8 @@ package agent
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -25,6 +27,7 @@ import (
 	"github.com/GoogleCloudPlatform/kubectl-ai/internal/mocks"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/sessions"
+	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/tools"
 	"go.uber.org/mock/gomock"
 )
 
@@ -899,5 +902,234 @@ func TestAgentCloseKeepsManualName(t *testing.T) {
 	}
 	if final.Name != "my custom name" {
 		t.Errorf("manual name was overridden: %q", final.Name)
+	}
+}
+
+// newToolsetWith registers a mock tool per name and returns the toolset.
+func newToolsetWith(t *testing.T, names ...string) *tools.Tools {
+	t.Helper()
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+	toolset := &tools.Tools{}
+	toolset.Init()
+	for _, name := range names {
+		mt := mocks.NewMockTool(ctrl)
+		mt.EXPECT().Name().Return(name).AnyTimes()
+		toolset.RegisterTool(mt)
+	}
+	return toolset
+}
+
+// makeToolCallAnalysis builds a ToolCallAnalysis for the named tool.
+func makeToolCallAnalysis(t *testing.T, toolset *tools.Tools, name string, args map[string]any, modifies string) ToolCallAnalysis {
+	t.Helper()
+	tc, err := toolset.ParseToolInvocation(context.Background(), name, args)
+	if err != nil {
+		t.Fatalf("ParseToolInvocation(%q): %v", name, err)
+	}
+	return ToolCallAnalysis{
+		FunctionCall:        gollm.FunctionCall{Name: name, Arguments: args},
+		ParsedToolCall:      tc,
+		ModifiesResourceStr: modifies,
+	}
+}
+
+func TestPermissionChoiceRequest(t *testing.T) {
+	toolset := newToolsetWith(t, "kubectl", "bash")
+
+	single := []ToolCallAnalysis{
+		makeToolCallAnalysis(t, toolset, "kubectl", map[string]any{"command": "kubectl delete pod foo"}, "yes"),
+	}
+	req := permissionChoiceRequest(single)
+	if len(req.Options) != 4 {
+		t.Fatalf("expected 4 options for single-tool prompt, got %d", len(req.Options))
+	}
+	if req.Options[3].Label != "Always allow kubectl" {
+		t.Errorf("4th option label = %q, want %q", req.Options[3].Label, "Always allow kubectl")
+	}
+
+	// Multiple calls for the same tool still offer the single-tool option.
+	sameTool := []ToolCallAnalysis{
+		makeToolCallAnalysis(t, toolset, "kubectl", map[string]any{"command": "kubectl delete pod foo"}, "yes"),
+		makeToolCallAnalysis(t, toolset, "kubectl", map[string]any{"command": "kubectl delete pod bar"}, "yes"),
+	}
+	if req := permissionChoiceRequest(sameTool); len(req.Options) != 4 {
+		t.Fatalf("expected 4 options for same-tool batch, got %d", len(req.Options))
+	}
+
+	// Distinct modifying tools: no per-tool option.
+	multi := []ToolCallAnalysis{
+		makeToolCallAnalysis(t, toolset, "kubectl", map[string]any{"command": "kubectl delete pod foo"}, "yes"),
+		makeToolCallAnalysis(t, toolset, "bash", map[string]any{"command": "rm -rf x"}, "yes"),
+	}
+	if req := permissionChoiceRequest(multi); len(req.Options) != 3 {
+		t.Fatalf("expected 3 options for multi-tool prompt, got %d", len(req.Options))
+	}
+
+	// Read-only calls do not count toward the tool names.
+	readOnly := []ToolCallAnalysis{
+		makeToolCallAnalysis(t, toolset, "kubectl", map[string]any{"command": "kubectl delete pod foo"}, "yes"),
+		makeToolCallAnalysis(t, toolset, "bash", map[string]any{"command": "ls"}, "no"),
+	}
+	req = permissionChoiceRequest(readOnly)
+	if len(req.Options) != 4 || req.Options[3].Label != "Always allow kubectl" {
+		t.Fatalf("expected read-only calls to be ignored, got options %v", req.Options)
+	}
+}
+
+func TestHandleChoiceAlwaysAllowTool(t *testing.T) {
+	toolset := newToolsetWith(t, "kubectl", "bash")
+	ctx := context.Background()
+
+	pending := []ToolCallAnalysis{
+		makeToolCallAnalysis(t, toolset, "kubectl", map[string]any{"command": "kubectl delete pod foo"}, "yes"),
+	}
+	a := &Agent{pendingFunctionCalls: pending}
+
+	if a.modifyingCallsAllowed(pending) {
+		t.Fatal("expected calls to require permission before any allow")
+	}
+	if dispatch := a.handleChoice(ctx, &api.UserChoiceResponse{Choice: 4}); !dispatch {
+		t.Fatal("expected choice 4 to dispatch the tool calls")
+	}
+	if !a.modifyingCallsAllowed(pending) {
+		t.Fatal("expected kubectl calls to be allowed after choice 4")
+	}
+
+	// A batch that also modifies via a different tool still prompts.
+	mixed := append(pending, makeToolCallAnalysis(t, toolset, "bash", map[string]any{"command": "rm x"}, "yes"))
+	if a.modifyingCallsAllowed(mixed) {
+		t.Fatal("expected mixed batch to still require permission")
+	}
+
+	// Read-only calls alongside the allowed tool skip the prompt.
+	readOnly := append([]ToolCallAnalysis{}, pending...)
+	readOnly = append(readOnly, makeToolCallAnalysis(t, toolset, "bash", map[string]any{"command": "ls"}, "no"))
+	if !a.modifyingCallsAllowed(readOnly) {
+		t.Fatal("expected read-only calls not to block the allow-set")
+	}
+}
+
+type fakeCompletionResponse struct{ text string }
+
+func (r *fakeCompletionResponse) Response() string   { return r.text }
+func (r *fakeCompletionResponse) UsageMetadata() any { return nil }
+
+func TestCompactConversation(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	ctx := context.Background()
+
+	store := sessions.NewInMemoryChatStore()
+	for i, payload := range []string{"how do I restart nginx?", "run kubectl rollout restart", "done, anything else?"} {
+		if err := store.AddChatMessage(&api.Message{
+			ID:      fmt.Sprintf("m%d", i),
+			Source:  api.MessageSourceUser,
+			Type:    api.MessageTypeText,
+			Payload: payload,
+		}); err != nil {
+			t.Fatalf("AddChatMessage: %v", err)
+		}
+	}
+
+	const summary = "User restarted nginx via rollout restart."
+	llm := mocks.NewMockClient(ctrl)
+	llm.EXPECT().GenerateCompletion(gomock.Any(), gomock.Any()).
+		DoAndReturn(func(_ context.Context, req *gollm.CompletionRequest) (gollm.CompletionResponse, error) {
+			if !strings.Contains(req.Prompt, "how do I restart nginx?") {
+				t.Errorf("expected transcript in summarize prompt, got %q", req.Prompt)
+			}
+			return &fakeCompletionResponse{text: summary}, nil
+		})
+
+	var initialized []*api.Message
+	chat := mocks.NewMockChat(ctrl)
+	chat.EXPECT().Initialize(gomock.Any()).
+		DoAndReturn(func(messages []*api.Message) error {
+			initialized = messages
+			return nil
+		})
+
+	a := &Agent{LLM: llm, llmChat: chat, Model: "test-model", Output: make(chan any, 1)}
+	a.Session = &api.Session{ChatMessageStore: store}
+
+	ans, handled, err := a.handleMetaQuery(ctx, "/compact")
+	if err != nil {
+		t.Fatalf("handleMetaQuery: %v", err)
+	}
+	if !handled {
+		t.Fatal("expected /compact to be handled")
+	}
+	if !strings.Contains(ans, "Conversation compacted (~3 messages summarized).") {
+		t.Errorf("unexpected answer: %q", ans)
+	}
+
+	messages := store.ChatMessages()
+	if len(messages) != 1 {
+		t.Fatalf("expected history replaced by a single summary message, got %d", len(messages))
+	}
+	payload, ok := messages[0].Payload.(string)
+	if !ok || messages[0].Source != api.MessageSourceModel ||
+		!strings.Contains(payload, "Previous conversation summary:") || !strings.Contains(payload, summary) {
+		t.Errorf("unexpected summary message: %+v", messages[0])
+	}
+
+	if len(initialized) != 1 || initialized[0].ID != messages[0].ID {
+		t.Errorf("expected llmChat.Initialize with the compacted history, got %v", initialized)
+	}
+}
+
+func TestCompactConversationRunOnce(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	ctx := context.Background()
+
+	store := sessions.NewInMemoryChatStore()
+	if err := store.AddChatMessage(&api.Message{ID: "m1", Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "hello"}); err != nil {
+		t.Fatalf("AddChatMessage: %v", err)
+	}
+
+	// The LLM must never be called in RunOnce mode (no expectations set).
+	llm := mocks.NewMockClient(ctrl)
+
+	a := &Agent{LLM: llm, RunOnce: true, Output: make(chan any, 1)}
+	a.Session = &api.Session{ChatMessageStore: store}
+
+	ans, handled, err := a.handleMetaQuery(ctx, "compact")
+	if err != nil {
+		t.Fatalf("handleMetaQuery: %v", err)
+	}
+	if !handled {
+		t.Fatal("expected compact to be handled in RunOnce mode")
+	}
+	if !strings.Contains(ans, "not supported in quiet mode") {
+		t.Errorf("unexpected answer: %q", ans)
+	}
+	if got := len(store.ChatMessages()); got != 1 {
+		t.Errorf("expected history intact, got %d messages", got)
+	}
+}
+
+func TestCompactConversationLLMError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	ctx := context.Background()
+
+	store := sessions.NewInMemoryChatStore()
+	if err := store.AddChatMessage(&api.Message{ID: "m1", Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "hello"}); err != nil {
+		t.Fatalf("AddChatMessage: %v", err)
+	}
+
+	llm := mocks.NewMockClient(ctrl)
+	llm.EXPECT().GenerateCompletion(gomock.Any(), gomock.Any()).Return(nil, errors.New("boom"))
+
+	a := &Agent{LLM: llm, Output: make(chan any, 1)}
+	a.Session = &api.Session{ChatMessageStore: store}
+
+	if _, handled, err := a.handleMetaQuery(ctx, "compact"); err == nil || handled {
+		t.Fatalf("expected error and handled=false, got handled=%v err=%v", handled, err)
+	}
+	if got := len(store.ChatMessages()); got != 1 {
+		t.Errorf("expected history intact after LLM error, got %d messages", got)
 	}
 }

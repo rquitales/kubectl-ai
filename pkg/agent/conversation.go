@@ -95,6 +95,11 @@ type Agent struct {
 
 	SkipPermissions bool
 
+	// allowedTools is the in-memory set of tools the user chose to always
+	// allow (via the "Always allow <tool>" permission option), keyed by tool
+	// name. It is per-process and not persisted.
+	allowedTools map[string]bool
+
 	Tools tools.Tools
 
 	EnableToolUseShim bool
@@ -259,6 +264,7 @@ func (s *Agent) Init(ctx context.Context) error {
 	s.Input = make(chan any, 10)
 	s.Output = make(chan any, 10)
 	s.currIteration = 0
+	s.allowedTools = map[string]bool{}
 	// when we support session, we will need to initialize this with the
 	// current history of the conversation.
 	s.currChatContent = []any{}
@@ -417,6 +423,7 @@ func deriveSessionName(messages []*api.Message) string {
 		"clear": true, "reset": true, "exit": true, "quit": true,
 		"session": true, "sessions": true, "tools": true, "model": true,
 		"models": true, "new-session": true, "save-session": true,
+		"compact": true,
 	}
 	for _, msg := range messages {
 		if msg.Source != api.MessageSourceUser || msg.Type != api.MessageTypeText {
@@ -932,7 +939,7 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 					continue // Skip execution for interactive commands
 				}
 
-				if !c.SkipPermissionsEnabled() && modifiesResourceToolCallIndex >= 0 {
+				if !c.SkipPermissionsEnabled() && modifiesResourceToolCallIndex >= 0 && !c.modifyingCallsAllowed(toolCallAnalysisResults) {
 					// In RunOnce mode, exit with error if permission is required
 					if c.RunOnce {
 						var commandDescriptions []string
@@ -949,21 +956,7 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 						return
 					}
 
-					var commandDescriptions []string
-					for _, call := range c.pendingFunctionCalls {
-						commandDescriptions = append(commandDescriptions, call.ParsedToolCall.Description())
-					}
-					confirmationPrompt := "The following commands require your approval to run:\n* " + strings.Join(commandDescriptions, "\n* ")
-					confirmationPrompt += "\n\nDo you want to proceed ?"
-
-					choiceRequest := &api.UserChoiceRequest{
-						Prompt: confirmationPrompt,
-						Options: []api.UserChoiceOption{
-							{Value: "yes", Label: "Yes"},
-							{Value: "yes_and_dont_ask_me_again", Label: "Yes, and don't ask me again"},
-							{Value: "no", Label: "No"},
-						},
-					}
+					choiceRequest := permissionChoiceRequest(c.pendingFunctionCalls)
 					c.setAgentState(api.AgentStateWaitingForInput)
 					c.addMessage(api.MessageSourceAgent, api.MessageTypeUserChoiceRequest, choiceRequest)
 					// Request input from the user by sending a message on the output channel.
@@ -1001,6 +994,7 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 var slashCommands = map[string]string{
 	"clear":    "clear",
 	"reset":    "reset",
+	"compact":  "compact",
 	"exit":     "exit",
 	"quit":     "quit",
 	"model":    "model",
@@ -1121,6 +1115,8 @@ func (c *Agent) handleMetaQuery(ctx context.Context, query string) (answer strin
 		c.llmChat.Initialize(c.Session.ChatMessageStore.ChatMessages())
 		c.sessionMu.Unlock()
 		return "Cleared the conversation.", true, nil
+	case "compact":
+		return c.compactConversation(ctx)
 	case "exit", "quit":
 		c.setAgentState(api.AgentStateExited)
 		return "It has been a pleasure assisting you. Have a great day!", true, nil
@@ -1234,6 +1230,74 @@ func (c *Agent) handleMetaQuery(ctx context.Context, query string) (answer strin
 	}
 
 	return "", false, nil
+}
+
+// compactConversation summarizes the session's conversation into a fresh
+// context: the LLM condenses the history, the stored messages are replaced
+// by a single summary message, and the chat is re-initialized with the new
+// history. On LLM error the history is left intact.
+func (c *Agent) compactConversation(ctx context.Context) (answer string, handled bool, err error) {
+	if c.RunOnce {
+		return "The compact command is not supported in quiet mode.", true, nil
+	}
+
+	c.sessionMu.Lock()
+	messages := c.Session.ChatMessageStore.ChatMessages()
+	c.sessionMu.Unlock()
+	if len(messages) == 0 {
+		return "Nothing to compact yet.", true, nil
+	}
+
+	// Build a plain-text transcript of the conversation, keeping at most the
+	// last ~100KB so the summarization request stays a reasonable size.
+	const maxTranscriptBytes = 100 * 1024
+	var transcript strings.Builder
+	for _, msg := range messages {
+		text, ok := msg.Payload.(string)
+		if !ok {
+			text = fmt.Sprintf("%v", msg.Payload)
+		}
+		text = strings.TrimSpace(text)
+		if text == "" {
+			continue
+		}
+		fmt.Fprintf(&transcript, "[%s] %s\n\n", msg.Source, text)
+	}
+	conversation := transcript.String()
+	if len(conversation) > maxTranscriptBytes {
+		conversation = conversation[len(conversation)-maxTranscriptBytes:]
+	}
+
+	completion, err := c.LLM.GenerateCompletion(ctx, &gollm.CompletionRequest{
+		Model:  c.Model,
+		Prompt: "Summarize this conversation concisely for continuing the task. Keep key facts, decisions, and current state:\n\n" + conversation,
+	})
+	if err != nil {
+		return "", false, fmt.Errorf("summarizing conversation: %w", err)
+	}
+	summary := strings.TrimSpace(completion.Response())
+	if summary == "" {
+		return "", false, fmt.Errorf("summarizing conversation: empty response from LLM")
+	}
+
+	c.sessionMu.Lock()
+	if err := c.Session.ChatMessageStore.ClearChatMessages(); err != nil {
+		c.sessionMu.Unlock()
+		return "Failed to compact the conversation", false, err
+	}
+	c.sessionMu.Unlock()
+
+	// Seed the compacted history with the summary as a model message.
+	c.addMessage(api.MessageSourceModel, api.MessageTypeText, "Previous conversation summary:\n\n"+summary)
+
+	c.sessionMu.Lock()
+	if err := c.llmChat.Initialize(c.Session.ChatMessageStore.ChatMessages()); err != nil {
+		c.sessionMu.Unlock()
+		return "", false, fmt.Errorf("re-initializing chat after compact: %w", err)
+	}
+	c.sessionMu.Unlock()
+
+	return fmt.Sprintf("Conversation compacted (~%d messages summarized).", len(messages)), true, nil
 }
 
 // createAndSwitchSession creates a new session, switches the agent to it,
@@ -1738,6 +1802,77 @@ func (c *Agent) analyzeToolCalls(ctx context.Context, toolCalls []gollm.Function
 	return toolCallAnalysis, nil
 }
 
+// modifyingToolNames returns the distinct, sorted names of the tools behind
+// the pending calls that modify resources (and therefore need permission).
+func modifyingToolNames(calls []ToolCallAnalysis) []string {
+	seen := make(map[string]bool)
+	var names []string
+	for _, call := range calls {
+		if call.ModifiesResourceStr == "no" || call.ParsedToolCall == nil {
+			continue
+		}
+		name := call.ParsedToolCall.GetTool().Name()
+		if !seen[name] {
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+// permissionChoiceRequest builds the confirmation prompt for the pending
+// resource-modifying tool calls. When every modifying call is for the same
+// tool, a fourth "Always allow <tool>" option is offered, which remembers
+// the tool for the rest of the process.
+func permissionChoiceRequest(calls []ToolCallAnalysis) *api.UserChoiceRequest {
+	var commandDescriptions []string
+	for _, call := range calls {
+		commandDescriptions = append(commandDescriptions, call.ParsedToolCall.Description())
+	}
+	confirmationPrompt := "The following commands require your approval to run:\n* " + strings.Join(commandDescriptions, "\n* ")
+	confirmationPrompt += "\n\nDo you want to proceed ?"
+
+	options := []api.UserChoiceOption{
+		{Value: "yes", Label: "Yes"},
+		{Value: "yes_and_dont_ask_me_again", Label: "Yes, and don't ask me again"},
+		{Value: "no", Label: "No"},
+	}
+	if names := modifyingToolNames(calls); len(names) == 1 {
+		options = append(options, api.UserChoiceOption{Value: "always_allow_" + names[0], Label: "Always allow " + names[0]})
+	}
+	return &api.UserChoiceRequest{Prompt: confirmationPrompt, Options: options}
+}
+
+// allowTools adds the given tool names to the in-memory always-allow set.
+func (c *Agent) allowTools(names []string) {
+	c.sessionMu.Lock()
+	defer c.sessionMu.Unlock()
+	if c.allowedTools == nil {
+		c.allowedTools = make(map[string]bool)
+	}
+	for _, name := range names {
+		c.allowedTools[name] = true
+	}
+}
+
+// modifyingCallsAllowed reports whether every resource-modifying call uses
+// a tool the user has previously marked as always allowed; such batches are
+// dispatched without prompting.
+func (c *Agent) modifyingCallsAllowed(calls []ToolCallAnalysis) bool {
+	c.sessionMu.Lock()
+	defer c.sessionMu.Unlock()
+	for _, call := range calls {
+		if call.ModifiesResourceStr == "no" || call.ParsedToolCall == nil {
+			continue
+		}
+		if !c.allowedTools[call.ParsedToolCall.GetTool().Name()] {
+			return false
+		}
+	}
+	return true
+}
+
 func (c *Agent) handleChoice(ctx context.Context, choice *api.UserChoiceResponse) (dispatchToolCalls bool) {
 	log := klog.FromContext(ctx)
 	// if user input is a choice and use has declined the operation,
@@ -1764,6 +1899,11 @@ func (c *Agent) handleChoice(ctx context.Context, choice *api.UserChoiceResponse
 		c.pendingFunctionCalls = []ToolCallAnalysis{}
 		dispatchToolCalls = false
 		c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Operation was skipped. User declined to run this operation.")
+	case 4:
+		// "Always allow <tool>": remember the modifying tool(s) for the rest
+		// of the process so future calls skip the prompt, then dispatch.
+		c.allowTools(modifyingToolNames(c.pendingFunctionCalls))
+		dispatchToolCalls = true
 	default:
 		// This case should technically not be reachable due to AskForConfirmation loop
 		err := fmt.Errorf("invalid confirmation choice: %q", choice.Choice)
