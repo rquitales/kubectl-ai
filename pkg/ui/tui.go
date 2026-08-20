@@ -3487,7 +3487,7 @@ func (m model) viewHelp(state api.AgentState) string {
 	case m.inChoiceMode:
 		hints = []string{"↑/↓: navigate", "Enter: select", "Ctrl+C: quit"}
 	case state == api.AgentStateRunning:
-		hints = []string{"Ctrl+C: cancel", "Esc: interrupt"}
+		hints = []string{"↑/↓: scroll", "Ctrl+C: cancel", "Esc: interrupt"}
 	default:
 		hints = []string{
 			"Enter: send", "Ctrl+P: commands", "↑/↓: history",
