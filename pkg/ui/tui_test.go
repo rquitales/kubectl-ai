@@ -537,6 +537,38 @@ func TestUpDownRecallsHistory(t *testing.T) {
 	}
 }
 
+func TestUpDownLineScrollsTranscriptWhileRunning(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateRunning}}
+	m := newModel(a)
+	m.width, m.height = 100, 24
+	m.resize()
+	for i := 0; i < 50; i++ {
+		m.messages = append(m.messages, &api.Message{
+			Source: api.MessageSourceModel, Type: api.MessageTypeText,
+			Payload: fmt.Sprintf("line %d", i), Timestamp: time.Now(),
+		})
+	}
+	m.dirty = true
+	m.refresh()
+	m.viewport.GotoBottom()
+	atBottom := m.viewport.YOffset
+
+	// Up scrolls the transcript up by one line (not the input history).
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyUp})
+	if m.viewport.YOffset >= atBottom {
+		t.Errorf("expected Up to scroll the transcript up while running, YOffset = %d (bottom %d)", m.viewport.YOffset, atBottom)
+	}
+	if got := m.input.Value(); got != "" {
+		t.Errorf("Up while running must not touch the input draft, got %q", got)
+	}
+
+	// Down scrolls back down.
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyDown})
+	if m.viewport.YOffset != atBottom {
+		t.Errorf("expected Down to scroll back to the bottom while running, YOffset = %d (want %d)", m.viewport.YOffset, atBottom)
+	}
+}
+
 func TestHistorySkipsConsecutiveDuplicates(t *testing.T) {
 	m := newModel(nil)
 	m.messages = []*api.Message{
@@ -1309,6 +1341,31 @@ func TestRenderChoicePromptHighlightsCommands(t *testing.T) {
 	// The commands must no longer be inline bullets glued to the prose.
 	if strings.Contains(got, "run:\n* kubectl") {
 		t.Errorf("expected the bullet prose form to be replaced, got:\n%s", got)
+	}
+}
+
+func TestRenderChoicePromptShowsDryRunPreview(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.inChoiceMode = true
+	m.choiceType = "confirm"
+	m.choicePrompt = "The following commands require your approval to run:\n* kubectl apply -f pod.yaml\n\nDry-run preview (safe, not applied):\n* kubectl apply -f pod.yaml --dry-run=server\n\nDo you want to proceed ?"
+
+	got := m.renderChoicePrompt()
+	// The command is on its own marked line.
+	if !strings.Contains(got, "› kubectl apply -f pod.yaml") {
+		t.Errorf("expected the command on its own line, got:\n%s", got)
+	}
+	// The dry-run preview is rendered distinctly (dimmed, nested).
+	if !strings.Contains(got, "dry-run preview (safe, not applied)") {
+		t.Errorf("expected a dry-run preview header, got:\n%s", got)
+	}
+	if !strings.Contains(got, "⎿ kubectl apply -f pod.yaml --dry-run=server") {
+		t.Errorf("expected the dry-run preview nested under the command, got:\n%s", got)
+	}
+	// The question is still present.
+	if !strings.Contains(got, "Do you want to proceed") {
+		t.Errorf("expected the proceed question, got:\n%s", got)
 	}
 }
 

@@ -119,6 +119,83 @@ func kubectlModifiesResource(command string) string {
 	return "unknown"
 }
 
+// serverDryRunOps are kubectl subcommands that support --dry-run=server, which
+// validates the change against the live apiserver without persisting it. These
+// produce the most useful preview (admission validation, defaulting, etc.).
+var serverDryRunOps = map[string]bool{
+	"apply": true, "create": true, "replace": true, "patch": true,
+}
+
+// KubectlDryRunPreview returns a safe dry-run variant of a kubectl command:
+// the same command with --dry-run=server (for subcommands that support it) or
+// --dry-run=client appended, so the user can preview what a mutating command
+// would do before approving it. If the command already has a --dry-run flag it
+// is returned unchanged. Non-kubectl or unparseable commands return "".
+func KubectlDryRunPreview(command string) string {
+	parser := syntax.NewParser()
+	file, err := parser.Parse(strings.NewReader(command), "")
+	if err != nil {
+		return ""
+	}
+	subcommand := ""
+	syntax.Walk(file, func(node syntax.Node) bool {
+		if call, ok := node.(*syntax.CallExpr); ok {
+			if sub := kubectlSubcommand(call); sub != "" {
+				subcommand = sub
+				return false
+			}
+		}
+		return true
+	})
+	if subcommand == "" {
+		return ""
+	}
+	if strings.Contains(command, "--dry-run") {
+		return command // already a dry-run
+	}
+	// Only produce a preview for commands that actually modify resources;
+	// read-only commands (get, describe, …) and unknowns don't need one.
+	if kubectlModifiesResource(command) != "yes" {
+		return ""
+	}
+	mode := "--dry-run=client"
+	if serverDryRunOps[subcommand] {
+		mode = "--dry-run=server"
+	}
+	return strings.TrimSpace(command) + " " + mode
+}
+
+// kubectlSubcommand returns the kubectl subcommand (e.g. "apply", "get") from a
+// parsed shell call, or "" if it isn't a kubectl invocation.
+func kubectlSubcommand(call *syntax.CallExpr) string {
+	if call == nil || len(call.Args) == 0 {
+		return ""
+	}
+	var args []string
+	for _, arg := range call.Args {
+		lit := arg.Lit()
+		if lit == "" {
+			continue
+		}
+		lit = strings.Trim(lit, "'\"")
+		args = append(args, lit)
+	}
+	if len(args) < 2 {
+		return ""
+	}
+	if !strings.Contains(args[0], "kubectl") {
+		return ""
+	}
+	// Skip flags to find the verb (the first non-flag arg after kubectl).
+	for _, a := range args[1:] {
+		if strings.HasPrefix(a, "-") {
+			continue
+		}
+		return a
+	}
+	return ""
+}
+
 func analyzeCall(call *syntax.CallExpr) string {
 	if call == nil || len(call.Args) == 0 {
 		klog.Warning("analyzeCall: call is nil or has no args")

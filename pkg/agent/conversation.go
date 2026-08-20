@@ -2143,10 +2143,21 @@ func modifyingToolNames(calls []ToolCallAnalysis) []string {
 // the tool for the rest of the process.
 func permissionChoiceRequest(calls []ToolCallAnalysis) *api.UserChoiceRequest {
 	var commandDescriptions []string
+	var dryRunPreviews []string
 	for _, call := range calls {
 		commandDescriptions = append(commandDescriptions, call.ParsedToolCall.Description())
+		// For kubectl mutating commands, show a safe dry-run preview the user
+		// can eyeball before approving: the same command with --dry-run=server
+		// (or --dry-run=client). No cluster side effect (dry-run validates but
+		// does not persist); non-kubectl/unparseable commands produce no preview.
+		if preview := tools.KubectlDryRunPreview(call.ParsedToolCall.Description()); preview != "" {
+			dryRunPreviews = append(dryRunPreviews, preview)
+		}
 	}
 	confirmationPrompt := "The following commands require your approval to run:\n* " + strings.Join(commandDescriptions, "\n* ")
+	if len(dryRunPreviews) > 0 {
+		confirmationPrompt += "\n\nDry-run preview (safe, not applied):\n* " + strings.Join(dryRunPreviews, "\n* ")
+	}
 	confirmationPrompt += "\n\nDo you want to proceed ?"
 
 	options := []api.UserChoiceOption{

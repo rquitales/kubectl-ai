@@ -572,3 +572,31 @@ func TestKubectlAlwaysAtPosition0(t *testing.T) {
 		})
 	}
 }
+
+func TestKubectlDryRunPreview(t *testing.T) {
+	cases := []struct {
+		command string
+		want    string
+	}{
+		// Server-side dry-run for subcommands that support it.
+		{"kubectl apply -f pod.yaml", "kubectl apply -f pod.yaml --dry-run=server"},
+		{"kubectl create deployment nginx", "kubectl create deployment nginx --dry-run=server"},
+		{"kubectl patch svc web --patch '{}'", "kubectl patch svc web --patch '{}' --dry-run=server"},
+		// Client-side dry-run for other mutating subcommands.
+		{"kubectl delete pod foo", "kubectl delete pod foo --dry-run=client"},
+		{"kubectl scale deployment web --replicas=3", "kubectl scale deployment web --replicas=3 --dry-run=client"},
+		{"kubectl label pod foo app=bar", "kubectl label pod foo app=bar --dry-run=client"},
+		// Already a dry-run: returned unchanged.
+		{"kubectl apply -f pod.yaml --dry-run=server", "kubectl apply -f pod.yaml --dry-run=server"},
+		// Read-only / non-kubectl / unparseable: no preview.
+		{"kubectl get pods", ""},
+		{"ls -la", ""},
+		{"not a real command", ""},
+	}
+	for _, c := range cases {
+		got := KubectlDryRunPreview(c.command)
+		if got != c.want {
+			t.Errorf("KubectlDryRunPreview(%q) = %q, want %q", c.command, got, c.want)
+		}
+	}
+}

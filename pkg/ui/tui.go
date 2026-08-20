@@ -954,6 +954,13 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.inChoiceMode {
 			return m, m.navigateList(tea.KeyUp)
 		}
+		// While the agent is running the input is disabled, so arrows are
+		// free: use them to line-scroll the transcript (PgUp/PgDn scroll
+		// half a page; this gives finer control while reading a reply).
+		if s := m.agentState(); s == api.AgentStateRunning || s == api.AgentStateInitializing {
+			m.viewport.ScrollUp(1)
+			return m, nil
+		}
 		// Within a multi-line draft, Up moves the cursor until the first
 		// line; from there (and for single-line drafts) it recalls older
 		// input history, like opencode and Claude Code. Transcript
@@ -966,6 +973,10 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyDown:
 		if m.inChoiceMode {
 			return m, m.navigateList(tea.KeyDown)
+		}
+		if s := m.agentState(); s == api.AgentStateRunning || s == api.AgentStateInitializing {
+			m.viewport.ScrollDown(1)
+			return m, nil
 		}
 		if m.input.LineCount() > 1 && m.input.Line() < m.input.LineCount()-1 {
 			m.input.CursorDown()
@@ -2168,19 +2179,29 @@ func (m model) renderChoicePrompt() string {
 	// Permission prompt: "The following commands require your approval to run:\n* cmd\n...\n\nDo you want to proceed ?"
 	// Split the bullet command lines out of the prose.
 	lines := strings.Split(m.choicePrompt, "\n")
-	var header, commands []string
+	var header, commands, previews []string
 	question := ""
+	inPreviews := false
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		switch {
 		case trimmed == "":
 			continue
+		case strings.HasPrefix(trimmed, "Dry-run preview"):
+			inPreviews = true
 		case strings.HasPrefix(trimmed, "* "):
-			commands = append(commands, strings.TrimPrefix(trimmed, "* "))
+			bullet := strings.TrimPrefix(trimmed, "* ")
+			if inPreviews {
+				previews = append(previews, bullet)
+			} else {
+				commands = append(commands, bullet)
+			}
 		case strings.HasPrefix(trimmed, "Do you want to proceed"):
 			question = trimmed
 		default:
-			header = append(header, line)
+			if !inPreviews {
+				header = append(header, line)
+			}
 		}
 	}
 
@@ -2200,6 +2221,17 @@ func (m model) renderChoicePrompt() string {
 	for _, cmd := range commands {
 		sb.WriteString("\n")
 		sb.WriteString("  " + cmdStyle.Render("› "+cmd))
+	}
+	// Dry-run previews show what each command would do if approved, without
+	// applying it — render them dimmed under the commands so they read as a
+	// safe, informational preview rather than another thing to approve.
+	if len(previews) > 0 {
+		sb.WriteString("\n")
+		sb.WriteString(dimStyle.Italic(true).Render("  dry-run preview (safe, not applied):"))
+		for _, pv := range previews {
+			sb.WriteString("\n")
+			sb.WriteString("  " + dimStyle.Render("⎿ "+pv))
+		}
 	}
 	if question != "" {
 		sb.WriteString("\n\n")
