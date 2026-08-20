@@ -1106,6 +1106,10 @@ func (m *model) handleEsc() (tea.Model, tea.Cmd) {
 	// Interrupt a running agent.
 	if m.agent != nil {
 		if s := m.agentState(); s == api.AgentStateRunning || s == api.AgentStateInitializing {
+			// Confirm in the transcript immediately so the user sees the
+			// interrupt landed; the actual cancel runs in the returned closure
+			// (CancelRun signals the run to stop asynchronously).
+			m.appendLocalMessage("⏹ Interrupted.")
 			return m, func() tea.Msg {
 				m.agent.CancelRun()
 				return nil
@@ -1255,6 +1259,7 @@ func (m *model) interruptRun() (tea.Model, tea.Cmd) {
 		m.appendLocalMessage("Nothing running to interrupt.")
 		return m, nil
 	}
+	m.appendLocalMessage("⏹ Interrupted.")
 	return m, nil
 }
 
