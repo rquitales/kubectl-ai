@@ -132,14 +132,14 @@ type TUI struct {
 }
 
 func NewTUI(agent *agent.Agent) *TUI {
-	// Enable mouse cell-motion capture so the scroll wheel scrolls the
-	// transcript viewport directly (terminal wheel-to-arrow translation
-	// in alt-screen mode is unreliable across terminals). Cell-motion mode
-	// delivers wheel events without intercepting all mouse motion, so text
-	// selection still copies natively in most terminals. Copy is also
-	// available via Ctrl+Y.
+	// Mouse cell-motion capture is enabled from Init (via the
+	// EnableMouseCellMotion command) rather than as a program option, so the
+	// mouse-enable escape sequence is written after the first render when
+	// the terminal is in alt-screen mode and ready to consume it —
+	// otherwise some terminals echo the sequence as literal text into the
+	// input box on startup.
 	return &TUI{
-		program: tea.NewProgram(newModel(agent), tea.WithAltScreen(), tea.WithMouseCellMotion()),
+		program: tea.NewProgram(newModel(agent), tea.WithAltScreen()),
 		agent:   agent,
 	}
 }
@@ -452,7 +452,11 @@ func newModel(agent *agent.Agent) model {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(textarea.Blink, m.spinner.Tick, m.tick())
+	// Enable mouse cell-motion capture here (after the first render) rather
+	// than as a program option, so the enable escape sequence is written when
+	// the terminal is in alt-screen mode and ready — otherwise some
+	// terminals echo it as literal text into the input box on startup.
+	return tea.Batch(textarea.Blink, m.spinner.Tick, m.tick(), tea.EnableMouseCellMotion)
 }
 
 func (m model) tick() tea.Cmd {
