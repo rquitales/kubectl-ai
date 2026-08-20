@@ -110,10 +110,18 @@ func (d itemDelegate) Render(w io.Writer, m list.Model, idx int, li list.Item) {
 	if !ok {
 		return
 	}
+	// Truncate long labels (e.g. a long model ID + " (current)") to the list
+	// width so the choice picker doesn't wrap or push its border. Reserve
+	// room for the "> " cursor / 2-cell left padding.
+	avail := m.Width() - 4
+	if avail < 4 {
+		avail = 4
+	}
+	label := truncateRunes(string(s), avail)
 	if idx == m.Index() {
-		fmt.Fprint(w, primaryText.Render("> "+string(s)))
+		fmt.Fprint(w, primaryText.Render("> "+label))
 	} else {
-		fmt.Fprint(w, mutedStyle.PaddingLeft(2).Render(string(s)))
+		fmt.Fprint(w, mutedStyle.PaddingLeft(2).Render(label))
 	}
 }
 
