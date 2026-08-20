@@ -81,6 +81,10 @@ func (p fakePart) AsFunctionCalls() ([]gollm.FunctionCall, bool) {
 	return nil, false
 }
 
+func (p fakePart) AsThinking() (string, bool) {
+	return "", false
+}
+
 type fakeCandidate struct{ parts []gollm.Part }
 
 func (c fakeCandidate) String() string      { return "" }

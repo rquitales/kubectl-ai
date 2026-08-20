@@ -171,4 +171,10 @@ type Part interface {
 	// AsFunctionCalls returns the function calls of the part.
 	// if the part is not a function call, it returns (nil, false)
 	AsFunctionCalls() ([]FunctionCall, bool)
+
+	// AsThinking returns the model's reasoning/thinking text of the part, if
+	// the provider surfaced it. Providers that discard reasoning (most of them)
+	// return ("", false). When true, the content is surfaced to the UI as a
+	// collapsible thinking block.
+	AsThinking() (string, bool)
 }

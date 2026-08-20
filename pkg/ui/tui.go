@@ -317,6 +317,10 @@ type model struct {
 	// expandToolResults renders tool call results in full (ctrl+o toggle);
 	// collapsed results show only the first few lines plus a count.
 	expandToolResults bool
+	// expandThinking renders the model's reasoning/thinking in full (ctrl+t
+	// toggle); collapsed thinking shows only the first line plus a count, so
+	// a long reasoning trace doesn't dominate the transcript.
+	expandThinking bool
 	// Slash-command autocomplete cycling state: the matches captured when
 	// Tab was first pressed, so cycling doesn't re-narrow once the input
 	// becomes a full command name.
@@ -780,6 +784,13 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Toggle expanded tool call results (collapsed by default so
 		// back-to-back tool calls stay compact).
 		m.expandToolResults = !m.expandToolResults
+		m.dirty = true
+		m.refresh()
+		return m, nil
+	case tea.KeyCtrlT:
+		// Toggle expanded model reasoning/thinking (collapsed by default so
+		// a long reasoning trace doesn't dominate the transcript).
+		m.expandThinking = !m.expandThinking
 		m.dirty = true
 		m.refresh()
 		return m, nil
@@ -1776,11 +1787,56 @@ func (m *model) handleTextDelta(msg *api.Message) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// handleThinkingDelta folds a live-streamed thinking/reasoning delta (or the
+// final thinking message) into the transcript: the entry matching the
+// delta's ID is updated in place, or appended on the first chunk. Thinking
+// messages are ephemeral (never stored), so they live only in the UI's
+// transcript and are dropped on the next session snapshot.
+func (m *model) handleThinkingDelta(msg *api.Message) (tea.Model, tea.Cmd) {
+	updated := false
+	for i := len(m.messages) - 1; i >= 0; i-- {
+		if m.messages[i].ID == msg.ID {
+			m.messages[i].Payload = msg.Payload
+			m.messages[i].Timestamp = msg.Timestamp
+			updated = true
+			break
+		}
+	}
+	if !updated {
+		m.messages = append(m.messages, msg)
+	}
+	m.dirty = true
+
+	// Throttle viewport refreshes while streaming (see deltaRefreshInterval).
+	if time.Since(m.lastDeltaRefresh) < deltaRefreshInterval {
+		return m, nil
+	}
+	m.lastDeltaRefresh = time.Now()
+
+	if m.clearedAt > 0 && m.revealAll {
+		m.revealAll = false
+		m.refresh()
+		m.viewport.GotoBottom()
+	} else {
+		atBottom := m.viewport.AtBottom()
+		m.refresh()
+		if atBottom {
+			m.viewport.GotoBottom()
+		}
+	}
+	return m, nil
+}
+
 func (m *model) handleAgentMsg(msg *api.Message) (tea.Model, tea.Cmd) {
 	// Live-streamed model text arrives as ephemeral deltas that are not in
 	// the session store; fold them into the transcript separately.
 	if msg.Type == api.MessageTypeTextDelta {
 		return m.handleTextDelta(msg)
+	}
+	// Live-streamed model reasoning/thinking arrives the same way, as ephemeral
+	// thinking deltas (and a final thinking message that replaces them).
+	if msg.Type == api.MessageTypeThinkingDelta || msg.Type == api.MessageTypeThinking {
+		return m.handleThinkingDelta(msg)
 	}
 
 	session := m.agent.GetSession()
@@ -2003,7 +2059,7 @@ func (m model) renderChoicePrompt() string {
 	cmdStyle := lipgloss.NewStyle().Foreground(colorWarning)
 	for _, cmd := range commands {
 		sb.WriteString("\n")
-		sb.WriteString("  " + cmdStyle.Render("› " + cmd))
+		sb.WriteString("  " + cmdStyle.Render("› "+cmd))
 	}
 	if question != "" {
 		sb.WriteString("\n\n")
@@ -2091,7 +2147,8 @@ func (m model) renderMessage(msg *api.Message, r *glamour.TermRenderer, w int) s
 	// Check cache (except tool calls which show status, and text deltas
 	// whose content changes per chunk; the final text message shares the
 	// delta's ID and must render fresh).
-	cacheable := msg.ID != "" && msg.Type != api.MessageTypeToolCallRequest && msg.Type != api.MessageTypeTextDelta
+	cacheable := msg.ID != "" && msg.Type != api.MessageTypeToolCallRequest && msg.Type != api.MessageTypeTextDelta &&
+		msg.Type != api.MessageTypeThinking && msg.Type != api.MessageTypeThinkingDelta
 	if cacheable {
 		if cached, ok := m.cache.get(msg.ID); ok {
 			return cached
@@ -2104,6 +2161,8 @@ func (m model) renderMessage(msg *api.Message, r *glamour.TermRenderer, w int) s
 		result = m.renderToolCall(msg, w)
 	case api.MessageTypeError:
 		result = m.renderError(msg, w)
+	case api.MessageTypeThinking, api.MessageTypeThinkingDelta:
+		result = m.renderThinking(msg, w)
 	default:
 		result = m.renderTextMsg(msg, r, w)
 	}
@@ -2148,6 +2207,59 @@ func (m model) renderTextMsg(msg *api.Message, r *glamour.TermRenderer, w int) s
 		return agentMsg.Width(w+2).Render(label+"\n"+body) + "\n"
 	}
 	return ""
+}
+
+// renderThinking renders the model's reasoning/thinking as a collapsible,
+// dimmed block — the same shape Claude Code uses to show the model "thinking"
+// without crowding the answer. While streaming (a thinking delta while the
+// agent is running), the header carries the live spinner and the partial
+// reasoning; once final, it collapses to a one-line "Thought for Ns" summary
+// with an expand hint.
+func (m model) renderThinking(msg *api.Message, w int) string {
+	payload, ok := msg.Payload.(string)
+	if !ok {
+		return ""
+	}
+	payload = strings.TrimSpace(payload)
+
+	running := m.agentState() == api.AgentStateRunning
+
+	if running && msg.Type == api.MessageTypeThinkingDelta {
+		// Live streaming: spinner header + the reasoning so far (dimmed).
+		header := mutedStyle.Italic(true).Render(m.spinner.View() + " Thinking…")
+		body := dimStyle.Width(w).Render(payload)
+		if payload != "" {
+			return agentMsg.Width(w+2).Render(header+"\n"+body) + "\n"
+		}
+		return agentMsg.Width(w+2).Render(header) + "\n"
+	}
+
+	// Final thinking message: collapsed to a one-line summary by default
+	// (ctrl+t toggles expandThinking to show the full reasoning inline).
+	dur := ""
+	if m.lastTurnDuration > 0 {
+		dur = " · " + formatDuration(m.lastTurnDuration)
+	}
+	lines := strings.Count(payload, "\n") + 1
+	summary := fmt.Sprintf("💭 Thought for %d line%s", lines, pluralS(lines))
+	if lines <= 0 {
+		summary = "💭 Thought"
+	}
+	header := mutedStyle.Italic(true).Render(summary + dur)
+	if m.expandThinking {
+		// Show the full reasoning under the summary header, dimmed.
+		body := dimStyle.Width(w).Render(payload)
+		return agentMsg.Width(w + 2).Render(header+"\n"+body) + "\n"
+	}
+	return agentMsg.Width(w + 2).Render(header) + "\n"
+}
+
+// pluralS returns "s" when n != 1, for compact pluralization.
+func pluralS(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
 }
 
 func (m model) renderToolCall(msg *api.Message, w int) string {
@@ -2810,6 +2922,7 @@ func helpText() string {
 | **Ctrl+L** | clear screen (scroll up to reveal) |
 | **Ctrl+Y** | copy last reply |
 | **Ctrl+O** | expand/collapse tool results |
+| **Ctrl+T** | expand/collapse model reasoning |
 | **PgUp / PgDn** | scroll transcript |
 | **Tab** | autocomplete (commands, @files, /context, /namespace) |
 
@@ -3074,8 +3187,8 @@ func (m model) viewHelp(state api.AgentState) string {
 		hints = []string{
 			"Enter: send", "Ctrl+P: commands", "↑/↓: history",
 			"Ctrl+J: newline", "Ctrl+L: clear", "Ctrl+Y: copy",
-			"Ctrl+O: expand", "Shift+Tab: auto", "Esc: clear/stop",
-			"Ctrl+C: quit",
+			"Ctrl+O: expand", "Ctrl+T: thinking", "Shift+Tab: auto",
+			"Esc: clear/stop", "Ctrl+C: quit",
 		}
 		if m.viewport.TotalLineCount() > m.viewport.Height {
 			hints = append(hints, "PgUp/PgDn: scroll")

@@ -270,6 +270,10 @@ func (p *openAIResponsePart) AsFunctionCalls() ([]FunctionCall, bool) {
 	return []FunctionCall{p.toolCall}, p.content == ""
 }
 
+func (p *openAIResponsePart) AsThinking() (string, bool) {
+	return "", false
+}
+
 // convertFunctionParameters handles the conversion of gollm parameters to OpenAI format
 func (cs *openAIResponseChatSession) convertFunctionParameters(gollmDef *FunctionDefinition) (openai.FunctionParameters, error) {
 	var params openai.FunctionParameters

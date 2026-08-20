@@ -865,6 +865,8 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 
 				// accumulator for streamed text
 				var streamedText string
+				// accumulator for streamed model reasoning/thinking
+				var streamedThinking string
 				var llmError error
 
 				// lastUsage holds the usage metadata of the most recent chunk
@@ -876,6 +878,10 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 				// text message share one ID, so UIs can update the streaming
 				// entry in place and finally replace it with the stored message.
 				streamID := uuid.New().String()
+				// Live thinking-delta messages share their own ID, separate from
+				// the text stream, so the UI can render a distinct collapsible
+				// thinking block alongside the streaming text.
+				thinkStreamID := uuid.New().String()
 				lastDeltaEmit := time.Time{}
 
 				for response, err := range stream {
@@ -929,6 +935,26 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 							}
 						}
 
+						// Check if it's the model's reasoning/thinking.
+						if thinking, ok := part.AsThinking(); ok {
+							log.Info("thinking response", "thinkingLen", len(thinking))
+							streamedThinking += thinking
+							// Stream thinking live (throttled like text deltas) so
+							// the UI can show a collapsible thinking block updating
+							// in real time. Thinking deltas are ephemeral: they go
+							// to the output channel and are never stored.
+							if time.Since(lastDeltaEmit) >= streamDeltaInterval {
+								lastDeltaEmit = time.Now()
+								c.Output <- &api.Message{
+									ID:        thinkStreamID,
+									Source:    api.MessageSourceModel,
+									Type:      api.MessageTypeThinkingDelta,
+									Payload:   streamedThinking,
+									Timestamp: time.Now(),
+								}
+							}
+						}
+
 						// Check if it's a function call
 						if calls, ok := part.AsFunctionCalls(); ok && len(calls) > 0 {
 							log.Info("function calls", "calls", calls)
@@ -963,6 +989,18 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 						Tokens:    usageTotalTokens(lastUsage),
 					})
 					c.maybeGenerateSessionTitle()
+				}
+				// The final thinking message replaces the live thinking-delta
+				// entry in UIs. It is not stored (reasoning is ephemeral and is
+				// already kept in the provider's history via the accumulator).
+				if streamedThinking != "" {
+					c.Output <- &api.Message{
+						ID:        thinkStreamID,
+						Source:    api.MessageSourceModel,
+						Type:      api.MessageTypeThinking,
+						Payload:   streamedThinking,
+						Timestamp: time.Now(),
+					}
 				}
 				// If no function calls to be made, we're done
 				if len(functionCalls) == 0 {
@@ -2404,4 +2442,8 @@ func (p *ShimPart) AsFunctionCalls() ([]gollm.FunctionCall, bool) {
 		}, true
 	}
 	return nil, false
+}
+
+func (p *ShimPart) AsThinking() (string, bool) {
+	return "", false
 }
