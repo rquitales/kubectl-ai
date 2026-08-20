@@ -1850,3 +1850,63 @@ func TestFileMentionNonToken(t *testing.T) {
 		t.Errorf("expected no file matches inside an email-like token, got %v", got)
 	}
 }
+
+func writeAgentKubeConfig(t *testing.T, currentContext string, names ...string) string {
+	t.Helper()
+	content := "apiVersion: v1\nkind: Config\ncurrent-context: " + currentContext + "\nclusters: []\ncontexts:\n"
+	for _, n := range names {
+		content += "- context:\n    cluster: c\n    user: u\n  name: " + n + "\n"
+	}
+	content += "users: []\n"
+	path := filepath.Join(t.TempDir(), "config")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestContextAutocomplete(t *testing.T) {
+	path := writeAgentKubeConfig(t, "prod", "dev", "prod", "staging")
+	a := &agent.Agent{
+		Session:    &api.Session{ID: "test", AgentState: api.AgentStateIdle},
+		Kubeconfig: path,
+	}
+	m := newModel(a)
+	m.width, m.height = 100, 40
+	m.resize()
+
+	// No matches outside the /context command.
+	m.input.SetValue("hello")
+	if got := m.contextMatches(); got != nil {
+		t.Errorf("expected no matches outside /context, got %v", got)
+	}
+
+	// Prefix matches and hint.
+	m.input.SetValue("/context s")
+	if got := m.contextMatches(); len(got) != 1 || got[0] != "staging" {
+		t.Errorf("contextMatches(/context s) = %v, want [staging]", got)
+	}
+	if !m.completionHintVisible() {
+		t.Error("expected hint visible for /context partial")
+	}
+	if got := m.completionHint(); !strings.Contains(got, "staging") {
+		t.Errorf("completionHint = %q, want staging", got)
+	}
+	base := m.inputHeight + 2
+	if got := m.inputBlockHeight(); got != base+1 {
+		t.Errorf("inputBlockHeight = %d, want %d with the context hint", got, base+1)
+	}
+
+	// Tab cycles through all contexts, keeping the command prefix.
+	m.input.SetValue("/context ")
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyTab})
+	first := m.input.Value()
+	if !strings.HasPrefix(first, "/context ") || first == "/context " {
+		t.Errorf("after tab: input = %q, want a context name", first)
+	}
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyTab})
+	second := m.input.Value()
+	if second == first {
+		t.Errorf("expected tab to cycle to the next context, got %q", second)
+	}
+}

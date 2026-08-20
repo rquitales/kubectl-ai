@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -26,6 +27,7 @@ import (
 	"github.com/GoogleCloudPlatform/kubectl-ai/gollm"
 	"github.com/GoogleCloudPlatform/kubectl-ai/internal/mocks"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
+	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/kube"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/sessions"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/tools"
 	"go.uber.org/mock/gomock"
@@ -1131,5 +1133,59 @@ func TestCompactConversationLLMError(t *testing.T) {
 	}
 	if got := len(store.ChatMessages()); got != 1 {
 		t.Errorf("expected history intact after LLM error, got %d messages", got)
+	}
+}
+
+func writeAgentKubeConfig(t *testing.T, currentContext string, names ...string) string {
+	t.Helper()
+	content := "apiVersion: v1\nkind: Config\ncurrent-context: " + currentContext + "\nclusters: []\ncontexts:\n"
+	for _, n := range names {
+		content += "- context:\n    cluster: c\n    user: u\n  name: " + n + "\n"
+	}
+	content += "users: []\n"
+	path := filepath.Join(t.TempDir(), "config")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestContextMetaQuery(t *testing.T) {
+	path := writeAgentKubeConfig(t, "prod", "dev", "prod", "staging")
+	a := &Agent{Kubeconfig: path, Session: &api.Session{}}
+
+	// Bare "context" lists current and available.
+	ans, handled, err := a.handleMetaQuery(context.Background(), "context")
+	if err != nil {
+		t.Fatalf("handleMetaQuery: %v", err)
+	}
+	if !handled {
+		t.Fatal("expected handled")
+	}
+	for _, want := range []string{"Current context: `prod`", "dev", "staging", "prod (current)"} {
+		if !strings.Contains(ans, want) {
+			t.Errorf("answer missing %q:\n%s", want, ans)
+		}
+	}
+
+	// "context <name>" switches.
+	ans, handled, err = a.handleMetaQuery(context.Background(), "context staging")
+	if err != nil {
+		t.Fatalf("handleMetaQuery: %v", err)
+	}
+	if !handled || !strings.Contains(ans, "Switched to context `staging`") {
+		t.Errorf("unexpected answer: handled=%v ans=%q", handled, ans)
+	}
+	if current, _, ok := kube.CurrentContext(path); !ok || current != "staging" {
+		t.Errorf("after switch: context = %q (ok=%v), want staging", current, ok)
+	}
+
+	// Unknown context errors and changes nothing.
+	_, _, err = a.handleMetaQuery(context.Background(), "context nope")
+	if err == nil {
+		t.Fatal("expected error for an unknown context")
+	}
+	if !strings.Contains(err.Error(), "dev") {
+		t.Errorf("expected available contexts in the error, got: %v", err)
 	}
 }

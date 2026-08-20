@@ -32,6 +32,7 @@ import (
 	"github.com/GoogleCloudPlatform/kubectl-ai/gollm"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/journal"
+	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/kube"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/mcp"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/sandbox"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/sessions"
@@ -1095,6 +1096,8 @@ var slashCommands = map[string]string{
 	"rename":   "rename-session",
 	"resume":   "resume-session",
 	"delete":   "delete-session",
+	"context":  "context",
+	"contexts": "context",
 }
 
 // normalizeSlashCommand translates a slash-prefixed command (e.g. "/rename
@@ -1219,6 +1222,8 @@ func (c *Agent) handleMetaQuery(ctx context.Context, query string) (answer strin
 		return "Available models:\n\n  - " + strings.Join(models, "\n  - ") + "\n\n", true, nil
 	case "tools":
 		return "Available tools:\n\n  - " + strings.Join(c.Tools.Names(), "\n  - ") + "\n\n", true, nil
+	case "context":
+		return c.handleContextQuery("")
 	case "session":
 		if c.SessionBackend != "filesystem" {
 			return "Ephemeral session (memory backed). No persistent info available.", true, nil
@@ -1291,6 +1296,10 @@ func (c *Agent) handleMetaQuery(ctx context.Context, query string) (answer strin
 			return "", false, err
 		}
 		return fmt.Sprintf("Switched to model `%s`.", modelID), true, nil
+	}
+
+	if query == "context" || strings.HasPrefix(query, "context ") {
+		return c.handleContextQuery(strings.TrimSpace(strings.TrimPrefix(query, "context")))
 	}
 
 	if query == "delete-session" || strings.HasPrefix(query, "delete-session ") {
@@ -1611,6 +1620,42 @@ func (c *Agent) DeleteSession(sessionID string) error {
 	}
 
 	return manager.DeleteSession(sessionID)
+}
+
+// handleContextQuery answers the "context" meta query: bare lists the
+// current and available kube contexts; "context <name>" switches the
+// current context in the kubeconfig.
+func (c *Agent) handleContextQuery(name string) (answer string, handled bool, err error) {
+	current, _, ok := kube.CurrentContext(c.Kubeconfig)
+	if name == "" {
+		names, err := kube.ListContexts(c.Kubeconfig)
+		if err != nil {
+			return "", false, fmt.Errorf("listing contexts: %w", err)
+		}
+		var b strings.Builder
+		if ok {
+			b.WriteString("Current context: `" + current + "`\n\n")
+		}
+		b.WriteString("Available contexts:\n\n")
+		for _, n := range names {
+			if n == current {
+				b.WriteString("  - " + n + " (current)\n")
+			} else {
+				b.WriteString("  - " + n + "\n")
+			}
+		}
+		b.WriteString("\nSwitch with `/context <name>`.")
+		return b.String(), true, nil
+	}
+
+	if err := kube.UseContext(c.Kubeconfig, name); err != nil {
+		names, _ := kube.ListContexts(c.Kubeconfig)
+		if len(names) > 0 {
+			return "", false, fmt.Errorf("%v. Available contexts: %s", err, strings.Join(names, ", "))
+		}
+		return "", false, err
+	}
+	return fmt.Sprintf("Switched to context `%s`.", name), true, nil
 }
 
 // openModelPicker presents an interactive picker of the provider's models

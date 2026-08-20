@@ -31,6 +31,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/agent"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
+	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/kube"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/spinner"
@@ -40,7 +41,6 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
-	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 )
 
@@ -318,6 +318,9 @@ type model struct {
 	// becomes a full command name.
 	tabMatches []string
 	tabIndex   int
+	// Kube context names for /context autocomplete, cached briefly.
+	contextNames     []string
+	contextNamesLast time.Time
 	// sessionID tracks the active session so switches are detectable.
 	sessionID string
 	// Kube context/namespace shown in the status bar; resolved once at
@@ -764,6 +767,22 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.toggleAutoMode()
 	case tea.KeyTab:
 		if m.inChoiceMode {
+			return m, nil
+		}
+		// Kube context autocomplete: cycle the partial after "/context "
+		// through context names.
+		if v := m.input.Value(); strings.HasPrefix(v, "/context ") {
+			if m.tabIndex < len(m.tabMatches) && v == "/context "+m.tabMatches[m.tabIndex] {
+				m.tabIndex = (m.tabIndex + 1) % len(m.tabMatches)
+			} else {
+				m.tabMatches = m.contextMatches()
+				m.tabIndex = 0
+			}
+			if len(m.tabMatches) > 0 {
+				m.input.SetValue("/context " + m.tabMatches[m.tabIndex])
+				m.input.CursorEnd()
+				m.syncInputHeight()
+			}
 			return m, nil
 		}
 		// File mention autocomplete: cycle the current @token through
@@ -2126,23 +2145,16 @@ func (k kubeContextInfo) isProd() bool {
 }
 
 // loadKubeContext reads the current context and namespace from a kubeconfig
-// file (path, or the KUBECONFIG env / ~/.kube/config default when empty)
-// using client-go — no kubectl subprocess. A missing or unreadable config
-// reports ok=false so the status bar simply omits the indicator.
+// file (path, or the KUBECONFIG env / ~/.kube/config default when empty).
+// A missing or unreadable config reports ok=false so the status bar simply
+// omits the indicator.
 func loadKubeContext(path string) (info kubeContextInfo, ok bool) {
-	rules := clientcmd.NewDefaultClientConfigLoadingRules()
-	if path != "" {
-		rules = &clientcmd.ClientConfigLoadingRules{ExplicitPath: path}
-	}
-	cfg, err := rules.Load()
-	if err != nil || cfg.CurrentContext == "" {
+	context, namespace, ok := kube.CurrentContext(path)
+	if !ok {
 		return kubeContextInfo{}, false
 	}
-	info.context = cfg.CurrentContext
-	info.namespace = "default"
-	if ctx, ok := cfg.Contexts[cfg.CurrentContext]; ok && ctx.Namespace != "" {
-		info.namespace = ctx.Namespace
-	}
+	info.context = context
+	info.namespace = namespace
 	return info, true
 }
 
@@ -2283,7 +2295,7 @@ func (m model) viewDivider() string {
 var slashCommands = []string{
 	"/model", "/models", "/tools", "/sessions", "/session", "/new", "/save",
 	"/rename", "/resume", "/delete", "/delete-session", "/clear", "/exit",
-	"/quit", "/compact",
+	"/quit", "/compact", "/context",
 }
 
 // slashCompletions returns the commands matching the input prefix, or nil
@@ -2317,11 +2329,42 @@ func (m model) shellMode() bool {
 }
 
 // completionHintVisible reports whether a hint line (slash completions,
-// file mentions, or the shell marker) is shown under the input.
-func (m model) completionHintVisible() bool {
+// file mentions, context names, or the shell marker) is shown under the input.
+func (m *model) completionHintVisible() bool {
 	return m.shellMode() ||
 		len(slashCompletions(m.input.Value())) > 0 ||
-		len(m.fileMatches()) > 0
+		len(m.fileMatches()) > 0 ||
+		len(m.contextMatches()) > 0
+}
+
+// contextMatches returns kube context names matching the partial after
+// "/context " in the input, or nil when the input isn't a context command.
+// Names are cached briefly to avoid reloading the kubeconfig on every frame.
+func (m *model) contextMatches() []string {
+	v := m.input.Value()
+	const cmd = "/context "
+	if !strings.HasPrefix(v, cmd) {
+		return nil
+	}
+	prefix := strings.TrimPrefix(v, cmd)
+	if time.Since(m.contextNamesLast) > 10*time.Second || m.contextNamesLast.IsZero() {
+		if m.agent == nil {
+			return nil
+		}
+		names, err := kube.ListContexts(m.agent.Kubeconfig)
+		if err != nil {
+			return nil
+		}
+		m.contextNames = names
+		m.contextNamesLast = time.Now()
+	}
+	var matches []string
+	for _, n := range m.contextNames {
+		if strings.HasPrefix(n, prefix) {
+			matches = append(matches, n)
+		}
+	}
+	return matches
 }
 
 // fileMatches returns filesystem path completions for the current `@`
@@ -2355,10 +2398,14 @@ func (m model) fileMatches() []string {
 }
 
 // completionHint renders the dim hint line shown under the input: the shell
-// marker, file mention matches, or slash-command completions.
-func (m model) completionHint() string {
+// marker, file mention matches, context names, or slash-command completions.
+func (m *model) completionHint() string {
 	if m.shellMode() {
 		return dimStyle.Render("  shell command")
+	}
+	if matches := m.contextMatches(); len(matches) > 0 {
+		hint := "  " + strings.Join(matches, "  ")
+		return dimStyle.Render(truncateRunes(hint, max(m.input.Width(), 20)))
 	}
 	if matches := m.fileMatches(); len(matches) > 0 {
 		hint := "  " + strings.Join(matches, "  ")
