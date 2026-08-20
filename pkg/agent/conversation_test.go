@@ -1375,3 +1375,71 @@ func TestToolDispatchUsesActiveKubeconfig(t *testing.T) {
 		t.Errorf("base context changed to %q, want prod untouched", current)
 	}
 }
+
+// bigOutputTool returns a result with a massive stdout, to verify the agent
+// caps oversized tool output before storing it in the session history.
+type bigOutputTool struct{}
+
+func (t *bigOutputTool) Name() string                          { return "bigoutput" }
+func (t *bigOutputTool) Description() string                   { return "returns a big output" }
+func (t *bigOutputTool) FunctionDefinition() *gollm.FunctionDefinition {
+	return &gollm.FunctionDefinition{Name: "bigoutput", Description: "returns a big output"}
+}
+func (t *bigOutputTool) Run(context.Context, map[string]any) (any, error) {
+	return map[string]any{"stdout": strings.Repeat("x", 32*1024)}, nil
+}
+func (t *bigOutputTool) IsInteractive(map[string]any) (bool, error) { return false, nil }
+func (t *bigOutputTool) CheckModifiesResource(map[string]any) string { return "no" }
+
+func TestDispatchToolCallsCapsOversizedOutput(t *testing.T) {
+	a := &Agent{
+		Session: &api.Session{ChatMessageStore: sessions.NewInMemoryChatStore()},
+		workDir: t.TempDir(),
+		Output:  make(chan any, 10),
+	}
+	go func() {
+		for range a.Output {
+		}
+	}()
+
+	var toolset tools.Tools
+	toolset.Init()
+	toolset.RegisterTool(&bigOutputTool{})
+	a.Tools = toolset
+	parsed, err := a.Tools.ParseToolInvocation(context.Background(), "bigoutput", map[string]any{})
+	if err != nil {
+		t.Fatalf("ParseToolInvocation: %v", err)
+	}
+	a.pendingFunctionCalls = []ToolCallAnalysis{
+		{FunctionCall: gollm.FunctionCall{ID: "1", Name: "bigoutput", Arguments: map[string]any{}},
+			ParsedToolCall: parsed, ModifiesResourceStr: "no"},
+	}
+	if err := a.DispatchToolCalls(context.Background()); err != nil {
+		t.Fatalf("DispatchToolCalls failed: %v", err)
+	}
+	// The stored tool-call-response payload is capped.
+	msgs := a.Session.ChatMessageStore.ChatMessages()
+	var last *api.Message
+	for i := range msgs {
+		if msgs[i].Type == api.MessageTypeToolCallResponse {
+			last = msgs[i]
+		}
+	}
+	if last == nil {
+		t.Fatal("expected a tool-call-response message")
+	}
+	payload, ok := last.Payload.(map[string]any)
+	if !ok {
+		t.Fatalf("expected a map payload, got %T", last.Payload)
+	}
+	stdout, _ := payload["stdout"].(string)
+	// The capped stdout is the head plus a truncation marker, so it's
+	// slightly over maxToolOutputBytes — but far smaller than the
+	// original 32KB, and carries the marker.
+	if !strings.Contains(stdout, "truncated") {
+		t.Error("expected a truncation marker in the capped stdout")
+	}
+	if len(stdout) > maxToolOutputBytes+100 {
+		t.Errorf("stored stdout = %d bytes, want ~%d (head + marker)", len(stdout), maxToolOutputBytes)
+	}
+}
