@@ -1862,6 +1862,59 @@ func (m model) renderWelcome() string {
 	return sb.String()
 }
 
+// renderChoicePrompt renders the choice picker's prompt. For a permission
+// prompt (confirm), the commands being approved are pulled out of the prose
+// and rendered on their own highlighted lines so the user immediately sees
+// what they're authorizing — the safety-critical part must not blend into the
+// surrounding text. Other prompts (e.g. session pickers) render as a simple
+// "? <prompt>" line.
+func (m model) renderChoicePrompt() string {
+	if m.choiceType != "confirm" {
+		return warnText.Render("? " + m.choicePrompt)
+	}
+	// Permission prompt: "The following commands require your approval to run:\n* cmd\n...\n\nDo you want to proceed ?"
+	// Split the bullet command lines out of the prose.
+	lines := strings.Split(m.choicePrompt, "\n")
+	var header, commands []string
+	question := ""
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case trimmed == "":
+			continue
+		case strings.HasPrefix(trimmed, "* "):
+			commands = append(commands, strings.TrimPrefix(trimmed, "* "))
+		case strings.HasPrefix(trimmed, "Do you want to proceed"):
+			question = trimmed
+		default:
+			header = append(header, line)
+		}
+	}
+
+	var sb strings.Builder
+	if len(header) > 0 {
+		sb.WriteString(warnText.Render("? " + strings.Join(header, " ")))
+	} else {
+		sb.WriteString(warnText.Render("? Approval required"))
+	}
+	// The commands are the thing the user is actually approving: render each
+	// distinctly (a warning-tinted code line) so they pop out of the prose.
+	if len(commands) == 0 {
+		// Unknown shape — fall back to the raw prompt.
+		return warnText.Render("? " + m.choicePrompt)
+	}
+	cmdStyle := lipgloss.NewStyle().Foreground(colorWarning)
+	for _, cmd := range commands {
+		sb.WriteString("\n")
+		sb.WriteString("  " + cmdStyle.Render("› " + cmd))
+	}
+	if question != "" {
+		sb.WriteString("\n\n")
+		sb.WriteString(warnText.Bold(true).Render(question))
+	}
+	return sb.String()
+}
+
 func (m model) renderMessages() string {
 	var sb strings.Builder
 
@@ -1914,7 +1967,7 @@ func (m model) renderMessages() string {
 	// Render choice picker inline at the end of messages
 	if m.inChoiceMode {
 		sb.WriteString("\n")
-		sb.WriteString(warnText.Render("? " + m.choicePrompt))
+		sb.WriteString(m.renderChoicePrompt())
 		sb.WriteString("\n\n")
 		sb.WriteString(m.list.View())
 		sb.WriteString("\n")
