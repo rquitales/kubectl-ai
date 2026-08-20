@@ -1007,6 +1007,34 @@ func TestEscInterruptsRunningAgent(t *testing.T) {
 	if m.input.Value() != "" {
 		t.Error("expected input untouched by interrupt")
 	}
+	// The interrupt is confirmed in the transcript.
+	if len(m.messages) == 0 || !strings.Contains(m.messages[len(m.messages)-1].Payload.(string), "Interrupted") {
+		t.Errorf("expected an 'Interrupted' confirmation, got %d messages", len(m.messages))
+	}
+}
+
+func TestInterruptRunConfirmsAndNothingRunning(t *testing.T) {
+	// Nothing running: a note, no cancel command.
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	_, _ = m.interruptRun()
+	if len(m.messages) == 0 || !strings.Contains(m.messages[len(m.messages)-1].Payload.(string), "Nothing running") {
+		t.Errorf("expected a 'Nothing running' note, got %d messages", len(m.messages))
+	}
+
+	// A running agent: the interrupt is confirmed.
+	a2 := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateRunning}}
+	m2 := newModel(a2)
+	runCtx := a2.StartRun(context.Background())
+	_, _ = m2.interruptRun()
+	select {
+	case <-runCtx.Done():
+	case <-time.After(time.Second):
+		t.Error("expected interruptRun to cancel the running agent")
+	}
+	if len(m2.messages) == 0 || !strings.Contains(m2.messages[len(m2.messages)-1].Payload.(string), "Interrupted") {
+		t.Errorf("expected an 'Interrupted' confirmation, got %d messages", len(m2.messages))
+	}
 }
 
 func TestEscClearsInputWhenIdle(t *testing.T) {
