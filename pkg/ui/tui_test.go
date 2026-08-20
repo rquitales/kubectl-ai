@@ -1769,6 +1769,36 @@ func TestRenderToolResultFailedStyle(t *testing.T) {
 	if strings.Contains(got, "partial output") {
 		t.Errorf("stdout must not be shown when stderr is present on failure, got:\n%s", got)
 	}
+	// The exit code is surfaced on the failed marker line.
+	if !strings.Contains(got, "exit 1") {
+		t.Errorf("expected 'exit 1' on the failed result, got:\n%s", got)
+	}
+}
+
+func TestRenderToolResultExitCodeDistinguishes(t *testing.T) {
+	m := newModel(nil)
+
+	// exit 137 (OOM-killed) reads distinctly from exit 1.
+	msg := &api.Message{
+		Type: api.MessageTypeToolCallResponse,
+		Payload: map[string]any{
+			"stderr":     "OOMKilled",
+			"exit_code":  float64(137),
+		},
+	}
+	got := m.renderToolResult(msg)
+	if !strings.Contains(got, "exit 137") {
+		t.Errorf("expected 'exit 137' surfaced, got:\n%s", got)
+	}
+
+	// A failed result with no exit code (err.Error() string) doesn't fabricate one.
+	got = m.renderToolResult(&api.Message{Type: api.MessageTypeToolCallResponse, Payload: "connection refused"})
+	if strings.Contains(got, "exit ") {
+		t.Errorf("a string error must not show a fabricated exit code, got:\n%s", got)
+	}
+	if !strings.Contains(got, "✗") {
+		t.Errorf("expected a ✗ marker on a string error, got:\n%s", got)
+	}
 }
 
 func TestRenderToolResultSuccessStaysDim(t *testing.T) {
