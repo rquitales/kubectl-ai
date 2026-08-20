@@ -3456,7 +3456,13 @@ func (m model) viewInput(state api.AgentState) string {
 		if !m.thinkStart.IsZero() {
 			elapsed = " " + formatDuration(time.Since(m.thinkStart))
 		}
-		content := primaryText.Render(m.spinner.View()+" Thinking...") + mutedStyle.Render(elapsed)
+		// Distinguish the startup phase (loading session/MCP) from an actual
+		// model thinking turn: "Initializing..." vs "Thinking...".
+		label := "Thinking..."
+		if state == api.AgentStateInitializing {
+			label = "Initializing..."
+		}
+		content := primaryText.Render(m.spinner.View()+" "+label) + mutedStyle.Render(elapsed)
 		return lipgloss.NewStyle().Padding(0, 1).Render(m.runningBox().Width(m.width - 4).Render(content))
 	}
 
