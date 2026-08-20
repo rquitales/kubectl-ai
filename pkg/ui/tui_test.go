@@ -1296,6 +1296,104 @@ func TestRenderToolResultShimStringAndEmpty(t *testing.T) {
 	}
 }
 
+func TestRenderToolGroupPairedRequestAndResult(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+
+	req := &api.Message{
+		Type:    api.MessageTypeToolCallRequest,
+		Payload: "kubectl get pods",
+	}
+	resp := &api.Message{
+		Type:    api.MessageTypeToolCallResponse,
+		Payload: map[string]any{"stdout": "NAME   READY\ncoredns   1/1\nmetrics-server   1/1\n"},
+	}
+
+	got := m.renderToolGroup(req, resp, 90)
+	// The command appears once as the header line.
+	if !strings.Contains(got, "kubectl get pods") {
+		t.Errorf("expected the command header, got:\n%s", got)
+	}
+	if strings.Count(got, "kubectl get pods") != 1 {
+		t.Errorf("expected the command once, got:\n%s", got)
+	}
+	// The result is nested under the command, not a separate "Running" box.
+	if !strings.Contains(got, "⎿") {
+		t.Errorf("expected a nested result marker, got:\n%s", got)
+	}
+	if strings.Contains(got, "Running") {
+		t.Errorf("a completed call must not show 'Running', got:\n%s", got)
+	}
+	if !strings.Contains(got, "coredns") {
+		t.Errorf("expected the result content, got:\n%s", got)
+	}
+}
+
+func TestRenderToolGroupEmptyResultKeepsHeader(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+
+	req := &api.Message{Type: api.MessageTypeToolCallRequest, Payload: "kubectl delete pod foo"}
+	resp := &api.Message{Type: api.MessageTypeToolCallResponse, Payload: map[string]any{}}
+
+	got := m.renderToolGroup(req, resp, 90)
+	if !strings.Contains(got, "delete pod foo") {
+		t.Errorf("expected the header for an empty result, got:\n%s", got)
+	}
+	if strings.Contains(got, "⎿") {
+		t.Errorf("expected no nested marker for an empty result, got:\n%s", got)
+	}
+}
+
+func TestRenderMessagesGroupsAdjacentToolCallAndResult(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.width, m.height = 100, 40
+	m.resize()
+
+	m.messages = []*api.Message{
+		{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "show pods", Timestamp: time.Now()},
+		{Source: api.MessageSourceModel, Type: api.MessageTypeToolCallRequest, Payload: "kubectl get pods", Timestamp: time.Now()},
+		{Source: api.MessageSourceAgent, Type: api.MessageTypeToolCallResponse, Payload: map[string]any{"stdout": "coredns 1/1\n"}, Timestamp: time.Now()},
+	}
+	m.dirty = true
+
+	got := m.renderMessages()
+	if !strings.Contains(got, "kubectl get pods") {
+		t.Errorf("expected the command header, got:\n%s", got)
+	}
+	if !strings.Contains(got, "⎿") {
+		t.Errorf("expected the paired result nested under the command, got:\n%s", got)
+	}
+	if !strings.Contains(got, "coredns") {
+		t.Errorf("expected the result content, got:\n%s", got)
+	}
+	if strings.Contains(got, "Running") {
+		t.Errorf("a completed tool call must not show 'Running', got:\n%s", got)
+	}
+}
+
+func TestRenderMessagesLoneToolRequestShowsRunning(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateRunning}}
+	m := newModel(a)
+	m.width, m.height = 100, 40
+	m.resize()
+
+	// A request whose result has not arrived yet renders standalone.
+	m.messages = []*api.Message{
+		{Source: api.MessageSourceModel, Type: api.MessageTypeToolCallRequest, Payload: "kubectl get nodes", Timestamp: time.Now()},
+	}
+	m.dirty = true
+
+	got := m.renderMessages()
+	if !strings.Contains(got, "kubectl get nodes") {
+		t.Errorf("expected the command, got:\n%s", got)
+	}
+	if !strings.Contains(got, "Running") {
+		t.Errorf("expected a 'Running' indicator for an in-flight call, got:\n%s", got)
+	}
+}
+
 func TestToolResultText(t *testing.T) {
 	cases := []struct {
 		in   any

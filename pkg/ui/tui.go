@@ -62,7 +62,6 @@ var (
 	colorMuted     = lipgloss.Color("#9AA0A6") // Grey 500
 	colorDim       = lipgloss.Color("#5F6368") // Grey 700
 	colorBgSubtle  = lipgloss.Color("#303134") // Surface variant
-	colorBgCode    = lipgloss.Color("#1E1E1E") // Code background
 )
 
 // Styles - consolidated for reuse
@@ -92,7 +91,6 @@ var (
 			Padding(0, 1).MarginBottom(1)
 	inputBox    = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colorPrimary).Padding(0, 1)
 	inputBoxDim = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colorDim).Padding(0, 1)
-	codeStyle   = lipgloss.NewStyle().Foreground(colorText).Background(colorBgCode).Padding(0, 1)
 )
 
 // List item for choice selection
@@ -1813,9 +1811,23 @@ func (m model) renderMessages() string {
 			// Cleared view: only the marker and what came after it.
 			start = from
 		}
-		for i, msg := range m.messages[start:] {
+		for i := start; i < len(m.messages); i++ {
 			if i == from && from > 0 {
 				sb.WriteString(dimStyle.PaddingLeft(1).Render("── transcript cleared (ctrl+l) ──") + "\n\n")
+			}
+			msg := m.messages[i]
+			// A tool-call request immediately followed by its response renders
+			// as one grouped, nested block (the command header with the result
+			// indented under it) — like Claude Code — instead of two
+			// disconnected boxes. A request whose result hasn't arrived yet
+			// renders standalone with a "Running" indicator.
+			if msg.Type == api.MessageTypeToolCallRequest && i+1 < len(m.messages) &&
+				m.messages[i+1].Type == api.MessageTypeToolCallResponse {
+				if s := m.renderToolGroup(msg, m.messages[i+1], width); s != "" {
+					sb.WriteString(s)
+				}
+				i++ // consume the paired response
+				continue
 			}
 			if s := m.renderMessage(msg, renderer, width); s != "" {
 				sb.WriteString(s)
@@ -1912,7 +1924,31 @@ func (m model) renderToolCall(msg *api.Message, w int) string {
 	if !ok {
 		return ""
 	}
-	content := successText.Render("⚡ Running") + "\n" + codeStyle.Render(payload)
+	content := successText.Render("⚡ Running") + " " + dimStyle.Render("·") + " " + textStyle.Render(payload)
+	return toolBox.Width(w).Render(content) + "\n"
+}
+
+// renderToolGroup renders a tool-call request and its result as a single
+// grouped block: the command on the header line (in the running/secondary
+// color), and the result nested under a "⎿" indent — the same shape Claude
+// Code and opencode use, so back-to-back tool calls read as one action with
+// its output instead of two unrelated boxes. The result is collapsed/expanded
+// exactly like renderToolResult, reusing the same line caps and the
+// ctrl+o toggle.
+func (m model) renderToolGroup(req, resp *api.Message, w int) string {
+	cmd, ok := req.Payload.(string)
+	if !ok {
+		return ""
+	}
+	header := successText.Render("⚡ " + truncateRunes(cmd, max(w-4, 20)))
+
+	body := m.renderToolResult(resp)
+	if strings.TrimSpace(body) == "" {
+		// No displayable output yet (e.g. still running, or empty success):
+		// keep the block compact with just the command header.
+		return toolBox.Width(w).Render(header) + "\n"
+	}
+	content := header + "\n" + strings.TrimRight(body, "\n")
 	return toolBox.Width(w).Render(content) + "\n"
 }
 
