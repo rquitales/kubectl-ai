@@ -1412,6 +1412,104 @@ func TestToolResultText(t *testing.T) {
 	}
 }
 
+func TestToolResultFailed(t *testing.T) {
+	cases := []struct {
+		in   any
+		want bool
+	}{
+		{map[string]any{"stdout": "ok", "exit_code": float64(0)}, false},
+		{map[string]any{"stdout": "ok"}, false},
+		{map[string]any{"content": "mcp result"}, false},
+		{map[string]any{}, false},
+		{map[string]any{"stderr": "boom", "exit_code": float64(1)}, true},
+		{map[string]any{"error": "connection refused"}, true},
+		{"Result of running \"x\":\nok", false},
+		{"connection refused: get pods", true},
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := toolResultFailed(c.in); got != c.want {
+			t.Errorf("toolResultFailed(%v) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+func TestToolResultErrorText(t *testing.T) {
+	cases := []struct {
+		in   any
+		want string
+	}{
+		{map[string]any{"error": "boom", "stderr": "lines"}, "boom"},
+		{map[string]any{"stderr": "lines"}, "lines"},
+		{map[string]any{"stdout": "ok"}, ""},
+		{"plain string", ""},
+	}
+	for _, c := range cases {
+		if got := toolResultErrorText(c.in); got != c.want {
+			t.Errorf("toolResultErrorText(%v) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestRenderToolResultFailedStyle(t *testing.T) {
+	m := newModel(nil)
+
+	// A non-zero exit code renders in the error color with a ✗ marker.
+	msg := &api.Message{
+		Type: api.MessageTypeToolCallResponse,
+		Payload: map[string]any{
+			"stdout":   "partial output",
+			"stderr":   "Error from server: not found",
+			"exit_code": float64(1),
+		},
+	}
+	got := m.renderToolResult(msg)
+	if !strings.Contains(got, "✗") {
+		t.Errorf("expected a ✗ marker on a failed result, got:\n%s", got)
+	}
+	// The cause (stderr) is shown, not the normal stdout.
+	if !strings.Contains(got, "not found") {
+		t.Errorf("expected stderr cause on a failed result, got:\n%s", got)
+	}
+	if strings.Contains(got, "partial output") {
+		t.Errorf("stdout must not be shown when stderr is present on failure, got:\n%s", got)
+	}
+}
+
+func TestRenderToolResultSuccessStaysDim(t *testing.T) {
+	m := newModel(nil)
+
+	msg := &api.Message{
+		Type:    api.MessageTypeToolCallResponse,
+		Payload: map[string]any{"stdout": "all good", "exit_code": float64(0)},
+	}
+	got := m.renderToolResult(msg)
+	if strings.Contains(got, "✗") {
+		t.Errorf("a successful result must not show a ✗ marker, got:\n%s", got)
+	}
+	if !strings.Contains(got, "all good") {
+		t.Errorf("expected the success output, got:\n%s", got)
+	}
+}
+
+func TestRenderToolGroupFailedHeader(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+
+	req := &api.Message{Type: api.MessageTypeToolCallRequest, Payload: "kubectl get pod missing"}
+	resp := &api.Message{
+		Type: api.MessageTypeToolCallResponse,
+		Payload: map[string]any{"stderr": "not found", "exit_code": float64(1)},
+	}
+	got := m.renderToolGroup(req, resp, 90)
+	if !strings.Contains(got, "✗") {
+		t.Errorf("expected a ✗ header marker for a failed grouped call, got:\n%s", got)
+	}
+	if !strings.Contains(got, "not found") {
+		t.Errorf("expected the error body nested under the header, got:\n%s", got)
+	}
+}
+
 func writeKubeConfig(t *testing.T, currentContext string, withNamespace bool) string {
 	t.Helper()
 	ns := ""
