@@ -471,7 +471,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		m.dirty = true
 		m.resize()
-		return m, nil
+		// A terminal resize makes the renderer re-enter alt-screen mode and
+		// re-emit the mouse-enable sequence; re-enable mouse cell-motion so
+		// bubbletea keeps consuming mouse events (otherwise the terminal's
+		// SGR mouse reports leak into the input box as literal text).
+		return m, tea.EnableMouseCellMotion
 
 	case tea.KeyMsg:
 		return m.handleKey(msg)
