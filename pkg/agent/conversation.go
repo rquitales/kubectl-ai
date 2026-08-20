@@ -1686,6 +1686,15 @@ func (c *Agent) ActiveKubeconfig() string {
 	return c.Kubeconfig
 }
 
+// ListAllTools returns every registered tool (built-in and MCP), safe to call
+// from UI goroutines. It snapshots under the session lock so a concurrent
+// tool registration can't race the caller.
+func (c *Agent) ListAllTools() []tools.Tool {
+	c.sessionMu.Lock()
+	defer c.sessionMu.Unlock()
+	return c.Tools.AllTools()
+}
+
 // applyKubeOverride builds (or rebuilds) the session-scoped kubeconfig
 // override with the given context and/or namespace and points KUBECONFIG at
 // it for this process. The base kubeconfig file is never mutated.

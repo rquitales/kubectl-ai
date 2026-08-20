@@ -25,13 +25,26 @@ import (
 	"testing"
 	"time"
 
+	"github.com/GoogleCloudPlatform/kubectl-ai/gollm"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/agent"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/sandbox"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/sessions"
+	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/tools"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
+
+// stubTool implements tools.Tool for /tools-command tests without spinning up
+// the full agent tool registry.
+type stubTool struct{ name, desc string }
+
+func (t *stubTool) Name() string                                   { return t.name }
+func (t *stubTool) Description() string                            { return t.desc }
+func (t *stubTool) FunctionDefinition() *gollm.FunctionDefinition  { return nil }
+func (t *stubTool) Run(context.Context, map[string]any) (any, error) { return nil, nil }
+func (t *stubTool) IsInteractive(map[string]any) (bool, error)     { return false, nil }
+func (t *stubTool) CheckModifiesResource(map[string]any) string    { return "no" }
 
 func pasteMsg(s string) tea.KeyMsg {
 	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s), Paste: true}
@@ -925,6 +938,31 @@ func TestSlashMCPUnconfigured(t *testing.T) {
 	}
 	if got := m.messages[1].Payload.(string); !strings.Contains(got, "No MCP servers") {
 		t.Errorf("expected a no-MCP message when unconfigured, got:\n%s", got)
+	}
+}
+
+func TestToolsTextFormatsSortedList(t *testing.T) {
+	tls := []tools.Tool{
+		&stubTool{name: "kubectl", desc: "Run kubectl commands against the cluster."},
+		&stubTool{name: "bash", desc: "Run a bash command.\nWith more detail."},
+		&stubTool{name: "mcp__srv__get-pods", desc: "List pods in a namespace."},
+	}
+	got := toolsText(tls)
+	if !strings.Contains(got, "Available tools") {
+		t.Errorf("expected an 'Available tools' header, got:\n%s", got)
+	}
+	if !strings.Contains(got, "kubectl") || !strings.Contains(got, "bash") {
+		t.Errorf("expected kubectl and bash in the tools list, got:\n%s", got)
+	}
+	// Multi-line description collapses to its first line.
+	if strings.Contains(got, "With more detail") {
+		t.Errorf("expected the description collapsed to its first line, got:\n%s", got)
+	}
+}
+
+func TestToolsTextEmpty(t *testing.T) {
+	if got := toolsText(nil); !strings.Contains(got, "No tools are available") {
+		t.Errorf("expected a no-tools message, got %q", got)
 	}
 }
 
