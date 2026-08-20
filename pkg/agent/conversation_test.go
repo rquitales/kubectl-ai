@@ -738,3 +738,131 @@ func TestAgentCloseKeepsSessionWithMessages(t *testing.T) {
 		t.Error("expected session with messages to be kept on exit")
 	}
 }
+
+func TestDeriveSessionName(t *testing.T) {
+	cases := []struct {
+		name     string
+		messages []*api.Message
+		want     string
+	}{
+		{name: "no messages", messages: nil, want: ""},
+		{
+			name: "first real user message wins",
+			messages: []*api.Message{
+				{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "/sessions"},
+				{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "why are my pods crashing in prod"},
+			},
+			want: "why are my pods crashing in prod",
+		},
+		{
+			name: "skips bare meta commands",
+			messages: []*api.Message{
+				{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "model"},
+				{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "restart the flux kustomization"},
+			},
+			want: "restart the flux kustomization",
+		},
+		{
+			name: "collapses whitespace",
+			messages: []*api.Message{
+				{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "debug\n\tthe  payment   gateway"},
+			},
+			want: "debug the payment gateway",
+		},
+		{
+			name: "truncates long names",
+			messages: []*api.Message{
+				{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: strings.Repeat("debug this very long sentence about kubernetes ", 5)},
+			},
+			want: strings.TrimSpace(strings.Repeat("debug this very long sentence about kubernetes ", 5))[:48] + "…",
+		},
+		{
+			name: "ignores non-user and non-text messages",
+			messages: []*api.Message{
+				{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "some answer"},
+			},
+			want: "",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := deriveSessionName(c.messages); got != c.want {
+				t.Errorf("deriveSessionName() = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+func TestAgentCloseAutoNamesFromContent(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+
+	mgr, err := sessions.NewSessionManager("filesystem")
+	if err != nil {
+		t.Fatalf("NewSessionManager: %v", err)
+	}
+	s, err := mgr.NewSession(sessions.Metadata{ModelID: "m"})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if s.Name != "" {
+		t.Fatalf("expected empty name at creation, got %q", s.Name)
+	}
+	if err := s.ChatMessageStore.AddChatMessage(&api.Message{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "why is nginx crashlooping"}); err != nil {
+		t.Fatalf("AddChatMessage: %v", err)
+	}
+
+	a := &Agent{Session: s, SessionBackend: "filesystem"}
+	if err := a.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	reloaded, err := mgr.FindSessionByID(s.ID)
+	if err != nil {
+		t.Fatalf("session missing after close: %v", err)
+	}
+	if reloaded.Name != "why is nginx crashlooping" {
+		t.Errorf("auto-derived name = %q, want %q", reloaded.Name, "why is nginx crashlooping")
+	}
+	if reloaded.ManuallyNamed {
+		t.Error("auto-derived name must not be marked as manual")
+	}
+}
+
+func TestAgentCloseKeepsManualName(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+
+	mgr, err := sessions.NewSessionManager("filesystem")
+	if err != nil {
+		t.Fatalf("NewSessionManager: %v", err)
+	}
+	s, err := mgr.NewSession(sessions.Metadata{ModelID: "m"})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if err := mgr.SetSessionName(s.ID, "my custom name", true); err != nil {
+		t.Fatalf("SetSessionName: %v", err)
+	}
+	if err := s.ChatMessageStore.AddChatMessage(&api.Message{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "some question"}); err != nil {
+		t.Fatalf("AddChatMessage: %v", err)
+	}
+	// Reload so the in-memory session carries the manual flag.
+	reloaded, err := mgr.FindSessionByID(s.ID)
+	if err != nil {
+		t.Fatalf("FindSessionByID: %v", err)
+	}
+
+	a := &Agent{Session: reloaded, SessionBackend: "filesystem"}
+	if err := a.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	final, err := mgr.FindSessionByID(s.ID)
+	if err != nil {
+		t.Fatalf("session missing after close: %v", err)
+	}
+	if final.Name != "my custom name" {
+		t.Errorf("manual name was overridden: %q", final.Name)
+	}
+}

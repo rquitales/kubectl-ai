@@ -59,7 +59,7 @@ func (sm *SessionManager) NewSession(meta Metadata) (*api.Session, error) {
 		now := time.Now()
 		session := &api.Session{
 			ID:           sessionID,
-			Name:         generateSessionName(),
+			Name:         "", // unnamed until content-derived naming on exit
 			ProviderID:   meta.ProviderID,
 			ModelID:      meta.ModelID,
 			AgentState:   api.AgentStateIdle,
@@ -93,7 +93,8 @@ func (sm *SessionManager) DeleteSession(id string) error {
 }
 
 // RenameSession sets a new display name for the session with the given ID.
-// The name is sanitized before being stored.
+// The name is sanitized before being stored. It does not change the
+// ManuallyNamed flag (used by content-derived auto-naming).
 func (sm *SessionManager) RenameSession(id, name string) error {
 	name = SanitizeSessionName(name)
 	if name == "" {
@@ -104,6 +105,22 @@ func (sm *SessionManager) RenameSession(id, name string) error {
 		return err
 	}
 	session.Name = name
+	return sm.store.UpdateSession(session)
+}
+
+// SetSessionName sets a display name and records whether the name was
+// chosen manually (true) or derived automatically from content (false).
+func (sm *SessionManager) SetSessionName(id, name string, manuallyNamed bool) error {
+	name = SanitizeSessionName(name)
+	if name == "" {
+		return errors.New("session name cannot be empty")
+	}
+	session, err := sm.store.GetSession(id)
+	if err != nil {
+		return err
+	}
+	session.Name = name
+	session.ManuallyNamed = manuallyNamed
 	return sm.store.UpdateSession(session)
 }
 

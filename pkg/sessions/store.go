@@ -55,11 +55,12 @@ func SanitizeSessionName(name string) string {
 }
 
 type Metadata struct {
-	Name         string    `json:"name,omitempty"`
-	ProviderID   string    `json:"providerID"`
-	ModelID      string    `json:"modelID"`
-	CreatedAt    time.Time `json:"createdAt"`
-	LastAccessed time.Time `json:"lastAccessed"`
+	Name          string    `json:"name,omitempty"`
+	ManuallyNamed bool      `json:"manuallyNamed,omitempty"`
+	ProviderID    string    `json:"providerID"`
+	ModelID       string    `json:"modelID"`
+	CreatedAt     time.Time `json:"createdAt"`
+	LastAccessed  time.Time `json:"lastAccessed"`
 }
 
 var defaultMemoryStore Store = newMemoryStore()

@@ -57,6 +57,7 @@ func (f *filesystemStore) GetSession(id string) (*api.Session, error) {
 	return &api.Session{
 		ID:               id,
 		Name:             meta.Name,
+		ManuallyNamed:    meta.ManuallyNamed,
 		ProviderID:       meta.ProviderID,
 		ModelID:          meta.ModelID,
 		AgentState:       api.AgentStateIdle,
@@ -80,11 +81,12 @@ func (f *filesystemStore) CreateSession(session *api.Session) error {
 	session.ChatMessageStore = chatStore
 
 	meta := Metadata{
-		Name:         session.Name,
-		ProviderID:   session.ProviderID,
-		ModelID:      session.ModelID,
-		CreatedAt:    session.CreatedAt,
-		LastAccessed: session.LastModified,
+		Name:          session.Name,
+		ManuallyNamed: session.ManuallyNamed,
+		ProviderID:    session.ProviderID,
+		ModelID:       session.ModelID,
+		CreatedAt:     session.CreatedAt,
+		LastAccessed:  session.LastModified,
 	}
 
 	data, err := yaml.Marshal(meta)
@@ -113,6 +115,7 @@ func (f *filesystemStore) UpdateSession(session *api.Session) error {
 	}
 
 	meta.Name = session.Name
+	meta.ManuallyNamed = session.ManuallyNamed
 	meta.ProviderID = session.ProviderID
 	meta.ModelID = session.ModelID
 	meta.LastAccessed = session.LastModified

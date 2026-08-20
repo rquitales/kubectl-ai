@@ -29,6 +29,9 @@ type Session struct {
 	CreatedAt        time.Time
 	LastModified     time.Time
 	ChatMessageStore ChatMessageStore
+	// ManuallyNamed is true when the user renamed the session explicitly;
+	// auto-naming from content must not override it.
+	ManuallyNamed bool
 	// MCP status information
 	MCPStatus *MCPStatus
 }
