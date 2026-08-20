@@ -1493,7 +1493,7 @@ func TestRenameEscCancels(t *testing.T) {
 	if got := m.input.Value(); got != "" {
 		t.Errorf("expected input cleared after cancel, got %q", got)
 	}
-	if got := m.input.Placeholder; got != "Ask kubectl-ai anything..." {
+	if got := m.input.Placeholder; got != "Ask anything, or / for commands, !shell, @file…" {
 		t.Errorf("placeholder = %q, want default restored", got)
 	}
 }
