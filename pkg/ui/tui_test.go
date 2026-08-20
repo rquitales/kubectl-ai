@@ -2076,6 +2076,27 @@ func TestRenderMessagesLoneToolRequestShowsRunning(t *testing.T) {
 	}
 }
 
+func TestRenderMessagesInFlightToolShowsElapsed(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateRunning}}
+	m := newModel(a)
+	m.width, m.height = 100, 40
+	m.resize()
+	// thinkStart spans the turn; an in-flight tool call shows the turn's
+	// elapsed time so a long-running command doesn't look frozen.
+	m.thinkStart = time.Now().Add(-5 * time.Second)
+	m.messages = []*api.Message{
+		{Source: api.MessageSourceModel, Type: api.MessageTypeToolCallRequest, Payload: "kubectl wait pod/x", Timestamp: time.Now()},
+	}
+	m.dirty = true
+	got := m.renderMessages()
+	if !strings.Contains(got, "kubectl wait pod/x") {
+		t.Errorf("expected the command, got:\n%s", got)
+	}
+	if !strings.Contains(got, "5s") {
+		t.Errorf("expected the elapsed timer (5s) on an in-flight call, got:\n%s", got)
+	}
+}
+
 func TestHasInFlightToolCall(t *testing.T) {
 	m := newModel(nil)
 	if m.hasInFlightToolCall() {
