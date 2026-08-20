@@ -2210,7 +2210,7 @@ func (m model) View() string {
 		sections = append(sections, m.viewPalette())
 	}
 	sections = append(sections,
-		m.viewDivider(),
+		m.viewBottomDivider(),
 		m.viewInput(session.AgentState),
 		m.viewHelp(session.AgentState),
 	)
@@ -2500,6 +2500,27 @@ func (m model) viewState(state api.AgentState) string {
 
 func (m model) viewDivider() string {
 	return dimStyle.Render(strings.Repeat("─", m.width))
+}
+
+// viewBottomDivider renders the divider that sits between the transcript and
+// the input. When the user has scrolled up in the transcript, it carries a
+// right-aligned scroll-position indicator ("↓ NN%  PgDn for latest") so it's
+// obvious there is newer content below and how far down the view is — like
+// Claude Code's scroll cue. At the bottom it is a plain divider.
+func (m model) viewBottomDivider() string {
+	if m.viewport.TotalLineCount() <= m.viewport.Height || m.viewport.AtBottom() {
+		return m.viewDivider()
+	}
+	pct := int(m.viewport.ScrollPercent() * 100)
+	cue := fmt.Sprintf(" ↓ %d%%  PgDn for latest ", pct)
+	cueWidth := lipgloss.Width(cue)
+	avail := m.width - cueWidth
+	if avail < 2 {
+		// Too narrow for a divider + cue: show just the cue.
+		return dimStyle.Render(cue)
+	}
+	line := strings.Repeat("─", avail)
+	return dimStyle.Render(line) + warnText.Render(cue)
 }
 
 // slashCommands is the static list offered for autocomplete when the input
