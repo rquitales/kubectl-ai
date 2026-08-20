@@ -1077,6 +1077,62 @@ func (m *model) lastCopyableText() (string, bool) {
 	return "", false
 }
 
+// lastToolCommand returns the most recent tool-call request's command string,
+// suitable for copying (e.g. the exact kubectl invocation the agent ran).
+func (m *model) lastToolCommand() (string, bool) {
+	for i := len(m.messages) - 1; i >= 0; i-- {
+		msg := m.messages[i]
+		if msg.Type == api.MessageTypeToolCallRequest {
+			if payload, ok := msg.Payload.(string); ok && strings.TrimSpace(payload) != "" {
+				return payload, true
+			}
+		}
+	}
+	return "", false
+}
+
+// lastToolOutput returns the displayable output of the most recent tool-call
+// response, suitable for copying.
+func (m *model) lastToolOutput() (string, bool) {
+	for i := len(m.messages) - 1; i >= 0; i-- {
+		msg := m.messages[i]
+		if msg.Type == api.MessageTypeToolCallResponse {
+			if text := toolResultText(msg.Payload); strings.TrimSpace(text) != "" {
+				return text, true
+			}
+		}
+	}
+	return "", false
+}
+
+// copyToolCommand copies the most recent tool-call command to the clipboard.
+func (m *model) copyToolCommand() (tea.Model, tea.Cmd) {
+	payload, ok := m.lastToolCommand()
+	if !ok {
+		m.appendLocalMessage("Nothing to copy yet.")
+		return m, nil
+	}
+	m.appendLocalMessage("📋 Copied last command to clipboard.")
+	return m, func() tea.Msg {
+		_ = copyToClipboard(payload)
+		return nil
+	}
+}
+
+// copyToolOutput copies the most recent tool-call output to the clipboard.
+func (m *model) copyToolOutput() (tea.Model, tea.Cmd) {
+	payload, ok := m.lastToolOutput()
+	if !ok {
+		m.appendLocalMessage("Nothing to copy yet.")
+		return m, nil
+	}
+	m.appendLocalMessage("📋 Copied last output to clipboard.")
+	return m, func() tea.Msg {
+		_ = copyToClipboard(payload)
+		return nil
+	}
+}
+
 // normalizePasteContent normalizes line endings in pasted runes and drops a
 // single trailing newline (almost always a copy artifact, so pasting one
 // line doesn't grow the input).
@@ -1172,6 +1228,8 @@ func (m *model) paletteItems() []paletteItem {
 	}
 	items = append(items,
 		paletteItem{label: "Copy last response", hint: "ctrl+y", run: (*model).copyLastResponse},
+		paletteItem{label: "Copy last command", hint: "", run: (*model).copyToolCommand},
+		paletteItem{label: "Copy last output", hint: "", run: (*model).copyToolOutput},
 	)
 	if s := m.agentState(); s == api.AgentStateRunning || s == api.AgentStateInitializing || m.inChoiceMode {
 		items = append(items, paletteItem{label: "Interrupt agent", hint: "esc", run: (*model).interruptRun})
