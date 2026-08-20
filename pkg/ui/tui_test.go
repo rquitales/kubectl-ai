@@ -1312,6 +1312,31 @@ func TestRenderChoicePromptHighlightsCommands(t *testing.T) {
 	}
 }
 
+func TestRenderChoicePromptShowsDryRunPreview(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.inChoiceMode = true
+	m.choiceType = "confirm"
+	m.choicePrompt = "The following commands require your approval to run:\n* kubectl apply -f pod.yaml\n\nDry-run preview (safe, not applied):\n* kubectl apply -f pod.yaml --dry-run=server\n\nDo you want to proceed ?"
+
+	got := m.renderChoicePrompt()
+	// The command is on its own marked line.
+	if !strings.Contains(got, "› kubectl apply -f pod.yaml") {
+		t.Errorf("expected the command on its own line, got:\n%s", got)
+	}
+	// The dry-run preview is rendered distinctly (dimmed, nested).
+	if !strings.Contains(got, "dry-run preview (safe, not applied)") {
+		t.Errorf("expected a dry-run preview header, got:\n%s", got)
+	}
+	if !strings.Contains(got, "⎿ kubectl apply -f pod.yaml --dry-run=server") {
+		t.Errorf("expected the dry-run preview nested under the command, got:\n%s", got)
+	}
+	// The question is still present.
+	if !strings.Contains(got, "Do you want to proceed") {
+		t.Errorf("expected the proceed question, got:\n%s", got)
+	}
+}
+
 func TestRenderChoicePromptSessionPickerSimple(t *testing.T) {
 	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
 	m := newModel(a)
