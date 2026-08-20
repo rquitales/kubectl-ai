@@ -2498,8 +2498,14 @@ func (m model) renderToolCall(msg *api.Message, w int) string {
 		return ""
 	}
 	// An in-flight call (no result yet) shows the live spinner rather than a
-	// static icon, so it reads as actively running — like Claude Code.
-	content := successText.Render(m.spinner.View()) + " " + dimStyle.Render("·") + " " + textStyle.Render(payload)
+	// static icon, so it reads as actively running — like Claude Code. Show
+	// the turn's elapsed time (thinkStart spans the whole turn, including
+	// tool calls) so a long-running command doesn't look frozen.
+	elapsed := ""
+	if !m.thinkStart.IsZero() {
+		elapsed = mutedStyle.Render(" " + formatDuration(time.Since(m.thinkStart)))
+	}
+	content := successText.Render(m.spinner.View()) + " " + dimStyle.Render("·") + " " + textStyle.Render(payload) + elapsed
 	return toolBox.Width(w).Render(content) + "\n"
 }
 
