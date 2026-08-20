@@ -723,7 +723,7 @@ func TestAgentCloseKeepsSessionWithMessages(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSession: %v", err)
 	}
-	if err := s.ChatMessageStore.AddChatMessage(&api.Message{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "hello"}); err != nil {
+	if err := s.ChatMessageStore.AddChatMessage(&api.Message{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "hello"}); err != nil {
 		t.Fatalf("AddChatMessage: %v", err)
 	}
 
@@ -735,7 +735,36 @@ func TestAgentCloseKeepsSessionWithMessages(t *testing.T) {
 		t.Fatalf("Close failed: %v", err)
 	}
 	if _, err := mgr.FindSessionByID(s.ID); err != nil {
-		t.Error("expected session with messages to be kept on exit")
+		t.Error("expected session with a model message to be kept on exit")
+	}
+}
+
+func TestAgentCloseDeletesMetaOnlySession(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+
+	mgr, err := sessions.NewSessionManager("filesystem")
+	if err != nil {
+		t.Fatalf("NewSessionManager: %v", err)
+	}
+	s, err := mgr.NewSession(sessions.Metadata{ModelID: "m"})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	// Only meta/slash commands, no real conversation: still empty.
+	if err := s.ChatMessageStore.AddChatMessage(&api.Message{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "/sessions"}); err != nil {
+		t.Fatalf("AddChatMessage: %v", err)
+	}
+
+	a := &Agent{
+		Session:        s,
+		SessionBackend: "filesystem",
+	}
+	if err := a.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	if _, err := mgr.FindSessionByID(s.ID); err == nil {
+		t.Error("expected meta-only session to be deleted on exit")
 	}
 }
 
@@ -811,6 +840,9 @@ func TestAgentCloseAutoNamesFromContent(t *testing.T) {
 	if err := s.ChatMessageStore.AddChatMessage(&api.Message{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "why is nginx crashlooping"}); err != nil {
 		t.Fatalf("AddChatMessage: %v", err)
 	}
+	if err := s.ChatMessageStore.AddChatMessage(&api.Message{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "Let me investigate."}); err != nil {
+		t.Fatalf("AddChatMessage: %v", err)
+	}
 
 	a := &Agent{Session: s, SessionBackend: "filesystem"}
 	if err := a.Close(); err != nil {
@@ -845,6 +877,9 @@ func TestAgentCloseKeepsManualName(t *testing.T) {
 		t.Fatalf("SetSessionName: %v", err)
 	}
 	if err := s.ChatMessageStore.AddChatMessage(&api.Message{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "some question"}); err != nil {
+		t.Fatalf("AddChatMessage: %v", err)
+	}
+	if err := s.ChatMessageStore.AddChatMessage(&api.Message{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "some answer"}); err != nil {
 		t.Fatalf("AddChatMessage: %v", err)
 	}
 	// Reload so the in-memory session carries the manual flag.

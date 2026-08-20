@@ -148,3 +148,36 @@ func (sm *SessionManager) UpdateLastAccessed(session *api.Session) error {
 	session.LastModified = time.Now()
 	return sm.store.UpdateSession(session)
 }
+
+// HasConversationMessages reports whether the messages contain any real
+// conversation (at least one model-sourced message). Sessions with only
+// meta/slash commands (or nothing) are considered empty.
+func HasConversationMessages(messages []*api.Message) bool {
+	for _, m := range messages {
+		if m.Source == api.MessageSourceModel {
+			return true
+		}
+	}
+	return false
+}
+
+// PruneEmptySessions deletes every session that has no real conversation
+// (no model-sourced messages), returning the number deleted. Used to sweep
+// accumulated empty sessions on startup.
+func (sm *SessionManager) PruneEmptySessions() (int, error) {
+	sessionList, err := sm.store.ListSessions()
+	if err != nil {
+		return 0, err
+	}
+	pruned := 0
+	for _, s := range sessionList {
+		if HasConversationMessages(s.ChatMessageStore.ChatMessages()) {
+			continue
+		}
+		if err := sm.store.DeleteSession(s.ID); err != nil {
+			return pruned, fmt.Errorf("failed to delete session %s: %w", s.ID, err)
+		}
+		pruned++
+	}
+	return pruned, nil
+}

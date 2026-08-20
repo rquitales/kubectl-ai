@@ -219,3 +219,52 @@ func TestFileChatMessageStoreLargeMessages(t *testing.T) {
 		t.Errorf("message after the big one = %q", msgs[2].Payload)
 	}
 }
+
+func TestHasConversationMessages(t *testing.T) {
+	cases := []struct {
+		name string
+		msgs []*api.Message
+		want bool
+	}{
+		{"none", nil, false},
+		{"user only", []*api.Message{{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "hi"}}, false},
+		{"model text", []*api.Message{{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "hi"}}, true},
+		{"model tool call", []*api.Message{{Source: api.MessageSourceModel, Type: api.MessageTypeToolCallRequest, Payload: "kubectl get pods"}}, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := HasConversationMessages(c.msgs); got != c.want {
+				t.Errorf("HasConversationMessages() = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+func TestPruneEmptySessions(t *testing.T) {
+	manager := &SessionManager{store: newMemoryStore()}
+
+	empty1, _ := manager.NewSession(Metadata{ModelID: "m"})
+	empty2, _ := manager.NewSession(Metadata{ModelID: "m"})
+	withConv, _ := manager.NewSession(Metadata{ModelID: "m"})
+	_ = withConv.ChatMessageStore.AddChatMessage(&api.Message{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "real"})
+	metaOnly, _ := manager.NewSession(Metadata{ModelID: "m"})
+	_ = metaOnly.ChatMessageStore.AddChatMessage(&api.Message{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "/sessions"})
+
+	pruned, err := manager.PruneEmptySessions()
+	if err != nil {
+		t.Fatalf("PruneEmptySessions failed: %v", err)
+	}
+	if pruned != 3 {
+		t.Errorf("pruned = %d, want 3", pruned)
+	}
+
+	remaining, err := manager.ListSessions()
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if len(remaining) != 1 || remaining[0].ID != withConv.ID {
+		t.Errorf("expected only the conversation session to remain, got %v", remaining)
+	}
+	_ = empty1
+	_ = empty2
+}

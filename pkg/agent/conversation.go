@@ -445,7 +445,7 @@ func (c *Agent) Close() error {
 	// content-derived name (unless the user named it manually).
 	if c.Session != nil {
 		messages := c.Session.AllMessages()
-		if len(messages) == 0 {
+		if !sessions.HasConversationMessages(messages) {
 			if manager, err := sessions.NewSessionManager(c.SessionBackend); err == nil {
 				if err := manager.DeleteSession(c.Session.ID); err != nil {
 					klog.Warningf("failed to delete empty session %s: %v", c.Session.ID, err)
