@@ -1629,3 +1629,100 @@ func TestViewStatusShowsTokenTotal(t *testing.T) {
 		t.Errorf("expected no token total for an empty session, got:\n%s", got)
 	}
 }
+
+func newStreamModel() (model, *sessions.InMemoryChatStore) {
+	store := sessions.NewInMemoryChatStore()
+	a := &agent.Agent{Session: &api.Session{
+		ID:               "test",
+		AgentState:       api.AgentStateRunning,
+		ChatMessageStore: store,
+	}}
+	m := newModel(a)
+	m.width, m.height = 100, 40
+	m.resize()
+	return m, store
+}
+
+func textDelta(id, payload string) *api.Message {
+	return &api.Message{
+		ID:        id,
+		Source:    api.MessageSourceModel,
+		Type:      api.MessageTypeTextDelta,
+		Payload:   payload,
+		Timestamp: time.Now(),
+	}
+}
+
+func TestTextDeltaUpdateInPlaceAndFinalReplacement(t *testing.T) {
+	m, store := newStreamModel()
+	const streamID = "stream-1"
+
+	// First delta appends a new transcript entry.
+	m.handleAgentMsg(textDelta(streamID, "Hello"))
+	if len(m.messages) != 1 {
+		t.Fatalf("expected 1 message after first delta, got %d", len(m.messages))
+	}
+
+	// Subsequent deltas with the same ID update the entry in place.
+	m.handleAgentMsg(textDelta(streamID, "Hello, world"))
+	if len(m.messages) != 1 {
+		t.Fatalf("expected delta to update in place, got %d messages", len(m.messages))
+	}
+	if got := m.messages[0].Payload; got != "Hello, world" {
+		t.Errorf("delta payload = %q, want %q", got, "Hello, world")
+	}
+	if got := m.messages[0].Type; got != api.MessageTypeTextDelta {
+		t.Errorf("streaming entry type = %q, want text-delta", got)
+	}
+
+	// The final text message (same ID; the agent stores it before sending)
+	// replaces the delta entry at the same index.
+	final := &api.Message{
+		ID:        streamID,
+		Source:    api.MessageSourceModel,
+		Type:      api.MessageTypeText,
+		Payload:   "Hello, world",
+		Timestamp: time.Now(),
+	}
+	if err := store.AddChatMessage(final); err != nil {
+		t.Fatalf("AddChatMessage: %v", err)
+	}
+	m.handleAgentMsg(final)
+	if len(m.messages) != 1 {
+		t.Fatalf("expected final message to replace the delta entry, got %d messages", len(m.messages))
+	}
+	if got := m.messages[0]; got.ID != streamID || got.Type != api.MessageTypeText || got.Payload != "Hello, world" {
+		t.Errorf("final entry = %+v, want the stored final text message", got)
+	}
+
+	// Rendering the final message must not serve a stale cached delta render
+	// (glamour interleaves ANSI codes, so match on a word unique to the final).
+	if got := m.renderMessages(); !strings.Contains(got, "world") {
+		t.Errorf("expected rendered transcript to contain the final text, got:\n%s", got)
+	}
+}
+
+func TestTextDeltaThrottlesViewportRefresh(t *testing.T) {
+	m, _ := newStreamModel()
+	const streamID = "stream-1"
+
+	// The first delta refreshes the viewport immediately and renders like a
+	// normal model text message.
+	m.handleAgentMsg(textDelta(streamID, "first"))
+	if got := m.viewport.View(); !strings.Contains(got, "first") || !strings.Contains(got, "kubectl-ai") {
+		t.Errorf("expected viewport to render the first delta as a model message, got:\n%s", got)
+	}
+
+	// A delta arriving within deltaRefreshInterval updates the payload but
+	// skips the (expensive) transcript re-render.
+	m.handleAgentMsg(textDelta(streamID, "first second"))
+	if got := m.messages[0].Payload; got != "first second" {
+		t.Fatalf("payload = %q, want %q", got, "first second")
+	}
+	if got := m.viewport.View(); strings.Contains(got, "first second") {
+		t.Errorf("expected throttled viewport to keep the previous render, got:\n%s", got)
+	}
+	if !m.dirty {
+		t.Error("expected model to stay dirty so a later refresh picks up the delta")
+	}
+}
