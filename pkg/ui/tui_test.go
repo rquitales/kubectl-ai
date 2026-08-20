@@ -3357,6 +3357,9 @@ func TestViewHelpRunningShowsCancel(t *testing.T) {
 	if !strings.Contains(help, "Ctrl+C: cancel") {
 		t.Errorf("running: expected cancel hint, got:\n%s", help)
 	}
+	if !strings.Contains(help, "scroll") {
+		t.Errorf("running: expected the arrow scroll hint, got:\n%s", help)
+	}
 	if strings.Contains(help, "Enter: send") {
 		t.Errorf("running: must not show the idle send hint, got:\n%s", help)
 	}
