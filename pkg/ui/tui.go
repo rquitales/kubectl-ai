@@ -2595,6 +2595,17 @@ func (m model) viewStatus(session *api.Session) string {
 	if m.agent != nil && m.agent.SkipPermissionsEnabled() {
 		left += sep + warnText.Render("⚡AUTO")
 	}
+	// MCP server connection status, shown only when MCP is configured so a
+	// failed server is visible (otherwise tools silently go missing). Connected
+	// servers read green; any failure reads yellow.
+	if s := session.MCPStatus; s != nil && s.TotalServers > 0 {
+		mcpLabel := fmt.Sprintf("🔌 %d/%d", s.ConnectedCount, s.TotalServers)
+		if s.FailedCount > 0 {
+			left += sep + warnText.Render(mcpLabel)
+		} else {
+			left += sep + successText.Render(mcpLabel)
+		}
+	}
 
 	// The kube context sits on the right next to the model name; contexts
 	// that look like production get the warning color.

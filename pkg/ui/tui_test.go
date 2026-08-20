@@ -2328,6 +2328,48 @@ func TestViewContextBudgetEnvOverride(t *testing.T) {
 	}
 }
 
+func TestViewStatusShowsMCPStatus(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{
+		ID: "test", AgentState: api.AgentStateIdle, ModelID: "m",
+		MCPStatus: &api.MCPStatus{TotalServers: 2, ConnectedCount: 2, FailedCount: 0, ClientEnabled: true},
+	}}
+	m := newModel(a)
+	m.width = 100
+
+	got := m.viewStatus(a.Session)
+	if !strings.Contains(got, "🔌 2/2") {
+		t.Errorf("expected the MCP connected indicator, got:\n%s", got)
+	}
+}
+
+func TestViewStatusMCPFailsYellow(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{
+		ID: "test", AgentState: api.AgentStateIdle, ModelID: "m",
+		MCPStatus: &api.MCPStatus{TotalServers: 2, ConnectedCount: 1, FailedCount: 1, ClientEnabled: true},
+	}}
+	m := newModel(a)
+	m.width = 100
+
+	got := m.viewStatus(a.Session)
+	if !strings.Contains(got, "🔌 1/2") {
+		t.Errorf("expected the MCP partial indicator, got:\n%s", got)
+	}
+}
+
+func TestViewStatusHidesMCPWhenUnconfigured(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{
+		ID: "test", AgentState: api.AgentStateIdle, ModelID: "m",
+		MCPStatus: &api.MCPStatus{TotalServers: 0, ClientEnabled: false},
+	}}
+	m := newModel(a)
+	m.width = 100
+
+	got := m.viewStatus(a.Session)
+	if strings.Contains(got, "🔌") {
+		t.Errorf("expected no MCP indicator when unconfigured, got:\n%s", got)
+	}
+}
+
 func newStreamModel() (model, *sessions.InMemoryChatStore) {
 	store := sessions.NewInMemoryChatStore()
 	a := &agent.Agent{Session: &api.Session{
