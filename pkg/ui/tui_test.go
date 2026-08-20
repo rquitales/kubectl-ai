@@ -3429,3 +3429,26 @@ func TestViewHelpRunningShowsCancel(t *testing.T) {
 		t.Errorf("running: must not show the idle send hint, got:\n%s", help)
 	}
 }
+
+func TestViewInputInitializingLabel(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "t", AgentState: api.AgentStateInitializing}}
+	m := newModel(a)
+	m.width, m.height = 80, 24
+	m.resize()
+	got := m.viewInput(api.AgentStateInitializing)
+	if !strings.Contains(got, "Initializing...") {
+		t.Errorf("expected 'Initializing...' label during init, got:\n%s", got)
+	}
+	if strings.Contains(got, "Thinking...") {
+		t.Errorf("init phase must not show 'Thinking...', got:\n%s", got)
+	}
+	// Running still shows 'Thinking...'.
+	a2 := &agent.Agent{Session: &api.Session{ID: "t", AgentState: api.AgentStateRunning}}
+	m2 := newModel(a2)
+	m2.width, m2.height = 80, 24
+	m2.resize()
+	got2 := m2.viewInput(api.AgentStateRunning)
+	if !strings.Contains(got2, "Thinking...") {
+		t.Errorf("expected 'Thinking...' label while running, got:\n%s", got2)
+	}
+}
