@@ -1012,6 +1012,64 @@ func TestEscDeclinesPermissionPrompt(t *testing.T) {
 	}
 }
 
+func TestRenderChoicePromptHighlightsCommands(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.inChoiceMode = true
+	m.choiceType = "confirm"
+	m.choicePrompt = "The following commands require your approval to run:\n* kubectl delete deployment nginx\n* kubectl scale deployment web --replicas=0\n\nDo you want to proceed ?"
+
+	got := m.renderChoicePrompt()
+	// The commands are pulled out onto their own marked lines.
+	if !strings.Contains(got, "› kubectl delete deployment nginx") {
+		t.Errorf("expected the first command on its own line, got:\n%s", got)
+	}
+	if !strings.Contains(got, "› kubectl scale deployment web --replicas=0") {
+		t.Errorf("expected the second command on its own line, got:\n%s", got)
+	}
+	// The question is still present.
+	if !strings.Contains(got, "Do you want to proceed") {
+		t.Errorf("expected the proceed question, got:\n%s", got)
+	}
+	// The commands must no longer be inline bullets glued to the prose.
+	if strings.Contains(got, "run:\n* kubectl") {
+		t.Errorf("expected the bullet prose form to be replaced, got:\n%s", got)
+	}
+}
+
+func TestRenderChoicePromptSessionPickerSimple(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.inChoiceMode = true
+	m.choiceType = "session"
+	m.choicePrompt = "Select a session to resume"
+
+	got := m.renderChoicePrompt()
+	if !strings.HasPrefix(got, "? Select a session to resume") {
+		t.Errorf("expected the simple '? prompt' form for a session picker, got:\n%s", got)
+	}
+	if strings.Contains(got, "›") {
+		t.Errorf("a session picker must not render command lines, got:\n%s", got)
+	}
+}
+
+func TestRenderChoicePromptFallsBackForUnknownShape(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.inChoiceMode = true
+	m.choiceType = "confirm"
+	// A confirm prompt with no bullet commands: fall back to the raw prompt.
+	m.choicePrompt = "Something unusual. Continue?"
+
+	got := m.renderChoicePrompt()
+	if !strings.Contains(got, "Something unusual. Continue?") {
+		t.Errorf("expected the raw prompt as a fallback, got:\n%s", got)
+	}
+	if strings.Contains(got, "›") {
+		t.Errorf("the fallback must not fabricate command lines, got:\n%s", got)
+	}
+}
+
 func TestPaletteOpenNavigateClose(t *testing.T) {
 	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
 	m := newModel(a)
