@@ -340,6 +340,10 @@ type model struct {
 	dirty           bool
 	quitting        bool
 	thinkStart      time.Time
+	// lastTurnDuration is the elapsed time of the most recent completed turn,
+	// shown on the Done state so the user can see how long a turn took after
+	// it finishes (the live timer only shows while running).
+	lastTurnDuration time.Duration
 	// lastDeltaRefresh is when the viewport last refreshed for a live
 	// text-delta; used to throttle re-renders while streaming.
 	lastDeltaRefresh time.Time
@@ -1779,6 +1783,12 @@ func (m *model) handleAgentMsg(msg *api.Message) (tea.Model, tea.Cmd) {
 		m.inChoiceMode = false
 		m.choicePrompt = ""
 		m.choiceOptionID = ""
+		// Stash the turn's elapsed time so it can be shown on the Done state
+		// after the live timer stops.
+		if !m.thinkStart.IsZero() {
+			m.lastTurnDuration = time.Since(m.thinkStart)
+			m.thinkStart = time.Time{}
+		}
 	}
 
 	// A new message snaps the view back to the cleared state: hide the
@@ -2655,6 +2665,10 @@ func (m model) viewState(state api.AgentState) string {
 		txt := s.style.Render(s.icon + " " + s.text)
 		if state == api.AgentStateRunning && !m.thinkStart.IsZero() {
 			txt += mutedStyle.Render(" " + formatDuration(time.Since(m.thinkStart)))
+		} else if state == api.AgentStateDone && m.lastTurnDuration > 0 {
+			// Persist the last turn's duration after the live timer stops, so
+			// the user can see how long the completed turn took.
+			txt += mutedStyle.Render(" " + formatDuration(m.lastTurnDuration))
 		}
 		return txt
 	}
