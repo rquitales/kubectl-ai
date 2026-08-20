@@ -2634,6 +2634,27 @@ func TestRenderTextMsgShowsTokenCount(t *testing.T) {
 	}
 }
 
+func TestRenderErrorWrapsLongMessage(t *testing.T) {
+	m := newModel(nil)
+	// A long unbreakable error line must wrap, not overflow the box.
+	long := strings.Repeat("x", 80)
+	msg := &api.Message{Type: api.MessageTypeError, Payload: long, Timestamp: time.Now()}
+	got := m.renderError(msg, 60)
+	// The error body wraps: the 80-char line is split across multiple lines,
+	// each within the box's content width. Assert no content line exceeds
+	// the box frame width (62 = 60 inner + 2 border).
+	for _, line := range strings.Split(got, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "╭") || strings.HasPrefix(trimmed, "╰") ||
+			strings.HasPrefix(trimmed, "│") || trimmed == "" {
+			continue
+		}
+		if w := lipgloss.Width(line); w > 62 {
+			t.Errorf("error content line exceeds box width (62): %q", line)
+		}
+	}
+}
+
 func TestRenderTextMsgMarksShellEscape(t *testing.T) {
 	m := newModel(nil)
 	r, err := m.cache.getRenderer(80)
