@@ -2978,7 +2978,11 @@ func (m model) viewStatus(session *api.Session) string {
 
 	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right) - 2
 	if gap < 0 {
-		gap = 0
+		// The content can't be shrunk enough to fit (very narrow terminal).
+		// Truncate the joined string so the status bar stays on one line
+		// instead of wrapping.
+		joined := strings.TrimSpace(left + " " + right)
+		return statusBar.Width(m.width).Render(" " + truncateRunes(joined, max(m.width-2, 1)) + " ")
 	}
 	return statusBar.Width(m.width).Render(" " + left + strings.Repeat(" ", gap) + right + " ")
 }
