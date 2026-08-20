@@ -674,6 +674,8 @@ func (m *model) inputBlockHeight() int {
 	}
 	if m.completionHintVisible() {
 		h++ // the completion/shell hint line
+	} else if m.draftCounterVisible() {
+		h++ // the draft-size counter line
 	}
 	for _, p := range m.pastes {
 		if p.token == "" {
@@ -719,6 +721,20 @@ func visualLines(s string, width int) int {
 		}
 	}
 	return max(lines, 1)
+}
+
+// draftCounter renders a subtle right-aligned draft-size hint: "N chars · W
+// words". It's padded so the count sits at the right edge of the input box.
+func draftCounter(s string, width int) string {
+	const label = " · %d chars · %d words"
+	chars := len([]rune(s))
+	words := len(strings.Fields(s))
+	tail := fmt.Sprintf(label, chars, words)
+	pad := width - lipgloss.Width(tail)
+	if pad < 0 {
+		pad = 0
+	}
+	return strings.Repeat(" ", pad) + tail
 }
 
 func (m *model) navigateList(keyType tea.KeyType) tea.Cmd {
@@ -3015,6 +3031,16 @@ func (m *model) completionHintVisible() bool {
 		len(m.namespaceMatches()) > 0
 }
 
+// draftCounterVisible reports whether the draft-size counter line is shown
+// under the input: only when there's a non-empty draft, no completion hint, and
+// the input isn't in rename mode (where the input is a name, not a prompt).
+func (m *model) draftCounterVisible() bool {
+	if m.sessionRename {
+		return false
+	}
+	return !m.completionHintVisible() && strings.TrimSpace(m.input.Value()) != ""
+}
+
 // namespaceMatches returns cluster namespaces matching the partial after
 // "/namespace " or "/ns " in the input, or nil otherwise. Names come from a
 // live cluster query and are cached briefly.
@@ -3171,6 +3197,12 @@ func (m model) viewInput(state api.AgentState) string {
 	// hinted inside the input box.
 	if hint := m.completionHint(); hint != "" {
 		content += "\n" + hint
+	} else if v := strings.TrimSpace(m.input.Value()); v != "" && !m.sessionRename {
+		// A subtle draft-size counter so the user can gauge their prompt size
+		// before sending (relevant alongside the context-budget indicator).
+		// Only shown when there's a non-empty draft and no completion hint, to
+		// avoid clutter.
+		content += "\n" + dimStyle.Render(draftCounter(m.input.Value(), m.width-6))
 	}
 
 	// Chip-fallback pastes (those that didn't fit inline) are shown as

@@ -271,6 +271,40 @@ func TestVisualLines(t *testing.T) {
 	}
 }
 
+func TestDraftCounter(t *testing.T) {
+	got := draftCounter("hello world foo", 80)
+	// "hello world foo" is 15 runes / 3 words.
+	if !strings.Contains(got, "15 chars") {
+		t.Errorf("expected 15 chars (runes), got %q", got)
+	}
+	if !strings.Contains(got, "3 words") {
+		t.Errorf("expected 3 words, got %q", got)
+	}
+}
+
+func TestDraftCounterVisible(t *testing.T) {
+	m := newModel(nil)
+	// Empty draft: no counter.
+	if m.draftCounterVisible() {
+		t.Error("expected counter hidden for an empty draft")
+	}
+	// Slash completion: counter hidden (completion hint takes the line).
+	m.input.SetValue("/mo")
+	if m.draftCounterVisible() {
+		t.Error("expected counter hidden when a completion hint is visible")
+	}
+	// Non-empty plain draft: counter visible.
+	m.input.SetValue("hello")
+	if !m.draftCounterVisible() {
+		t.Error("expected counter visible for a non-empty plain draft")
+	}
+	// Rename mode: counter hidden (input is a name, not a prompt).
+	m.sessionRename = true
+	if m.draftCounterVisible() {
+		t.Error("expected counter hidden in rename mode")
+	}
+}
+
 func TestAltEnterInsertsNewline(t *testing.T) {
 	m := newModel(nil)
 	m.input.SetValue("first")
@@ -2294,8 +2328,13 @@ func TestCompletionHintGrowsInputBlock(t *testing.T) {
 	}
 
 	m.input.SetValue("hello")
-	if got := m.inputBlockHeight(); got != base {
-		t.Errorf("inputBlockHeight = %d, want %d without a slash prefix", got, base)
+	// A non-empty draft with no completion hint shows the draft-size counter
+	// line, so the block grows by one.
+	if got := m.inputBlockHeight(); got != base+1 {
+		t.Errorf("inputBlockHeight = %d, want %d with the draft counter visible", got, base+1)
+	}
+	if view := m.viewInput(api.AgentStateIdle); !strings.Contains(view, "chars") || !strings.Contains(view, "words") {
+		t.Errorf("expected the draft counter rendered in the input box, got:\n%s", view)
 	}
 }
 
