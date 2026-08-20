@@ -19,6 +19,8 @@ package kube
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 
 	"k8s.io/client-go/tools/clientcmd"
@@ -69,17 +71,39 @@ func ListContexts(path string) ([]string, error) {
 	return names, nil
 }
 
-// UseContext switches the current context in the kubeconfig at path (or the
-// default when empty) to name, validating that the context exists.
-func UseContext(path, name string) error {
-	rules := loadingRules(path)
-	cfg, err := rules.Load()
+// WriteOverride writes a session-scoped kubeconfig to outPath: a copy of
+// the base kubeconfig (path, or the default when empty) with the current
+// context set to context (validated) and/or the current context's namespace
+// set to namespace. Pointing KUBECONFIG at outPath applies the override to
+// every kubectl invocation in the process without mutating the base file.
+func WriteOverride(basePath, outPath, context, namespace string) error {
+	cfg, err := LoadConfig(basePath)
 	if err != nil {
 		return err
 	}
-	if _, exists := cfg.Contexts[name]; !exists {
-		return fmt.Errorf("context %q does not exist in the kubeconfig", name)
+
+	current := cfg.CurrentContext
+	if context != "" {
+		if _, exists := cfg.Contexts[context]; !exists {
+			return fmt.Errorf("context %q does not exist in the kubeconfig", context)
+		}
+		current = context
 	}
-	cfg.CurrentContext = name
-	return clientcmd.WriteToFile(*cfg, rules.GetDefaultFilename())
+	if current == "" {
+		return fmt.Errorf("no context available to override (base kubeconfig has no current context)")
+	}
+	cfg.CurrentContext = current
+
+	if namespace != "" {
+		ctx, exists := cfg.Contexts[current]
+		if !exists {
+			return fmt.Errorf("context %q does not exist in the kubeconfig", current)
+		}
+		ctx.Namespace = namespace
+	}
+
+	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
+		return err
+	}
+	return clientcmd.WriteToFile(*cfg, outPath)
 }

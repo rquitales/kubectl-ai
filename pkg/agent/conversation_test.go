@@ -28,6 +28,7 @@ import (
 	"github.com/GoogleCloudPlatform/kubectl-ai/internal/mocks"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/kube"
+	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/sandbox"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/sessions"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/tools"
 	"go.uber.org/mock/gomock"
@@ -1152,7 +1153,7 @@ func writeAgentKubeConfig(t *testing.T, currentContext string, names ...string) 
 
 func TestContextMetaQuery(t *testing.T) {
 	path := writeAgentKubeConfig(t, "prod", "dev", "prod", "staging")
-	a := &Agent{Kubeconfig: path, Session: &api.Session{}}
+	a := &Agent{Kubeconfig: path, Session: &api.Session{}, workDir: t.TempDir()}
 
 	// Bare "context" lists current and available.
 	ans, handled, err := a.handleMetaQuery(context.Background(), "context")
@@ -1168,7 +1169,7 @@ func TestContextMetaQuery(t *testing.T) {
 		}
 	}
 
-	// "context <name>" switches.
+	// "context <name>" applies a session-scoped override.
 	ans, handled, err = a.handleMetaQuery(context.Background(), "context staging")
 	if err != nil {
 		t.Fatalf("handleMetaQuery: %v", err)
@@ -1176,16 +1177,187 @@ func TestContextMetaQuery(t *testing.T) {
 	if !handled || !strings.Contains(ans, "Switched to context `staging`") {
 		t.Errorf("unexpected answer: handled=%v ans=%q", handled, ans)
 	}
-	if current, _, ok := kube.CurrentContext(path); !ok || current != "staging" {
-		t.Errorf("after switch: context = %q (ok=%v), want staging", current, ok)
+	// The override file has the new context and KUBECONFIG points at it.
+	override := a.ActiveKubeconfig()
+	if override == path {
+		t.Fatal("expected an override kubeconfig to be active")
+	}
+	if current, _, ok := kube.CurrentContext(override); !ok || current != "staging" {
+		t.Errorf("override context = %q (ok=%v), want staging", current, ok)
+	}
+	if got := os.Getenv("KUBECONFIG"); got != override {
+		t.Errorf("KUBECONFIG env = %q, want override %q", got, override)
+	}
+	// The global kubeconfig is untouched.
+	if current, _, _ := kube.CurrentContext(path); current != "prod" {
+		t.Errorf("base context changed to %q, want prod untouched", current)
 	}
 
-	// Unknown context errors and changes nothing.
+	// Unknown context errors and applies nothing.
 	_, _, err = a.handleMetaQuery(context.Background(), "context nope")
 	if err == nil {
 		t.Fatal("expected error for an unknown context")
 	}
 	if !strings.Contains(err.Error(), "dev") {
 		t.Errorf("expected available contexts in the error, got: %v", err)
+	}
+}
+
+func TestNamespaceMetaQuery(t *testing.T) {
+	path := writeAgentKubeConfig(t, "prod", "dev", "prod", "staging")
+	a := &Agent{
+		Kubeconfig: path,
+		Session:    &api.Session{},
+		workDir:    t.TempDir(),
+		Executor:   &fakeExecutor{result: &sandbox.ExecResult{Stdout: "default\nkube-system\npayments\n"}},
+	}
+
+	// Bare "namespace" shows current and live namespaces.
+	ans, handled, err := a.handleMetaQuery(context.Background(), "namespace")
+	if err != nil {
+		t.Fatalf("handleMetaQuery: %v", err)
+	}
+	if !handled {
+		t.Fatal("expected handled")
+	}
+	for _, want := range []string{"Current namespace: `default`", "kube-system", "payments"} {
+		if !strings.Contains(ans, want) {
+			t.Errorf("answer missing %q:\n%s", want, ans)
+		}
+	}
+
+	// "namespace <name>" applies a session-scoped override.
+	ans, handled, err = a.handleMetaQuery(context.Background(), "namespace payments")
+	if err != nil {
+		t.Fatalf("handleMetaQuery: %v", err)
+	}
+	if !handled || !strings.Contains(ans, "Switched to namespace `payments`") {
+		t.Errorf("unexpected answer: handled=%v ans=%q", handled, ans)
+	}
+	override := a.ActiveKubeconfig()
+	if override == path {
+		t.Fatal("expected an override kubeconfig to be active")
+	}
+	if _, namespace, ok := kube.CurrentContext(override); !ok || namespace != "payments" {
+		t.Errorf("override namespace = %q (ok=%v), want payments", namespace, ok)
+	}
+	// The global kubeconfig namespace is untouched.
+	if _, namespace, _ := kube.CurrentContext(path); namespace == "payments" {
+		t.Errorf("base namespace changed to %q, want untouched", namespace)
+	}
+
+	// /ns alias works.
+	if _, handled, err := a.handleMetaQuery(context.Background(), "ns"); err != nil || !handled {
+		t.Errorf("expected /ns alias to be handled: handled=%v err=%v", handled, err)
+	}
+
+	// Reset clears the override and the env.
+	_, _, err = a.handleMetaQuery(context.Background(), "namespace --reset")
+	if err != nil {
+		t.Fatalf("reset failed: %v", err)
+	}
+	if got := a.ActiveKubeconfig(); got != path {
+		t.Errorf("after reset: ActiveKubeconfig = %q, want base %q", got, path)
+	}
+	if got := os.Getenv("KUBECONFIG"); got != path {
+		t.Errorf("after reset: KUBECONFIG env = %q, want base %q", got, path)
+	}
+}
+
+func TestNamespaceMetaQueryClusterDown(t *testing.T) {
+	path := writeAgentKubeConfig(t, "prod", "prod", "staging")
+	a := &Agent{
+		Kubeconfig: path,
+		Session:    &api.Session{},
+		workDir:    t.TempDir(),
+		Executor:   &fakeExecutor{err: fmt.Errorf("connection refused")},
+	}
+
+	// Bare list tolerates cluster errors but still answers.
+	ans, handled, err := a.handleMetaQuery(context.Background(), "namespace")
+	if err != nil {
+		t.Fatalf("handleMetaQuery: %v", err)
+	}
+	if !handled || !strings.Contains(ans, "Could not list namespaces") {
+		t.Errorf("expected a graceful cluster-error note, got %q", ans)
+	}
+}
+
+type kubeconfigKeyCapturingTool struct {
+	name   string
+	gotKey string
+}
+
+func (t *kubeconfigKeyCapturingTool) Name() string        { return t.name }
+func (t *kubeconfigKeyCapturingTool) Description() string { return "captures kubeconfig" }
+func (t *kubeconfigKeyCapturingTool) FunctionDefinition() *gollm.FunctionDefinition {
+	return &gollm.FunctionDefinition{Name: t.name, Description: "captures kubeconfig"}
+}
+func (t *kubeconfigKeyCapturingTool) Run(ctx context.Context, args map[string]any) (any, error) {
+	if v, ok := ctx.Value(tools.KubeconfigKey).(string); ok {
+		t.gotKey = v
+	}
+	return map[string]any{"result": "ok"}, nil
+}
+func (t *kubeconfigKeyCapturingTool) IsInteractive(args map[string]any) (bool, error) {
+	return false, nil
+}
+func (t *kubeconfigKeyCapturingTool) CheckModifiesResource(args map[string]any) string {
+	return "no"
+}
+
+func TestToolDispatchUsesActiveKubeconfig(t *testing.T) {
+	base := writeAgentKubeConfig(t, "prod", "prod", "staging")
+	a := &Agent{
+		Session:    &api.Session{ChatMessageStore: sessions.NewInMemoryChatStore()},
+		Kubeconfig: base,
+		workDir:    t.TempDir(),
+		Output:     make(chan any, 10),
+	}
+	go func() {
+		for range a.Output {
+		}
+	}()
+
+	// No override: the base path flows.
+	if got := a.ActiveKubeconfig(); got != base {
+		t.Fatalf("ActiveKubeconfig = %q, want base %q", got, base)
+	}
+
+	// Apply the session override; the active kubeconfig (what tools get)
+	// becomes the override, while the base file stays untouched.
+	if err := a.applyKubeOverride("staging", ""); err != nil {
+		t.Fatalf("applyKubeOverride: %v", err)
+	}
+	override := a.ActiveKubeconfig()
+	if override == base {
+		t.Fatal("expected an override to be active")
+	}
+
+	// Dispatch a read-only tool call through the agent's dispatch path.
+	tool := &kubeconfigKeyCapturingTool{name: "capturetool"}
+	var toolset tools.Tools
+	toolset.Init()
+	toolset.RegisterTool(tool)
+	a.Tools = toolset
+	parsed, err := a.Tools.ParseToolInvocation(context.Background(), "capturetool", map[string]any{})
+	if err != nil {
+		t.Fatalf("ParseToolInvocation: %v", err)
+	}
+	a.pendingFunctionCalls = []ToolCallAnalysis{
+		{
+			FunctionCall:        gollm.FunctionCall{ID: "1", Name: "capturetool", Arguments: map[string]any{}},
+			ParsedToolCall:      parsed,
+			ModifiesResourceStr: "no",
+		},
+	}
+	if err := a.DispatchToolCalls(context.Background()); err != nil {
+		t.Fatalf("DispatchToolCalls failed: %v", err)
+	}
+	if tool.gotKey != override {
+		t.Errorf("tool context kubeconfig = %q, want override %q", tool.gotKey, override)
+	}
+	if current, _, _ := kube.CurrentContext(base); current != "prod" {
+		t.Errorf("base context changed to %q, want prod untouched", current)
 	}
 }

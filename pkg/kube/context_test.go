@@ -75,22 +75,37 @@ func TestListContexts(t *testing.T) {
 	}
 }
 
-func TestUseContext(t *testing.T) {
-	path := writeKubeConfig(t, "prod", map[string]string{"prod": "", "staging": ""})
+func TestWriteOverride(t *testing.T) {
+	base := writeKubeConfig(t, "prod", map[string]string{"prod": "", "staging": ""})
+	out := filepath.Join(t.TempDir(), "override")
 
-	if err := UseContext(path, "staging"); err != nil {
-		t.Fatalf("UseContext failed: %v", err)
+	// Context + namespace override.
+	if err := WriteOverride(base, out, "staging", "payments"); err != nil {
+		t.Fatalf("WriteOverride failed: %v", err)
 	}
-	context, _, ok := CurrentContext(path)
+	context, namespace, ok := CurrentContext(out)
 	if !ok || context != "staging" {
-		t.Errorf("after switch: context = %q (ok=%v), want staging", context, ok)
+		t.Errorf("override context = %q (ok=%v), want staging", context, ok)
+	}
+	if namespace != "payments" {
+		t.Errorf("override namespace = %q, want payments", namespace)
+	}
+	// The base file is untouched.
+	if context, _, _ := CurrentContext(base); context != "prod" {
+		t.Errorf("base context changed to %q, want prod untouched", context)
 	}
 
-	if err := UseContext(path, "does-not-exist"); err == nil {
-		t.Error("expected error for an unknown context")
+	// Namespace-only override keeps the base's current context.
+	out2 := filepath.Join(t.TempDir(), "override2")
+	if err := WriteOverride(base, out2, "", "dev"); err != nil {
+		t.Fatalf("WriteOverride failed: %v", err)
 	}
-	context, _, _ = CurrentContext(path)
-	if context != "staging" {
-		t.Errorf("failed switch must not change the context, got %q", context)
+	if context, namespace, _ := CurrentContext(out2); context != "prod" || namespace != "dev" {
+		t.Errorf("override2 = %q/%q, want prod/dev", context, namespace)
+	}
+
+	// Unknown context errors.
+	if err := WriteOverride(base, filepath.Join(t.TempDir(), "x"), "nope", ""); err == nil {
+		t.Error("expected error for an unknown context")
 	}
 }
