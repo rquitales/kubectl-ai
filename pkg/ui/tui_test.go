@@ -280,6 +280,19 @@ func TestDraftCounter(t *testing.T) {
 	if !strings.Contains(got, "3 words") {
 		t.Errorf("expected 3 words, got %q", got)
 	}
+	// A small draft has no large-draft hint.
+	if strings.Contains(got, "large") {
+		t.Errorf("expected no large hint for a small draft, got %q", got)
+	}
+}
+
+func TestDraftCounterLargeHint(t *testing.T) {
+	big := strings.Repeat("x", largeDraftThreshold)
+	got := draftCounter(big, 120)
+	// A large draft appends the @file/compact hint.
+	if !strings.Contains(got, "large") || !strings.Contains(got, "@file") || !strings.Contains(got, "/compact") {
+		t.Errorf("expected a large-draft hint, got %q", got)
+	}
 }
 
 func TestDraftCounterVisible(t *testing.T) {

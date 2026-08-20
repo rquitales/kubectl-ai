@@ -759,18 +759,31 @@ func visualLines(s string, width int) int {
 	return max(lines, 1)
 }
 
-// draftCounter renders a subtle right-aligned draft-size hint: "N chars · W
-// words". It's padded so the count sits at the right edge of the input box.
+// largeDraftThreshold is the character count at which the draft counter turns
+// warning-colored and suggests attaching the content as a file (or compacting)
+// instead of flooding the prompt — pasting a big YAML manifest as the query
+// is a common kubectl-ai flow that bloats context.
+const largeDraftThreshold = 2000
+
+// draftCounter renders a right-aligned draft-size hint: "N chars · W words".
+// It's padded so the count sits at the right edge of the input box. Below
+// largeDraftThreshold it's dim; at or above it's warning-colored and appends
+// a "@file / /compact" hint so the user knows to attach the content instead
+// of sending it as the prompt.
 func draftCounter(s string, width int) string {
-	const label = " · %d chars · %d words"
 	chars := len([]rune(s))
 	words := len(strings.Fields(s))
-	tail := fmt.Sprintf(label, chars, words)
+	tail := fmt.Sprintf(" · %d chars · %d words", chars, words)
+	style := dimStyle
+	if chars >= largeDraftThreshold {
+		tail += " · large: try @file or /compact"
+		style = lipgloss.NewStyle().Foreground(colorWarning)
+	}
 	pad := width - lipgloss.Width(tail)
 	if pad < 0 {
 		pad = 0
 	}
-	return strings.Repeat(" ", pad) + tail
+	return style.Render(strings.Repeat(" ", pad) + tail)
 }
 
 func (m *model) navigateList(keyType tea.KeyType) tea.Cmd {
@@ -3297,8 +3310,9 @@ func (m model) viewInput(state api.AgentState) string {
 		// A subtle draft-size counter so the user can gauge their prompt size
 		// before sending (relevant alongside the context-budget indicator).
 		// Only shown when there's a non-empty draft and no completion hint, to
-		// avoid clutter.
-		content += "\n" + dimStyle.Render(draftCounter(m.input.Value(), m.width-6))
+		// avoid clutter. It turns warning-colored with an @file/compact hint
+		// when the draft is large.
+		content += "\n" + draftCounter(m.input.Value(), m.width-6)
 	}
 
 	// Chip-fallback pastes (those that didn't fit inline) are shown as
