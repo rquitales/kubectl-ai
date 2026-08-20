@@ -17,6 +17,7 @@ package ui
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -1674,7 +1675,7 @@ func (m model) renderMessage(msg *api.Message, r *glamour.TermRenderer, w int) s
 		}
 	}
 	if msg.Type == api.MessageTypeToolCallResponse {
-		return ""
+		return m.renderToolResult(msg)
 	}
 	// Skip choice requests - they're rendered in the input area instead
 	if msg.Type == api.MessageTypeUserChoiceRequest || msg.Type == api.MessageTypeSessionPickerRequest {
@@ -1736,6 +1737,61 @@ func (m model) renderToolCall(msg *api.Message, w int) string {
 	}
 	content := successText.Render("⚡ Running") + "\n" + codeStyle.Render(payload)
 	return toolBox.Width(w).Render(content) + "\n"
+}
+
+// renderToolResult renders a tool call's result collapsed (opencode-style):
+// the first couple of output lines plus a "+N more lines" count, so back-to-
+// back tool calls are visually distinct instead of looking duplicated.
+func (m model) renderToolResult(msg *api.Message) string {
+	text := toolResultText(msg.Payload)
+	if strings.TrimSpace(text) == "" {
+		return ""
+	}
+
+	lines := strings.Split(strings.TrimRight(text, "\n"), "\n")
+	const maxLines = 3
+	shown := lines
+	if len(shown) > maxLines {
+		shown = shown[:maxLines]
+	}
+
+	var b strings.Builder
+	for i, l := range shown {
+		if i == 0 {
+			b.WriteString(dimStyle.Render("  ⎿ "))
+		} else {
+			b.WriteString(dimStyle.Render("    "))
+		}
+		b.WriteString(dimStyle.Render(truncateRunes(l, 100)))
+		b.WriteString("\n")
+	}
+	if len(lines) > maxLines {
+		b.WriteString(dimStyle.Render(fmt.Sprintf("    +%d more lines", len(lines)-maxLines)))
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// toolResultText extracts displayable output from a tool call result payload
+// (ExecResult-shaped maps, MCP content maps, or shim observation strings).
+func toolResultText(payload any) string {
+	switch p := payload.(type) {
+	case string:
+		return p
+	case map[string]any:
+		if len(p) == 0 {
+			return ""
+		}
+		for _, k := range []string{"stdout", "stderr", "content", "result", "output"} {
+			if s, ok := p[k].(string); ok && s != "" {
+				return s
+			}
+		}
+		if b, err := json.Marshal(p); err == nil {
+			return string(b)
+		}
+	}
+	return fmt.Sprintf("%v", payload)
 }
 
 func (m model) renderError(msg *api.Message, w int) string {

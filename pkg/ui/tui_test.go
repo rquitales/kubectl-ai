@@ -1270,3 +1270,53 @@ func TestCtrlLClearsViewButScrollUpReveals(t *testing.T) {
 		t.Error("expected second ctrl+l to fully restore the transcript")
 	}
 }
+
+func TestRenderToolResultCollapsed(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+
+	msg := &api.Message{
+		Type:    api.MessageTypeToolCallResponse,
+		Payload: map[string]any{"stdout": "NAME   READY\ncoredns   1/1\nmetrics-server   1/1\nkube-proxy   1/1\n"},
+	}
+	got := m.renderMessage(msg, nil, 90)
+	if !strings.Contains(got, "⎿") {
+		t.Error("expected a collapsed result block")
+	}
+	if !strings.Contains(got, "coredns") {
+		t.Error("expected first output line shown")
+	}
+	if !strings.Contains(got, "+1 more lines") {
+		t.Errorf("expected '+1 more lines', got:\n%s", got)
+	}
+}
+
+func TestRenderToolResultShimStringAndEmpty(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+
+	if got := m.renderMessage(&api.Message{Type: api.MessageTypeToolCallResponse, Payload: "Result of running \"x\":\nok"}, nil, 90); !strings.Contains(got, "⎿") {
+		t.Error("expected shim string payloads to render")
+	}
+	if got := m.renderMessage(&api.Message{Type: api.MessageTypeToolCallResponse, Payload: map[string]any{}}, nil, 90); got != "" {
+		t.Errorf("expected empty result to render nothing, got %q", got)
+	}
+}
+
+func TestToolResultText(t *testing.T) {
+	cases := []struct {
+		in   any
+		want string
+	}{
+		{"plain string", "plain string"},
+		{map[string]any{"stdout": "out", "stderr": "err"}, "out"},
+		{map[string]any{"stderr": "err only"}, "err only"},
+		{map[string]any{"content": "mcp content"}, "mcp content"},
+		{42, "42"},
+	}
+	for _, c := range cases {
+		if got := toolResultText(c.in); got != c.want {
+			t.Errorf("toolResultText(%v) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
