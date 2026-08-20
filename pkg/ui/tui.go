@@ -3087,6 +3087,8 @@ func helpText() string {
 | **/rename** | rename this session |
 | **/compact** | summarize & free context |
 | **/clear** | clear the transcript |
+| **/mcp** | MCP server connection details |
+| **/tools** | list available tools |
 | **/help** / **/?** | show this reference |
 | **/exit** | quit |
 

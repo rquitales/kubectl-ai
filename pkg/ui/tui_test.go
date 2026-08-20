@@ -875,6 +875,10 @@ func TestSlashHelpPrintsReferenceLocally(t *testing.T) {
 		if !strings.Contains(help, "Keyboard shortcuts") || !strings.Contains(help, "Slash commands") {
 			t.Errorf("%q: help text missing sections, got:\n%s", value, help)
 		}
+		// The reference lists the /mcp and /tools commands.
+		if !strings.Contains(help, "/mcp") || !strings.Contains(help, "/tools") {
+			t.Errorf("%q: help text missing /mcp or /tools, got:\n%s", value, help)
+		}
 		// /help is offered for autocomplete.
 		if !strings.Contains(strings.Join(slashCompletions("/he"), ","), "/help") {
 			t.Errorf("%q: expected /help in slash autocomplete", value)
