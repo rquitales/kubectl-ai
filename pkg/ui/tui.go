@@ -727,20 +727,14 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.navigateList(tea.KeyUp)
 		}
 		// Within a multi-line draft, Up moves the cursor until the first
-		// line. Otherwise it scrolls the transcript — importantly, this is
-		// also what the mouse wheel does, since terminals translate the
-		// wheel to arrow keys in alt-screen mode. History lives on Alt+P/N.
+		// line; from there (and for single-line drafts) it recalls older
+		// input history, like opencode and Claude Code. Transcript
+		// scrolling lives on PgUp/PgDn.
 		if m.input.LineCount() > 1 && m.input.Line() > 0 {
 			m.input.CursorUp()
 			return m, nil
 		}
-		// Scrolling up while cleared reveals the hidden transcript.
-		if m.clearedAt > 0 && !m.revealAll {
-			m.revealAll = true
-			m.dirty = true
-			m.refresh()
-		}
-		m.viewport.ScrollUp(1)
+		m.historyPrev()
 	case tea.KeyDown:
 		if m.inChoiceMode {
 			return m, m.navigateList(tea.KeyDown)
@@ -749,13 +743,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.input.CursorDown()
 			return m, nil
 		}
-		m.viewport.ScrollDown(1)
-		// Back at the bottom: the cleared view applies again.
-		if m.revealAll && m.viewport.AtBottom() {
-			m.revealAll = false
-			m.dirty = true
-			m.refresh()
-		}
+		m.historyNext()
 	case tea.KeyCtrlY:
 		return m.copyLastResponse()
 	case tea.KeyPgUp:
@@ -2081,9 +2069,9 @@ func (m model) viewHelp(state api.AgentState) string {
 	case state == api.AgentStateRunning:
 		hints = []string{"Ctrl+C: cancel"}
 	default:
-		hints = []string{"Enter: send", "Ctrl+J: newline", "Ctrl+P: commands", "Alt+P/N: history", "Ctrl+L: clear screen", "Ctrl+Y: copy", "Shift+Tab: auto", "Esc: clear/stop", "Ctrl+C: quit"}
+		hints = []string{"Enter: send", "Ctrl+J: newline", "Ctrl+P: commands", "↑/↓: history", "Ctrl+L: clear screen", "Ctrl+Y: copy", "Shift+Tab: auto", "Esc: clear/stop", "Ctrl+C: quit"}
 		if m.viewport.TotalLineCount() > m.viewport.Height {
-			hints = append(hints, "↑/↓/PgUp/PgDn: scroll")
+			hints = append(hints, "PgUp/PgDn: scroll")
 		}
 	}
 	return dimStyle.Padding(0, 2, 1, 2).Render(strings.Join(hints, " • "))

@@ -384,34 +384,25 @@ func TestPgUpPgDownScrollsViewport(t *testing.T) {
 	}
 }
 
-func TestUpDownScrollsViewport(t *testing.T) {
-	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
-	m := newModel(a)
-	m.width, m.height = 100, 24
-	m.resize()
-	for i := 0; i < 50; i++ {
-		m.messages = append(m.messages, &api.Message{
-			Source: api.MessageSourceModel, Type: api.MessageTypeText,
-			Payload: fmt.Sprintf("line %d", i), Timestamp: time.Now(),
-		})
-	}
-	m.dirty = true
-	m.refresh()
-	m.viewport.GotoBottom()
-	atBottom := m.viewport.YOffset
+func TestUpDownRecallsHistory(t *testing.T) {
+	m := newModel(nil)
+	m.messages = historyTestMessages()
 
-	// Plain Up/Down scrolls the viewport (what the wheel translates to).
 	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyUp})
-	if m.viewport.YOffset >= atBottom {
-		t.Error("expected Up to scroll the viewport up")
+	if got := m.input.Value(); got != "second query" {
+		t.Errorf("after up: input = %q, want %q", got, "second query")
+	}
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyUp})
+	if got := m.input.Value(); got != "first query" {
+		t.Errorf("after 2nd up: input = %q, want %q", got, "first query")
 	}
 	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyDown})
-	if m.viewport.YOffset != atBottom {
-		t.Errorf("expected Down to scroll back to bottom: YOffset = %d, want %d", m.viewport.YOffset, atBottom)
+	if got := m.input.Value(); got != "second query" {
+		t.Errorf("after down: input = %q, want %q", got, "second query")
 	}
-	// Plain Up/Down must not trigger history.
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyDown})
 	if got := m.input.Value(); got != "" {
-		t.Errorf("expected input to stay empty on Up/Down scroll, got %q", got)
+		t.Errorf("past newest: input = %q, want empty", got)
 	}
 }
 
