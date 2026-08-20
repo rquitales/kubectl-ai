@@ -3530,6 +3530,11 @@ func (m model) inputBox() lipgloss.Style {
 	if m.shellMode() {
 		return inputBox.BorderForeground(colorWarning)
 	}
+	if m.sessionRename {
+		// Rename mode gets a green border as a subtle, non-alarming cue that
+		// the input is editing a session name, not a chat prompt.
+		return inputBox.BorderForeground(colorSecondary)
+	}
 	if m.agent != nil && m.agent.SkipPermissionsEnabled() {
 		return inputBox.BorderForeground(colorWarning)
 	}
