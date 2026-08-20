@@ -39,12 +39,12 @@ import (
 // the full agent tool registry.
 type stubTool struct{ name, desc string }
 
-func (t *stubTool) Name() string                                   { return t.name }
-func (t *stubTool) Description() string                            { return t.desc }
-func (t *stubTool) FunctionDefinition() *gollm.FunctionDefinition  { return nil }
+func (t *stubTool) Name() string                                     { return t.name }
+func (t *stubTool) Description() string                              { return t.desc }
+func (t *stubTool) FunctionDefinition() *gollm.FunctionDefinition    { return nil }
 func (t *stubTool) Run(context.Context, map[string]any) (any, error) { return nil, nil }
-func (t *stubTool) IsInteractive(map[string]any) (bool, error)     { return false, nil }
-func (t *stubTool) CheckModifiesResource(map[string]any) string    { return "no" }
+func (t *stubTool) IsInteractive(map[string]any) (bool, error)       { return false, nil }
+func (t *stubTool) CheckModifiesResource(map[string]any) string      { return "no" }
 
 func pasteMsg(s string) tea.KeyMsg {
 	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s), Paste: true}
@@ -564,6 +564,45 @@ func TestUpDownRecallHistoryEvenWhileRunning(t *testing.T) {
 	}
 }
 
+func TestMouseReportBurstDoesNotLeakIntoInput(t *testing.T) {
+	// A fast scroll wheel packs many SGR mouse reports into one read; a
+	// chunk boundary that splits a sequence drops the ESC and/or the
+	// trailing M, and the leftovers arrive as literal runes.
+	bursts := []string{
+		"\x1b[<64;140;44M",                     // one full report
+		"[<64;140;44M",                         // ESC eaten by the parser
+		"[<64;140;44M[<64;140;44M[<65;140;44M", // fast-scroll burst
+		"[<64;140;44M[<64;140",                 // split mid-sequence
+		"[<",                                   // bare fragment
+	}
+	for _, burst := range bursts {
+		m := newModel(nil)
+		_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(burst)})
+		if got := m.input.Value(); got != "" {
+			t.Errorf("burst %q leaked into the input: %q", burst, got)
+		}
+	}
+}
+
+func TestMouseReportStrippedButRealInputKept(t *testing.T) {
+	// Real text mixed with report fragments keeps the text.
+	m := newModel(nil)
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("[<64;140;44Mkubectl get pods")})
+	if got := m.input.Value(); got != "kubectl get pods" {
+		t.Errorf("value = %q, want %q", got, "kubectl get pods")
+	}
+
+	// Ordinary typing arrives one rune per message and is never touched,
+	// even when the rune is one that appears inside a report.
+	m2 := newModel(nil)
+	for _, r := range []rune{'[', '<', '6', '4', 'M'} {
+		_, _ = m2.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	}
+	if got := m2.input.Value(); got != "[<64M" {
+		t.Errorf("single-rune typing altered: value = %q, want %q", got, "[<64M")
+	}
+}
+
 func TestHistorySkipsConsecutiveDuplicates(t *testing.T) {
 	m := newModel(nil)
 	m.messages = []*api.Message{
@@ -928,7 +967,7 @@ func TestSlashHelpPrintsReferenceLocally(t *testing.T) {
 func TestSlashMCPPrintsDetailsLocally(t *testing.T) {
 	a := &agent.Agent{Session: &api.Session{
 		ID:         "test",
-		AgentState:  api.AgentStateIdle,
+		AgentState: api.AgentStateIdle,
 		MCPStatus: &api.MCPStatus{
 			TotalServers:   2,
 			ConnectedCount: 1,
@@ -2213,8 +2252,8 @@ func TestRenderToolResultFailedStyle(t *testing.T) {
 	msg := &api.Message{
 		Type: api.MessageTypeToolCallResponse,
 		Payload: map[string]any{
-			"stdout":   "partial output",
-			"stderr":   "Error from server: not found",
+			"stdout":    "partial output",
+			"stderr":    "Error from server: not found",
 			"exit_code": float64(1),
 		},
 	}
@@ -2242,8 +2281,8 @@ func TestRenderToolResultExitCodeDistinguishes(t *testing.T) {
 	msg := &api.Message{
 		Type: api.MessageTypeToolCallResponse,
 		Payload: map[string]any{
-			"stderr":     "OOMKilled",
-			"exit_code":  float64(137),
+			"stderr":    "OOMKilled",
+			"exit_code": float64(137),
 		},
 	}
 	got := m.renderToolResult(msg)
@@ -2283,7 +2322,7 @@ func TestRenderToolResultColorizesDiff(t *testing.T) {
 	msg := &api.Message{
 		Type: api.MessageTypeToolCallResponse,
 		Payload: map[string]any{
-			"stdout":     "--- a\n+++ b\n@@ -1 +1 @@\n-foo\n+bar\n",
+			"stdout":    "--- a\n+++ b\n@@ -1 +1 @@\n-foo\n+bar\n",
 			"exit_code": float64(0),
 		},
 	}
@@ -2304,7 +2343,7 @@ func TestRenderToolGroupFailedHeader(t *testing.T) {
 
 	req := &api.Message{Type: api.MessageTypeToolCallRequest, Payload: "kubectl get pod missing"}
 	resp := &api.Message{
-		Type: api.MessageTypeToolCallResponse,
+		Type:    api.MessageTypeToolCallResponse,
 		Payload: map[string]any{"stderr": "not found", "exit_code": float64(1)},
 	}
 	got := m.renderToolGroup(req, resp, 90)
@@ -2433,8 +2472,8 @@ func TestKubeContextRefreshesAfterTurn(t *testing.T) {
 	path := writeKubeConfig(t, "agent-context", true)
 	store := sessions.NewInMemoryChatStore()
 	a := &agent.Agent{
-		Session:        &api.Session{ID: "test", AgentState: api.AgentStateRunning, ChatMessageStore: store},
-		Kubeconfig:     path,
+		Session:    &api.Session{ID: "test", AgentState: api.AgentStateRunning, ChatMessageStore: store},
+		Kubeconfig: path,
 	}
 	m := newModel(a)
 	m.width, m.height = 100, 40

@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -819,6 +820,30 @@ func (m *model) navigateList(keyType tea.KeyType) tea.Cmd {
 	return cmd
 }
 
+// mouseReportRe matches SGR mouse reports and the fragments a burst-split
+// read leaves behind. A full report is "\x1b[<64;140;44M"; when the input
+// reader's chunk boundary lands mid-sequence the ESC and/or the trailing
+// M/m are missing, so both are optional here. The "[<" pair is the
+// distinctive marker — no ordinary keystroke produces it.
+var mouseReportRe = regexp.MustCompile(`(?:\x1b)?\[<[0-9;]*[Mm]?`)
+
+// sanitizeRunes strips mouse-report fragments from a burst of input runes.
+// A fast scroll wheel packs many SGR reports into one read; if the chunk
+// boundary splits a sequence, the partial bytes fail to parse as a MouseMsg
+// and fall through as literal runes, which would otherwise land in the
+// input box. Returns the cleaned runes and whether anything was stripped.
+//
+// Only multi-rune bursts are sanitized by the caller: ordinary typing
+// arrives one rune at a time, so real input is never touched.
+func sanitizeRunes(runes []rune) ([]rune, bool) {
+	s := string(runes)
+	cleaned := mouseReportRe.ReplaceAllString(s, "")
+	if cleaned == s {
+		return runes, false
+	}
+	return []rune(cleaned), true
+}
+
 // handleMouse routes mouse events: the scroll wheel scrolls the
 // transcript viewport. Other mouse events (clicks, motion) are ignored.
 func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
@@ -840,6 +865,23 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// that follows the CR, so it doesn't leave a stray newline in
 			// the next draft.
 			return m, nil
+		}
+	}
+
+	// A fast scroll wheel packs many SGR mouse reports into a single read.
+	// When the chunk boundary splits a sequence, the partial bytes fail to
+	// parse as a MouseMsg and arrive here as literal runes, which would
+	// land in the input box. Strip those fragments before anything else.
+	//
+	// Only multi-rune bursts are sanitized: ordinary typing delivers one
+	// rune per message, so real keystrokes are never altered.
+	if msg.Type == tea.KeyRunes && len(msg.Runes) > 1 {
+		cleaned, stripped := sanitizeRunes(msg.Runes)
+		if stripped {
+			if len(cleaned) == 0 {
+				return m, nil // the burst was nothing but mouse reports
+			}
+			msg.Runes = cleaned
 		}
 	}
 
