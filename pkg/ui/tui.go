@@ -2564,7 +2564,22 @@ func (m model) renderToolResult(msg *api.Message) string {
 				prefix = "  ⎿ "
 			}
 		}
-		out = append(out, lineStyle.Render(prefix+truncateRunes(l, lineWidth)))
+		rendered := prefix + truncateRunes(l, lineWidth)
+		// Colorize unified-diff lines so a kubectl diff / apply --dry-run
+		// preview reads as a diff: additions green, deletions red. Only
+		// applied to successful results (failed ones stay uniformly red).
+		// Lines that aren't diff markers keep the base line style.
+		if !failed {
+			switch {
+			case strings.HasPrefix(strings.TrimSpace(l), "+"):
+				out = append(out, lipgloss.NewStyle().Foreground(colorSecondary).Render(rendered))
+				continue
+			case strings.HasPrefix(strings.TrimSpace(l), "-"):
+				out = append(out, lipgloss.NewStyle().Foreground(colorError).Render(rendered))
+				continue
+			}
+		}
+		out = append(out, lineStyle.Render(rendered))
 	}
 	if len(lines) > maxLines {
 		hint := fmt.Sprintf("    +%d more lines", len(lines)-maxLines)

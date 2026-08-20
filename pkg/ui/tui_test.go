@@ -2196,6 +2196,27 @@ func TestRenderToolResultSuccessStaysDim(t *testing.T) {
 	}
 }
 
+func TestRenderToolResultColorizesDiff(t *testing.T) {
+	m := newModel(nil)
+	m.expandToolResults = true // show the full diff, not the collapsed 3 lines
+	msg := &api.Message{
+		Type: api.MessageTypeToolCallResponse,
+		Payload: map[string]any{
+			"stdout":     "--- a\n+++ b\n@@ -1 +1 @@\n-foo\n+bar\n",
+			"exit_code": float64(0),
+		},
+	}
+	got := m.renderToolResult(msg)
+	// The diff's addition (+bar) and deletion (-foo) lines render with
+	// diff coloring (green/red); assert the content is present.
+	if !strings.Contains(got, "+bar") {
+		t.Errorf("expected the diff addition line present, got:\n%s", got)
+	}
+	if !strings.Contains(got, "-foo") {
+		t.Errorf("expected the diff deletion line present, got:\n%s", got)
+	}
+}
+
 func TestRenderToolGroupFailedHeader(t *testing.T) {
 	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
 	m := newModel(a)
