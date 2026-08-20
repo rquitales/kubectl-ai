@@ -320,10 +320,15 @@ type model struct {
 	// how long that can last (see filterMouseRunes).
 	swallowMouseSeq bool
 	swallowedRunes  int
-	spinner       spinner.Model
-	list          list.Model
-	cache         *renderCache
-	messages      []*api.Message
+
+	// mouseEnabled tracks whether mouse capture is on. Capture powers
+	// wheel scrolling but takes drag events away from the terminal, which
+	// disables native click-and-drag text selection — so Ctrl+G toggles it.
+	mouseEnabled bool
+	spinner      spinner.Model
+	list         list.Model
+	cache        *renderCache
+	messages     []*api.Message
 	// clearedAt is the transcript position of the Ctrl+L "cleared"
 	// boundary marker (0 = no marker). Content before it leaves the
 	// current view but is revealed again by scrolling up (revealAll).
@@ -376,15 +381,15 @@ type model struct {
 	choiceType     string // "confirm" or "session"
 	sessionIDs     []string
 	// Session browser state
-	browserOpen     bool
-	browserSessions []api.SessionInfo
+	browserOpen        bool
+	browserSessions    []api.SessionInfo
 	allBrowserSessions []api.SessionInfo // full set; browserSessions is the filtered view
-	browserFilter    string              // substring filter applied to allBrowserSessions
-	browserIndex    int
-	browserStatus   browserStatusMsg // transient info/error shown in the browser footer
-	renaming        bool
-	renameInput     textinput.Model
-	pendingDeleteID string // session staged for deletion, awaiting 'y'
+	browserFilter      string            // substring filter applied to allBrowserSessions
+	browserIndex       int
+	browserStatus      browserStatusMsg // transient info/error shown in the browser footer
+	renaming           bool
+	renameInput        textinput.Model
+	pendingDeleteID    string // session staged for deletion, awaiting 'y'
 	// Command palette state
 	paletteOpen  bool
 	paletteIndex int
@@ -437,16 +442,17 @@ func newModel(agent *agent.Agent) model {
 	ri.Cursor.Style = primaryText
 
 	m := model{
-		agent:       agent,
-		input:       ti,
-		inputHeight: 1,
-		historyIdx:  -1,
-		viewport:    vp,
-		spinner:     sp,
-		list:        l,
-		cache:       newRenderCache(),
-		renameInput: ri,
-		dirty:       true,
+		agent:        agent,
+		input:        ti,
+		inputHeight:  1,
+		historyIdx:   -1,
+		viewport:     vp,
+		spinner:      sp,
+		list:         l,
+		cache:        newRenderCache(),
+		renameInput:  ri,
+		dirty:        true,
+		mouseEnabled: true,
 	}
 	if agent != nil {
 		if s := agent.GetSession(); s != nil {
@@ -481,6 +487,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// re-emit the mouse-enable sequence; re-enable mouse cell-motion so
 		// bubbletea keeps consuming mouse events (otherwise the terminal's
 		// SGR mouse reports leak into the input box as literal text).
+		// Respect the Ctrl+G toggle: if the user turned capture off to
+		// select text, a resize must not silently turn it back on.
+		if !m.mouseEnabled {
+			return m, nil
+		}
 		return m, tea.EnableMouseCellMotion
 
 	case tea.KeyMsg:
@@ -883,6 +894,26 @@ func (m *model) filterMouseRunes(runes []rune) []rune {
 	return out
 }
 
+// toggleMouse turns mouse capture on or off.
+//
+// Capture is what makes the scroll wheel scroll the transcript, but it also
+// routes click-and-drag to the app instead of the terminal, so native text
+// selection stops working. Toggling it off restores selection (at the cost
+// of wheel scrolling, which falls back to PgUp/PgDn) and toggling it back on
+// restores the wheel.
+func (m *model) toggleMouse() (tea.Model, tea.Cmd) {
+	m.mouseEnabled = !m.mouseEnabled
+	if m.mouseEnabled {
+		m.appendLocalMessage("🖱  Mouse capture on — wheel scrolls the transcript. Ctrl+G to turn it off for text selection.")
+		return m, tea.EnableMouseCellMotion
+	}
+	// Any in-flight report fragment is moot once capture is off.
+	m.swallowMouseSeq = false
+	m.swallowedRunes = 0
+	m.appendLocalMessage("🖱  Mouse capture off — drag to select and copy text. PgUp/PgDn scroll; Ctrl+G to turn it back on.")
+	return m, tea.DisableMouse
+}
+
 // handleMouse routes mouse events: the scroll wheel scrolls the
 // transcript viewport. Other mouse events (clicks, motion) are ignored.
 func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
@@ -991,6 +1022,12 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.dirty = true
 		m.refresh()
 		return m, nil
+	case tea.KeyCtrlG:
+		// Toggle mouse capture. Capture drives wheel scrolling, but it also
+		// takes drag events away from the terminal, which disables native
+		// click-and-drag text selection. Turning it off hands the mouse back
+		// to the terminal so text can be selected and copied normally.
+		return m.toggleMouse()
 	case tea.KeyShiftTab:
 		// Toggle auto-accept mode (skip permission prompts), like opencode
 		// and Claude Code.
@@ -2534,7 +2571,7 @@ func (m model) renderTextMsg(msg *api.Message, r *glamour.TermRenderer, w int) s
 		if strings.HasPrefix(payload, "!") {
 			label := primaryText.Render("You") + ts + warnText.Render(" ⚡shell")
 			content := textStyle.Width(w).Render(payload)
-			return userMsg.Width(w + 2).Render(label+"\n"+content) + "\n"
+			return userMsg.Width(w+2).Render(label+"\n"+content) + "\n"
 		}
 		label := primaryText.Render("You") + ts
 		content := textStyle.Width(w).Render(payload)
@@ -2598,9 +2635,9 @@ func (m model) renderThinking(msg *api.Message, w int) string {
 	if m.expandThinking {
 		// Show the full reasoning under the summary header, dimmed.
 		body := dimStyle.Width(w).Render(payload)
-		return agentMsg.Width(w + 2).Render(header+"\n"+body) + "\n"
+		return agentMsg.Width(w+2).Render(header+"\n"+body) + "\n"
 	}
-	return agentMsg.Width(w + 2).Render(header) + "\n"
+	return agentMsg.Width(w+2).Render(header) + "\n"
 }
 
 // pluralS returns "s" when n != 1, for compact pluralization.
@@ -3320,7 +3357,9 @@ func helpText() string {
 | **Ctrl+Y** | copy last reply |
 | **Ctrl+O** | expand/collapse tool results |
 | **Ctrl+T** | expand/collapse model reasoning |
+| **Ctrl+G** | toggle mouse capture (turn off to select text) |
 | **PgUp / PgDn** | scroll transcript |
+| **wheel** | scroll transcript (when mouse capture is on) |
 | **Tab** | autocomplete (commands, @files, /context, /namespace) |
 
 ## Slash commands
@@ -3340,6 +3379,12 @@ func helpText() string {
 | **/exit** | quit |
 
 Type **!command** to run a shell command, or **@path** to attach a file.
+
+**Selecting text:** mouse capture gives the wheel to the transcript, which
+takes click-and-drag away from the terminal. Most terminals still select if
+you hold a modifier while dragging — **Option** on macOS (iTerm2, Terminal),
+**Shift** on most Linux terminals. Otherwise press **Ctrl+G** to release the
+mouse, select normally, and press it again to get the wheel back.
 `
 }
 

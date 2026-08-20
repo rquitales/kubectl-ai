@@ -584,6 +584,64 @@ func TestMouseReportBurstDoesNotLeakIntoInput(t *testing.T) {
 	}
 }
 
+// lastMessageText returns the payload of the most recent transcript
+// message as a string, or "" when there are none.
+func lastMessageText(m model) string {
+	if len(m.messages) == 0 {
+		return ""
+	}
+	s, _ := m.messages[len(m.messages)-1].Payload.(string)
+	return s
+}
+
+func TestCtrlGTogglesMouseCapture(t *testing.T) {
+	m := newModel(nil)
+	if !m.mouseEnabled {
+		t.Fatal("mouse capture should start enabled")
+	}
+
+	// Off: the terminal gets the mouse back so text can be selected.
+	_, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlG})
+	if m.mouseEnabled {
+		t.Error("Ctrl+G did not disable mouse capture")
+	}
+	if cmd == nil {
+		t.Error("expected a command to disable mouse capture")
+	}
+	if got := lastMessageText(m); !strings.Contains(got, "off") {
+		t.Errorf("expected a note that capture is off, got %q", got)
+	}
+
+	// On again: the wheel scrolls once more.
+	_, cmd = m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlG})
+	if !m.mouseEnabled {
+		t.Error("Ctrl+G did not re-enable mouse capture")
+	}
+	if cmd == nil {
+		t.Error("expected a command to re-enable mouse capture")
+	}
+}
+
+func TestResizeDoesNotReEnableDisabledMouse(t *testing.T) {
+	// A resize re-enables capture so split reports don't leak — but it must
+	// not override a user who turned capture off to select text.
+	m := newModel(nil)
+	m.mouseEnabled = false
+	updated, cmd := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	if cmd != nil {
+		t.Error("resize must not re-enable mouse capture while it is toggled off")
+	}
+	if got := updated.(model); got.mouseEnabled {
+		t.Error("resize flipped mouseEnabled back on")
+	}
+
+	// With capture on, a resize does re-establish it.
+	m2 := newModel(nil)
+	if _, cmd := m2.Update(tea.WindowSizeMsg{Width: 100, Height: 30}); cmd == nil {
+		t.Error("resize should re-enable mouse capture when it is on")
+	}
+}
+
 func TestSplitMouseReportAcrossMessagesDoesNotLeak(t *testing.T) {
 	// When a fast scroll splits an SGR report at the read boundary, the
 	// parser's ESC branch stops after one rune, so the report arrives as a
