@@ -1282,3 +1282,82 @@ func TestNamespaceMetaQueryClusterDown(t *testing.T) {
 		t.Errorf("expected a graceful cluster-error note, got %q", ans)
 	}
 }
+
+type kubeconfigKeyCapturingTool struct {
+	name   string
+	gotKey string
+}
+
+func (t *kubeconfigKeyCapturingTool) Name() string        { return t.name }
+func (t *kubeconfigKeyCapturingTool) Description() string { return "captures kubeconfig" }
+func (t *kubeconfigKeyCapturingTool) FunctionDefinition() *gollm.FunctionDefinition {
+	return &gollm.FunctionDefinition{Name: t.name, Description: "captures kubeconfig"}
+}
+func (t *kubeconfigKeyCapturingTool) Run(ctx context.Context, args map[string]any) (any, error) {
+	if v, ok := ctx.Value(tools.KubeconfigKey).(string); ok {
+		t.gotKey = v
+	}
+	return map[string]any{"result": "ok"}, nil
+}
+func (t *kubeconfigKeyCapturingTool) IsInteractive(args map[string]any) (bool, error) {
+	return false, nil
+}
+func (t *kubeconfigKeyCapturingTool) CheckModifiesResource(args map[string]any) string {
+	return "no"
+}
+
+func TestToolDispatchUsesActiveKubeconfig(t *testing.T) {
+	base := writeAgentKubeConfig(t, "prod", "prod", "staging")
+	a := &Agent{
+		Session:    &api.Session{ChatMessageStore: sessions.NewInMemoryChatStore()},
+		Kubeconfig: base,
+		workDir:    t.TempDir(),
+		Output:     make(chan any, 10),
+	}
+	go func() {
+		for range a.Output {
+		}
+	}()
+
+	// No override: the base path flows.
+	if got := a.ActiveKubeconfig(); got != base {
+		t.Fatalf("ActiveKubeconfig = %q, want base %q", got, base)
+	}
+
+	// Apply the session override; the active kubeconfig (what tools get)
+	// becomes the override, while the base file stays untouched.
+	if err := a.applyKubeOverride("staging", ""); err != nil {
+		t.Fatalf("applyKubeOverride: %v", err)
+	}
+	override := a.ActiveKubeconfig()
+	if override == base {
+		t.Fatal("expected an override to be active")
+	}
+
+	// Dispatch a read-only tool call through the agent's dispatch path.
+	tool := &kubeconfigKeyCapturingTool{name: "capturetool"}
+	var toolset tools.Tools
+	toolset.Init()
+	toolset.RegisterTool(tool)
+	a.Tools = toolset
+	parsed, err := a.Tools.ParseToolInvocation(context.Background(), "capturetool", map[string]any{})
+	if err != nil {
+		t.Fatalf("ParseToolInvocation: %v", err)
+	}
+	a.pendingFunctionCalls = []ToolCallAnalysis{
+		{
+			FunctionCall:        gollm.FunctionCall{ID: "1", Name: "capturetool", Arguments: map[string]any{}},
+			ParsedToolCall:      parsed,
+			ModifiesResourceStr: "no",
+		},
+	}
+	if err := a.DispatchToolCalls(context.Background()); err != nil {
+		t.Fatalf("DispatchToolCalls failed: %v", err)
+	}
+	if tool.gotKey != override {
+		t.Errorf("tool context kubeconfig = %q, want override %q", tool.gotKey, override)
+	}
+	if current, _, _ := kube.CurrentContext(base); current != "prod" {
+		t.Errorf("base context changed to %q, want prod untouched", current)
+	}
+}

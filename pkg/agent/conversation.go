@@ -1996,7 +1996,7 @@ func (c *Agent) DispatchToolCalls(ctx context.Context) error {
 		c.addMessage(api.MessageSourceModel, api.MessageTypeToolCallRequest, toolDescription)
 
 		output, err := call.ParsedToolCall.InvokeTool(ctx, tools.InvokeToolOptions{
-			Kubeconfig: c.Kubeconfig,
+			Kubeconfig: c.ActiveKubeconfig(),
 			WorkDir:    c.workDir,
 			Executor:   c.Executor,
 		})
