@@ -2141,14 +2141,20 @@ func (m model) renderWelcome() string {
 		return primaryText.Render("  "+c[0]) + " " + dimStyle.Render(c[1])
 	}
 	// A two-column row needs room for the widest left + widest right entry
-	// plus a gap; fall back to a single column below that width.
+	// plus a gap; fall back to a single column below that width. Measure
+	// the rendered width (the "  " prefix renderRow adds) so the
+	// threshold matches what's actually rendered.
 	colWidth := 0
 	for _, c := range commands {
-		if w := lipgloss.Width(c[0] + " " + c[1]); w > colWidth {
+		if w := lipgloss.Width("  " + c[0] + " " + c[1]); w > colWidth {
 			colWidth = w
 		}
 	}
-	twoCol := m.width >= colWidth*2+6
+	twoCol := m.width >= colWidth*2+2
+	// availW is the row content width (the panel has ~2 cells of side
+	// padding); rows are truncated to it so a long command row never
+	// overflows on a narrow terminal.
+	availW := max(m.width-2, 10)
 	var rows []string
 	if twoCol {
 		half := (len(commands) + 1) / 2
@@ -2158,11 +2164,11 @@ func (m model) renderWelcome() string {
 			if i+half < len(commands) {
 				right = "  " + renderRow(commands[i+half])
 			}
-			rows = append(rows, left+right)
+			rows = append(rows, truncateRunes(left+right, availW))
 		}
 	} else {
 		for _, c := range commands {
-			rows = append(rows, renderRow(c))
+			rows = append(rows, truncateRunes(renderRow(c), availW))
 		}
 	}
 	sb.WriteString(strings.Join(rows, "\n"))
