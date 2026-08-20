@@ -1561,6 +1561,82 @@ func TestBrowserCannotDeleteCurrentSession(t *testing.T) {
 	}
 }
 
+func TestBrowserFilterTypingNarrows(t *testing.T) {
+	m := newBrowserModel()
+	sessions := testSessions()
+	sessions = append(sessions, api.SessionInfo{ID: "sx9", Name: "deploy-debug", ModelID: "m", LastModified: time.Now()})
+	m.openBrowser(sessions)
+	full := len(m.browserSessions)
+
+	// Typing a non-reserved character ('e') filters the list.
+	_, _ = m.handleBrowserKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")})
+	if m.browserFilter != "e" {
+		t.Fatalf("filter = %q, want %q", m.browserFilter, "e")
+	}
+	if len(m.browserSessions) >= full {
+		t.Errorf("expected the list to narrow after filtering, got %d (full %d)", len(m.browserSessions), full)
+	}
+	// Every surviving session matches the filter.
+	for _, s := range m.browserSessions {
+		if !sessionMatchesFilter(s, "e") {
+			t.Errorf("session %q does not match filter 'e' but survived", s.ID)
+		}
+	}
+}
+
+func TestBrowserFilterBackspaceAndEsc(t *testing.T) {
+	m := newBrowserModel()
+	m.openBrowser(testSessions())
+	_, _ = m.handleBrowserKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")})
+	_, _ = m.handleBrowserKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	if m.browserFilter != "ec" {
+		t.Fatalf("filter = %q, want %q", m.browserFilter, "ec")
+	}
+
+	// Backspace edits the filter.
+	_, _ = m.handleBrowserKey(tea.KeyMsg{Type: tea.KeyBackspace})
+	if m.browserFilter != "e" {
+		t.Errorf("after backspace: filter = %q, want %q", m.browserFilter, "e")
+	}
+
+	// Esc clears an active filter (it doesn't close the browser).
+	_, _ = m.handleBrowserKey(tea.KeyMsg{Type: tea.KeyEsc})
+	if m.browserFilter != "" {
+		t.Errorf("after esc: filter = %q, want cleared", m.browserFilter)
+	}
+	if !m.browserOpen {
+		t.Error("expected esc to clear the filter, not close the browser")
+	}
+}
+
+func TestBrowserFilterNoMatchMessage(t *testing.T) {
+	m := newBrowserModel()
+	m.openBrowser(testSessions())
+	// A filter that matches nothing.
+	_, _ = m.handleBrowserKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("z")})
+	got := m.viewSessionBrowser()
+	if !strings.Contains(got, "No sessions match") {
+		t.Errorf("expected a 'No sessions match' message, got:\n%s", got)
+	}
+}
+
+func TestBrowserReservedKeysDoNotFilter(t *testing.T) {
+	m := newBrowserModel()
+	m.openBrowser(testSessions())
+	before := len(m.browserSessions)
+	// 'd', 'r', 'j', 'k' are reserved commands and must not start a filter.
+	for _, r := range "drjk" {
+		_, _ = m.handleBrowserKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	}
+	if m.browserFilter != "" {
+		t.Errorf("reserved keys started a filter: %q (want empty)", m.browserFilter)
+	}
+	// The list wasn't narrowed by reserved keys.
+	if len(m.browserSessions) != before {
+		t.Errorf("reserved keys narrowed the list: %d (want %d)", len(m.browserSessions), before)
+	}
+}
+
 func TestCtrlLClearsViewButScrollUpReveals(t *testing.T) {
 	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
 	m := newModel(a)
