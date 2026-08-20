@@ -2182,11 +2182,21 @@ func (m model) renderToolResult(msg *api.Message) string {
 	}
 
 	var out []string
+	// On a failed result, surface the exit code on the first line so k8s
+	// debugging can distinguish e.g. OOM (137), not-found (127), or
+	// terminated (143) from a plain error — the code is in the result map
+	// but otherwise discarded.
+	exitLabel := ""
+	if failed {
+		if code, ok := toolResultExitCode(msg.Payload); ok && code != 0 {
+			exitLabel = fmt.Sprintf("exit %d ", code)
+		}
+	}
 	for i, l := range shown {
 		prefix := "    "
 		if i == 0 {
 			if failed {
-				prefix = "  ⎿ ✗ "
+				prefix = "  ⎿ ✗ " + exitLabel
 			} else {
 				prefix = "  ⎿ "
 			}
@@ -2264,6 +2274,18 @@ func toolResultErrorText(payload any) string {
 		}
 	}
 	return ""
+}
+
+// toolResultExitCode extracts the exit code from an ExecResult-shaped result
+// map, if present. Returns false when there is no exit code (e.g. a plain
+// err.Error() string payload, or an MCP result without one).
+func toolResultExitCode(payload any) (int, bool) {
+	if p, ok := payload.(map[string]any); ok {
+		if v, ok := p["exit_code"]; ok {
+			return toInt(v)
+		}
+	}
+	return 0, false
 }
 
 // toInt converts a JSON-decoded numeric value (float64) to an int.
