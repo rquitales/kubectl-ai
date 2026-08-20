@@ -2366,6 +2366,13 @@ func (m model) renderTextMsg(msg *api.Message, r *glamour.TermRenderer, w int) s
 
 	switch msg.Source {
 	case api.MessageSourceUser:
+		// A shell-escape query ("!command") ran locally, not sent to the LLM.
+		// Mark it distinctly so the transcript shows it wasn't a prompt.
+		if strings.HasPrefix(payload, "!") {
+			label := primaryText.Render("You") + ts + warnText.Render(" ⚡shell")
+			content := textStyle.Width(w).Render(payload)
+			return userMsg.Width(w + 2).Render(label+"\n"+content) + "\n"
+		}
 		label := primaryText.Render("You") + ts
 		content := textStyle.Width(w).Render(payload)
 		return userMsg.Width(w+2).Render(label+"\n"+content) + "\n"
