@@ -790,6 +790,38 @@ func TestSlashCommandPassesThroughToAgent(t *testing.T) {
 	}
 }
 
+func TestSlashHelpPrintsReferenceLocally(t *testing.T) {
+	for _, value := range []string{"/help", "/?"} {
+		m := newBrowserModel()
+		m.input.SetValue(value)
+
+		_, cmd := m.handleEnter()
+		// /help is handled locally: no command is sent to the agent.
+		if cmd != nil {
+			select {
+			case got := <-m.agent.Input:
+				t.Fatalf("%q must not reach the agent, got %v", value, got)
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
+		// A help message is appended to the transcript (user query + reference).
+		if len(m.messages) != 2 {
+			t.Fatalf("%q: expected 2 transcript messages (query + help), got %d", value, len(m.messages))
+		}
+		help, ok := m.messages[1].Payload.(string)
+		if !ok {
+			t.Fatalf("%q: expected a string help payload, got %T", value, m.messages[1].Payload)
+		}
+		if !strings.Contains(help, "Keyboard shortcuts") || !strings.Contains(help, "Slash commands") {
+			t.Errorf("%q: help text missing sections, got:\n%s", value, help)
+		}
+		// /help is offered for autocomplete.
+		if !strings.Contains(strings.Join(slashCompletions("/he"), ","), "/help") {
+			t.Errorf("%q: expected /help in slash autocomplete", value)
+		}
+	}
+}
+
 func TestShiftTabTogglesAutoMode(t *testing.T) {
 	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
 	m := newModel(a)
