@@ -386,6 +386,75 @@ func TestPgUpPgDownScrollsViewport(t *testing.T) {
 	}
 }
 
+func TestBottomDividerPlainAtBottom(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.width, m.height = 100, 24
+	m.resize()
+	for i := 0; i < 50; i++ {
+		m.messages = append(m.messages, &api.Message{
+			Source: api.MessageSourceModel, Type: api.MessageTypeText,
+			Payload: fmt.Sprintf("line %d", i), Timestamp: time.Now(),
+		})
+	}
+	m.dirty = true
+	m.refresh()
+	m.viewport.GotoBottom()
+
+	got := m.viewBottomDivider()
+	if strings.Contains(got, "PgDn") {
+		t.Errorf("at the bottom, the divider must be plain (no scroll cue), got:\n%s", got)
+	}
+}
+
+func TestBottomDividerShowsScrollCueWhenScrolledUp(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.width, m.height = 100, 24
+	m.resize()
+	for i := 0; i < 50; i++ {
+		m.messages = append(m.messages, &api.Message{
+			Source: api.MessageSourceModel, Type: api.MessageTypeText,
+			Payload: fmt.Sprintf("line %d", i), Timestamp: time.Now(),
+		})
+	}
+	m.dirty = true
+	m.refresh()
+	m.viewport.GotoBottom()
+
+	// Scroll up: the divider now carries the position cue.
+	m.viewport.ScrollUp(m.viewport.Height / 2)
+	got := m.viewBottomDivider()
+	if !strings.Contains(got, "PgDn for latest") {
+		t.Errorf("expected a scroll cue when scrolled up, got:\n%s", got)
+	}
+	if !strings.Contains(got, "%") {
+		t.Errorf("expected a percentage in the scroll cue, got:\n%s", got)
+	}
+	// The cue and divider together must stay on one line of the terminal width.
+	if n := lipgloss.Height(got); n != 1 {
+		t.Errorf("expected the bottom divider to be one line, got %d:\n%s", n, got)
+	}
+}
+
+func TestBottomDividerPlainWhenShortTranscript(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.width, m.height = 100, 24
+	m.resize()
+	// A transcript shorter than the viewport cannot scroll: no cue.
+	m.messages = []*api.Message{
+		{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "hi", Timestamp: time.Now()},
+	}
+	m.dirty = true
+	m.refresh()
+
+	got := m.viewBottomDivider()
+	if strings.Contains(got, "PgDn") {
+		t.Errorf("a short transcript must not show a scroll cue, got:\n%s", got)
+	}
+}
+
 func TestUpDownRecallsHistory(t *testing.T) {
 	m := newModel(nil)
 	m.messages = historyTestMessages()
