@@ -1452,6 +1452,29 @@ func TestPaletteOpenNavigateClose(t *testing.T) {
 	}
 }
 
+func TestChoicePickerTruncatesLongLabels(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateWaitingForInput}}
+	m := newModel(a)
+	m.width, m.height = 50, 24
+	m.resize()
+	req := &api.UserChoiceRequest{
+		Prompt: "Select a model:",
+		Options: []api.UserChoiceOption{
+			{Label: "accounts/fireworks/models/deepseek-v3 (current)", Value: "a"},
+			{Label: "accounts/fireworks/models/llama4-scout", Value: "b"},
+		},
+	}
+	msg := &api.Message{Type: api.MessageTypeUserChoiceRequest, Payload: req}
+	m.handleAgentMsg(msg)
+
+	got := m.renderMessages()
+	// The long label is truncated to the list width so the picker doesn't
+	// wrap or push its border. The ellipsis confirms truncation.
+	if !strings.Contains(got, "…") {
+		t.Errorf("expected a long choice label to be truncated, got:\n%s", got)
+	}
+}
+
 func TestPaletteModelSendsSlashQuery(t *testing.T) {
 	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}, Input: make(chan any, 1)}
 	m := newModel(a)
