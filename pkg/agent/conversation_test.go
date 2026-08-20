@@ -139,7 +139,7 @@ func TestHandleMetaQuery(t *testing.T) {
 				llm := mocks.NewMockClient(ctrl)
 				llm.EXPECT().ListModels(ctx).Return([]string{"test-model", "other-model"}, nil)
 
-				a := &Agent{Model: "test-model", LLM: llm, Output: make(chan any, 1)}
+				a := &Agent{Model: "test-model", LLM: llm, Output: make(chan any, 2)}
 				a.Session = &api.Session{ChatMessageStore: sessions.NewInMemoryChatStore()}
 				return a
 			},
@@ -150,14 +150,28 @@ func TestHandleMetaQuery(t *testing.T) {
 				if len(a.pendingModelChoice) != 2 {
 					t.Errorf("expected 2 pending model choices, got %v", a.pendingModelChoice)
 				}
-				select {
-				case m := <-a.Output:
-					msg, ok := m.(*api.Message)
-					if !ok || msg.Type != api.MessageTypeUserChoiceRequest {
-						t.Errorf("expected user-choice-request, got %T", m)
+				// Drain any ephemeral status messages (e.g. "Fetching
+				// models…") before asserting the user-choice-request.
+				var got *api.Message
+			drain:
+				for i := 0; i < len(a.pendingModelChoice)+1; i++ {
+					select {
+					case m := <-a.Output:
+						msg, ok := m.(*api.Message)
+						if !ok {
+							t.Fatalf("expected *api.Message, got %T", m)
+						}
+						if msg.Type == api.MessageTypeUserChoiceRequest {
+							got = msg
+							break drain
+						}
+					default:
+						t.Error("expected a user-choice-request message on output")
+						return
 					}
-				default:
-					t.Error("expected a user-choice-request message on output")
+				}
+				if got == nil || got.Type != api.MessageTypeUserChoiceRequest {
+					t.Errorf("expected user-choice-request, got %v", got)
 				}
 			},
 		},
