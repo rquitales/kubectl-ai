@@ -839,22 +839,18 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// Enabling mouse cell-motion capture can make some terminals emit
-	// mouse-event reports or capability-response escape sequences as
-	// KeyRunes (e.g. "\x1b[<64;110;75M" — an SGR mouse report, or
-	// "\x1b[?1003h"). These aren't user keystrokes; swallow them so
-	// they don't get pasted into the input box. Match the ESC (0x1b)
-	// introducer with or without a following "[", plus bare "[<" / "[?"
-	// in case the ESC was already stripped.
+	// Mouse cell-motion capture can make terminals emit SGR mouse
+	// reports (e.g. "\x1b[<64;140;44M") or capability-response escape
+	// sequences as KeyRunes — sometimes flagged as bracketed paste. These
+	// aren't user keystrokes; swallow them before the paste handler so
+	// they don't get inserted into the input box. Match the ESC (0x1b)
+	// introducer with or without a following "[", plus bare "[<" / "[?",
+	// and any KeyRunes whose first rune is a non-printable control char.
 	if msg.Type == tea.KeyRunes {
-		if s := msg.String(); strings.HasPrefix(s, "\x1b") ||
-			strings.HasPrefix(s, "\x1b[<") || strings.HasPrefix(s, "\x1b[?") ||
-			strings.HasPrefix(s, "[<") || strings.HasPrefix(s, "[?") {
-			return m, nil
-		}
-		// Also drop any KeyRunes whose first rune is a non-printable
-		// control character (a stray terminal report with no ESC).
-		if len(msg.Runes) > 0 && msg.Runes[0] < 0x20 && msg.Runes[0] != '\n' && msg.Runes[0] != '\t' {
+		s := msg.String()
+		if strings.HasPrefix(s, "\x1b") ||
+			strings.HasPrefix(s, "[<") || strings.HasPrefix(s, "[?") ||
+			(len(msg.Runes) > 0 && msg.Runes[0] < 0x20 && msg.Runes[0] != '\n' && msg.Runes[0] != '\t') {
 			return m, nil
 		}
 	}
@@ -871,8 +867,15 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// Bracketed paste arrives as a single key message with Paste set.
-	// Handle it before anything else so pasted text never triggers shortcuts.
+	// Handle it before anything else so pasted text never triggers
+	// shortcuts — but a mouse SGR report may also arrive flagged as
+	// paste, so drop those first.
 	if msg.Paste {
+		if s := msg.String(); strings.HasPrefix(s, "\x1b") ||
+			strings.HasPrefix(s, "[<") || strings.HasPrefix(s, "[?") ||
+			(len(msg.Runes) > 0 && msg.Runes[0] < 0x20 && msg.Runes[0] != '\n' && msg.Runes[0] != '\t') {
+			return m, nil
+		}
 		return m.handlePaste(msg)
 	}
 
