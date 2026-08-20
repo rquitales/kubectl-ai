@@ -1984,6 +1984,53 @@ func TestViewStatusShowsKubeContext(t *testing.T) {
 	}
 }
 
+func TestViewStateShowsTurnDurationOnDone(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateDone}}
+	m := newModel(a)
+	m.lastTurnDuration = 12 * time.Second
+
+	got := m.viewState(api.AgentStateDone)
+	if !strings.Contains(got, "Done") {
+		t.Errorf("expected the Done label, got %q", got)
+	}
+	if !strings.Contains(got, "12s") {
+		t.Errorf("expected the persisted turn duration '12s' on Done, got %q", got)
+	}
+}
+
+func TestViewStateHidesDurationOnIdle(t *testing.T) {
+	m := newModel(nil)
+	m.lastTurnDuration = 12 * time.Second
+	// Idle state must not carry the done turn's duration.
+	if got := m.viewState(api.AgentStateIdle); strings.Contains(got, "12s") {
+		t.Errorf("expected no duration on Idle, got %q", got)
+	}
+}
+
+func TestDoneTransitionStashesTurnDuration(t *testing.T) {
+	m, store := newStreamModel() // AgentStateRunning
+	// Simulate a turn that started, then a final text message that flips the
+	// session to Done.
+	m.thinkStart = time.Now().Add(-5 * time.Second)
+	final := &api.Message{
+		ID: "s1", Source: api.MessageSourceModel, Type: api.MessageTypeText,
+		Payload: "done", Timestamp: time.Now(),
+	}
+	if err := store.AddChatMessage(final); err != nil {
+		t.Fatalf("AddChatMessage: %v", err)
+	}
+	m.agent.Session.AgentState = api.AgentStateDone
+	m.handleAgentMsg(final)
+
+	// The turn duration is stashed and thinkStart cleared.
+	if m.lastTurnDuration <= 0 {
+		t.Errorf("expected lastTurnDuration to be stashed, got %v", m.lastTurnDuration)
+	}
+	if !m.thinkStart.IsZero() {
+		t.Error("expected thinkStart to be cleared after the turn completes")
+	}
+}
+
 func TestCtrlOTogglesToolResultExpansion(t *testing.T) {
 	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
 	m := newModel(a)
