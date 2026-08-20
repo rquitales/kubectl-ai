@@ -23,6 +23,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -642,8 +643,8 @@ func (m *model) inputBlockHeight() int {
 	if m.sessionRename {
 		h++ // the "Rename session:" label line
 	}
-	if len(slashCompletions(m.input.Value())) > 0 {
-		h++ // the slash-command completion hint line
+	if m.completionHintVisible() {
+		h++ // the completion/shell hint line
 	}
 	for _, p := range m.pastes {
 		if p.token == "" {
@@ -762,10 +763,26 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// and Claude Code.
 		return m.toggleAutoMode()
 	case tea.KeyTab:
-		// Slash-command autocomplete: cycle the input through the matches.
 		if m.inChoiceMode {
 			return m, nil
 		}
+		// File mention autocomplete: cycle the current @token through
+		// filesystem path matches, keeping preceding text intact.
+		if tok := m.lastToken(); strings.HasPrefix(tok, "@") && tok != "@" {
+			if m.tabIndex < len(m.tabMatches) && strings.HasSuffix(m.input.Value(), m.tabMatches[m.tabIndex]) {
+				m.tabIndex = (m.tabIndex + 1) % len(m.tabMatches)
+			} else {
+				m.tabMatches = m.fileMatches()
+				m.tabIndex = 0
+			}
+			if len(m.tabMatches) > 0 {
+				m.input.SetValue(strings.TrimSuffix(m.input.Value(), tok) + "@" + m.tabMatches[m.tabIndex])
+				m.input.CursorEnd()
+				m.syncInputHeight()
+			}
+			return m, nil
+		}
+		// Slash-command autocomplete: cycle the input through the matches.
 		if m.tabIndex < len(m.tabMatches) && m.input.Value() == m.tabMatches[m.tabIndex] {
 			// Mid-cycle: advance to the next captured match.
 			m.tabIndex = (m.tabIndex + 1) % len(m.tabMatches)
@@ -2284,9 +2301,69 @@ func slashCompletions(input string) []string {
 	return matches
 }
 
-// completionHint renders the dim slash-command completion line shown under
-// the input, or "" when there are no matches.
+// lastToken returns the input's trailing whitespace-separated token
+// (what an autocomplete would complete).
+func (m model) lastToken() string {
+	v := m.input.Value()
+	if i := strings.LastIndexAny(v, " \t\n"); i >= 0 {
+		return v[i+1:]
+	}
+	return v
+}
+
+// shellMode reports whether the input is a `!` shell escape command.
+func (m model) shellMode() bool {
+	return strings.HasPrefix(m.input.Value(), "!")
+}
+
+// completionHintVisible reports whether a hint line (slash completions,
+// file mentions, or the shell marker) is shown under the input.
+func (m model) completionHintVisible() bool {
+	return m.shellMode() ||
+		len(slashCompletions(m.input.Value())) > 0 ||
+		len(m.fileMatches()) > 0
+}
+
+// fileMatches returns filesystem path completions for the current `@`
+// mention token (directories get a trailing "/" so completion can continue).
+// Returns nil when the last token isn't a mention prefix.
+func (m model) fileMatches() []string {
+	tok := m.lastToken()
+	if !strings.HasPrefix(tok, "@") || tok == "@" {
+		return nil
+	}
+	prefix := tok[1:]
+	if prefix == "" {
+		return nil
+	}
+	glob, err := filepath.Glob(prefix + "*")
+	if err != nil {
+		return nil
+	}
+	var matches []string
+	for _, g := range glob {
+		if info, err := os.Stat(g); err == nil && info.IsDir() {
+			g += "/"
+		}
+		matches = append(matches, g)
+	}
+	const maxMatches = 8
+	if len(matches) > maxMatches {
+		matches = matches[:maxMatches]
+	}
+	return matches
+}
+
+// completionHint renders the dim hint line shown under the input: the shell
+// marker, file mention matches, or slash-command completions.
 func (m model) completionHint() string {
+	if m.shellMode() {
+		return dimStyle.Render("  shell command")
+	}
+	if matches := m.fileMatches(); len(matches) > 0 {
+		hint := "  " + strings.Join(matches, "  ")
+		return dimStyle.Render(truncateRunes(hint, max(m.input.Width(), 20)))
+	}
 	matches := slashCompletions(m.input.Value())
 	if len(matches) == 0 {
 		return ""
@@ -2324,7 +2401,8 @@ func (m model) viewInput(state api.AgentState) string {
 	if m.sessionRename {
 		content = warnText.Render("Rename session:") + "\n" + content
 	}
-	// Slash-command completions are hinted inside the input box.
+	// Slash-command completions, file mentions, or the shell marker are
+	// hinted inside the input box.
 	if hint := m.completionHint(); hint != "" {
 		content += "\n" + hint
 	}
@@ -2343,7 +2421,16 @@ func (m model) viewInput(state api.AgentState) string {
 		}
 	}
 
-	return lipgloss.NewStyle().Padding(0, 1).Render(inputBox.Width(m.width - 4).Render(content))
+	return lipgloss.NewStyle().Padding(0, 1).Render(m.inputBox().Width(m.width - 4).Render(content))
+}
+
+// inputBox returns the input box style: a warning-colored border for `!`
+// shell escape commands, primary otherwise.
+func (m model) inputBox() lipgloss.Style {
+	if m.shellMode() {
+		return inputBox.BorderForeground(colorWarning)
+	}
+	return inputBox
 }
 
 func (m model) viewHelp(state api.AgentState) string {
