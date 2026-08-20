@@ -132,12 +132,14 @@ type TUI struct {
 }
 
 func NewTUI(agent *agent.Agent) *TUI {
-	// Mouse capture is intentionally NOT enabled: selecting text with the
-	// mouse copies natively in every terminal (no modifier keys). Scrolling
-	// still works because terminals translate the wheel to arrow keys in
-	// alt-screen mode, which scroll the viewport (plus PgUp/PgDn).
+	// Enable mouse cell-motion capture so the scroll wheel scrolls the
+	// transcript viewport directly (terminal wheel-to-arrow translation
+	// in alt-screen mode is unreliable across terminals). Cell-motion mode
+	// delivers wheel events without intercepting all mouse motion, so text
+	// selection still copies natively in most terminals. Copy is also
+	// available via Ctrl+Y.
 	return &TUI{
-		program: tea.NewProgram(newModel(agent), tea.WithAltScreen()),
+		program: tea.NewProgram(newModel(agent), tea.WithAltScreen(), tea.WithMouseCellMotion()),
 		agent:   agent,
 	}
 }
@@ -467,6 +469,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		return m.handleKey(msg)
+
+	case tea.MouseMsg:
+		return m.handleMouse(msg)
 
 	case *api.Message:
 		return m.handleAgentMsg(msg)
@@ -804,6 +809,21 @@ func (m *model) navigateList(keyType tea.KeyType) tea.Cmd {
 	return cmd
 }
 
+// handleMouse routes mouse events: the scroll wheel scrolls the
+// transcript viewport. Other mouse events (clicks, motion) are ignored —
+// text selection still copies natively in most terminals under
+// cell-motion mode, and copy is available via Ctrl+Y.
+func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	const wheelStep = 3
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		m.viewport.ScrollUp(wheelStep)
+	case tea.MouseButtonWheelDown:
+		m.viewport.ScrollDown(wheelStep)
+	}
+	return m, nil
+}
+
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.justSubmitted {
 		m.justSubmitted = false
@@ -962,17 +982,10 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.inChoiceMode {
 			return m, m.navigateList(tea.KeyUp)
 		}
-		// While the agent is running the input is disabled, so arrows are
-		// free: use them to line-scroll the transcript (PgUp/PgDn scroll
-		// half a page; this gives finer control while reading a reply).
-		if s := m.agentState(); s == api.AgentStateRunning || s == api.AgentStateInitializing {
-			m.viewport.ScrollUp(1)
-			return m, nil
-		}
 		// Within a multi-line draft, Up moves the cursor until the first
 		// line; from there (and for single-line drafts) it recalls older
 		// input history, like opencode and Claude Code. Transcript
-		// scrolling lives on PgUp/PgDn.
+		// scrolling lives on the mouse wheel and PgUp/PgDn.
 		if m.input.LineCount() > 1 && m.input.Line() > 0 {
 			m.input.CursorUp()
 			return m, nil
@@ -981,10 +994,6 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyDown:
 		if m.inChoiceMode {
 			return m, m.navigateList(tea.KeyDown)
-		}
-		if s := m.agentState(); s == api.AgentStateRunning || s == api.AgentStateInitializing {
-			m.viewport.ScrollDown(1)
-			return m, nil
 		}
 		if m.input.LineCount() > 1 && m.input.Line() < m.input.LineCount()-1 {
 			m.input.CursorDown()

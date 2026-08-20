@@ -537,8 +537,35 @@ func TestUpDownRecallsHistory(t *testing.T) {
 	}
 }
 
-func TestUpDownLineScrollsTranscriptWhileRunning(t *testing.T) {
+func TestUpDownRecallHistoryEvenWhileRunning(t *testing.T) {
 	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateRunning}}
+	m := newModel(a)
+	m.width, m.height = 100, 24
+	m.resize()
+	m.messages = []*api.Message{
+		{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "first query"},
+		{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "answer"},
+		{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "second query"},
+	}
+	m.dirty = true
+	m.refresh()
+	m.viewport.GotoBottom()
+
+	// Up/Down recall input history even while the agent is running
+	// (transcript scrolling lives on the mouse wheel + PgUp/PgDn),
+	// like opencode and Claude Code.
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyUp})
+	if got := m.input.Value(); got != "second query" {
+		t.Errorf("after up while running: input = %q, want %q (history recall)", got, "second query")
+	}
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyDown})
+	if got := m.input.Value(); got != "" {
+		t.Errorf("after down while running: input = %q, want empty (history restored)", got)
+	}
+}
+
+func TestMouseWheelScrollsTranscript(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
 	m := newModel(a)
 	m.width, m.height = 100, 24
 	m.resize()
@@ -553,19 +580,15 @@ func TestUpDownLineScrollsTranscriptWhileRunning(t *testing.T) {
 	m.viewport.GotoBottom()
 	atBottom := m.viewport.YOffset
 
-	// Up scrolls the transcript up by one line (not the input history).
-	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyUp})
+	// Mouse wheel up scrolls the transcript up.
+	_, _ = m.handleMouse(tea.MouseMsg{Button: tea.MouseButtonWheelUp})
 	if m.viewport.YOffset >= atBottom {
-		t.Errorf("expected Up to scroll the transcript up while running, YOffset = %d (bottom %d)", m.viewport.YOffset, atBottom)
+		t.Errorf("expected wheel-up to scroll the transcript up, YOffset = %d (bottom %d)", m.viewport.YOffset, atBottom)
 	}
-	if got := m.input.Value(); got != "" {
-		t.Errorf("Up while running must not touch the input draft, got %q", got)
-	}
-
-	// Down scrolls back down.
-	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyDown})
+	// Mouse wheel down scrolls back down.
+	_, _ = m.handleMouse(tea.MouseMsg{Button: tea.MouseButtonWheelDown})
 	if m.viewport.YOffset != atBottom {
-		t.Errorf("expected Down to scroll back to the bottom while running, YOffset = %d (want %d)", m.viewport.YOffset, atBottom)
+		t.Errorf("expected wheel-down to scroll back to the bottom, YOffset = %d (want %d)", m.viewport.YOffset, atBottom)
 	}
 }
 
