@@ -1618,6 +1618,20 @@ func TestRenameEscCancels(t *testing.T) {
 	}
 }
 
+func TestRenameModeGreenBorder(t *testing.T) {
+	m, _, _ := newRenameModel(t)
+	m.enterSessionRename()
+	// Rename mode gets a green (secondary) border as a subtle cue.
+	if got := m.inputBox().GetBorderTopForeground(); got != colorSecondary {
+		t.Errorf("rename border = %v, want colorSecondary %v", got, colorSecondary)
+	}
+	// Exiting rename mode restores the primary border.
+	m.exitSessionRename()
+	if got := m.inputBox().GetBorderTopForeground(); got != colorPrimary {
+		t.Errorf("normal border after rename = %v, want colorPrimary %v", got, colorPrimary)
+	}
+}
+
 func TestRenameWithArgsAppliesImmediately(t *testing.T) {
 	m, a, _ := newRenameModel(t)
 
