@@ -641,15 +641,26 @@ func TestPhantomLFAfterSubmitIsSwallowed(t *testing.T) {
 
 func TestMouseReportEscapeSequenceSwallowed(t *testing.T) {
 	m := newModel(nil)
-	// Enabling mouse capture can make terminals emit capability-report
-	// escape sequences as KeyRunes (e.g. "[<64;110;75M"). These must
-	// be swallowed, not pasted into the input box.
-	for _, seq := range []string{"[<64;110;75M", "[?1003h", "[?1006h"} {
+	// Enabling mouse capture can make terminals emit mouse-event
+	// reports or capability-response escape sequences as KeyRunes —
+	// with or without the leading ESC (0x1b) that terminals strip.
+	// These must be swallowed, not pasted into the input box.
+	for _, seq := range []string{
+		"[<64;110;75M", "[?1003h", "[?1006h",
+		"\x1b[<64;110;75M", "\x1b[?1003h",
+	} {
 		m.input.Reset()
 		_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(seq)})
 		if got := m.input.Value(); got != "" {
 			t.Errorf("escape sequence %q leaked into the input: %q", seq, got)
 		}
+	}
+	// A stray report whose first rune is a non-printable control char
+	// (no ESC) is also swallowed.
+	m.input.Reset()
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{0x01, 'x'}})
+	if got := m.input.Value(); got != "" {
+		t.Errorf("control-char report leaked into the input: %q", got)
 	}
 	// A normal runnable keystroke is not swallowed.
 	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})

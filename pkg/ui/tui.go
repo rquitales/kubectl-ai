@@ -840,11 +840,21 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// Enabling mouse cell-motion capture can make some terminals emit
-	// capability-report or mode-status escape sequences as KeyRunes (e.g.
-	// "[<64;110;75M"). These aren't user keystrokes; swallow them so
-	// they don't get pasted into the input box.
+	// mouse-event reports or capability-response escape sequences as
+	// KeyRunes (e.g. "\x1b[<64;110;75M" — an SGR mouse report, or
+	// "\x1b[?1003h"). These aren't user keystrokes; swallow them so
+	// they don't get pasted into the input box. Match the ESC (0x1b)
+	// introducer with or without a following "[", plus bare "[<" / "[?"
+	// in case the ESC was already stripped.
 	if msg.Type == tea.KeyRunes {
-		if s := msg.String(); strings.HasPrefix(s, "[<") || strings.HasPrefix(s, "[?") {
+		if s := msg.String(); strings.HasPrefix(s, "\x1b") ||
+			strings.HasPrefix(s, "\x1b[<") || strings.HasPrefix(s, "\x1b[?") ||
+			strings.HasPrefix(s, "[<") || strings.HasPrefix(s, "[?") {
+			return m, nil
+		}
+		// Also drop any KeyRunes whose first rune is a non-printable
+		// control character (a stray terminal report with no ESC).
+		if len(msg.Runes) > 0 && msg.Runes[0] < 0x20 && msg.Runes[0] != '\n' && msg.Runes[0] != '\t' {
 			return m, nil
 		}
 	}
