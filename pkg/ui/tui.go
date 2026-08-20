@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,6 +33,7 @@ import (
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/agent"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/kube"
+	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/tools"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/spinner"
@@ -1864,6 +1866,17 @@ func (m *model) handleEnter() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// Intercept the /tools command (handled locally, prints the available
+	// tools into the transcript).
+	if v := strings.ToLower(value); v == "/tools" {
+		if m.agent != nil {
+			m.appendLocalMessage(toolsText(m.agent.ListAllTools()))
+		} else {
+			m.appendLocalMessage("_No tools available._")
+		}
+		return m, nil
+	}
+
 	m.thinkStart = time.Now()
 
 	return m, func() tea.Msg {
@@ -3020,9 +3033,10 @@ func (m model) viewBottomDivider() string {
 // slashCommands is the static list offered for autocomplete when the input
 // starts with "/".
 var slashCommands = []string{
-	"/model", "/models", "/tools", "/sessions", "/session", "/new", "/save",
+	"/model", "/models", "/sessions", "/session", "/new", "/save",
 	"/rename", "/resume", "/delete", "/delete-session", "/clear", "/exit",
 	"/quit", "/compact", "/context", "/namespace", "/ns", "/help", "/mcp",
+	"/tools",
 }
 
 // slashCompletions returns the commands matching the input prefix, or nil
@@ -3110,6 +3124,38 @@ func mcpStatusText(session *api.Session) string {
 		}
 		tools := fmt.Sprintf("%d", len(srv.AvailableTools))
 		fmt.Fprintf(&sb, "| %s | %s | %s |\n", name, state, tools)
+	}
+	return sb.String()
+}
+
+// toolsText returns a markdown summary of the available tools (built-in and
+// MCP), printed to the transcript by the /tools command. Each tool is listed
+// with its name and a one-line description so the user can see what the agent
+// is able to call.
+func toolsText(tls []tools.Tool) string {
+	if len(tls) == 0 {
+		return "No tools are available."
+	}
+
+	// Sort by name for a stable, scannable list.
+	slices.SortFunc(tls, func(a, b tools.Tool) int {
+		return strings.Compare(a.Name(), b.Name())
+	})
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "## Available tools\n\n")
+	fmt.Fprintf(&sb, "| Tool | Description |\n")
+	fmt.Fprintf(&sb, "| --- | --- |\n")
+	for _, t := range tls {
+		desc := strings.TrimSpace(t.Description())
+		// Collapse a multi-line description to its first line for the table.
+		if i := strings.IndexByte(desc, '\n'); i >= 0 {
+			desc = desc[:i]
+		}
+		if desc == "" {
+			desc = "—"
+		}
+		fmt.Fprintf(&sb, "| %s | %s |\n", t.Name(), desc)
 	}
 	return sb.String()
 }
