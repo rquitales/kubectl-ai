@@ -2036,6 +2036,18 @@ func firstUserMessage(messages []*api.Message) string {
 
 func (c *Agent) listModels(ctx context.Context) ([]string, error) {
 	if c.availableModels == nil {
+		// Surface an ephemeral status so the user sees the model list is being
+		// fetched (ListModels can be a network call). Not stored, so it leaves
+		// no trace in the history. Guarded for tests that construct an agent
+		// without an Output channel.
+		if c.Output != nil {
+			c.Output <- &api.Message{
+				Source:    api.MessageSourceAgent,
+				Type:      api.MessageTypeText,
+				Payload:   "⏳ Fetching available models…",
+				Timestamp: time.Now(),
+			}
+		}
 		modelNames, err := c.LLM.ListModels(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("listing models: %w", err)
