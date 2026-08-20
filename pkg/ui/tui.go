@@ -1740,7 +1740,11 @@ func (m *model) handleEnter() (tea.Model, tea.Cmd) {
 	// Intercept the /mcp command (handled locally, prints MCP server
 	// connection details into the transcript).
 	if v := strings.ToLower(value); v == "/mcp" {
-		m.appendLocalMessage(mcpStatusText(m.agent.GetSession()))
+		if m.agent != nil {
+			m.appendLocalMessage(mcpStatusText(m.agent.GetSession()))
+		} else {
+			m.appendLocalMessage("_No MCP servers configured._")
+		}
 		return m, nil
 	}
 
