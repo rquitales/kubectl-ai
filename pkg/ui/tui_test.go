@@ -39,12 +39,12 @@ import (
 // the full agent tool registry.
 type stubTool struct{ name, desc string }
 
-func (t *stubTool) Name() string                                   { return t.name }
-func (t *stubTool) Description() string                            { return t.desc }
-func (t *stubTool) FunctionDefinition() *gollm.FunctionDefinition  { return nil }
+func (t *stubTool) Name() string                                     { return t.name }
+func (t *stubTool) Description() string                              { return t.desc }
+func (t *stubTool) FunctionDefinition() *gollm.FunctionDefinition    { return nil }
 func (t *stubTool) Run(context.Context, map[string]any) (any, error) { return nil, nil }
-func (t *stubTool) IsInteractive(map[string]any) (bool, error)     { return false, nil }
-func (t *stubTool) CheckModifiesResource(map[string]any) string    { return "no" }
+func (t *stubTool) IsInteractive(map[string]any) (bool, error)       { return false, nil }
+func (t *stubTool) CheckModifiesResource(map[string]any) string      { return "no" }
 
 func pasteMsg(s string) tea.KeyMsg {
 	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s), Paste: true}
@@ -537,35 +537,111 @@ func TestUpDownRecallsHistory(t *testing.T) {
 	}
 }
 
-func TestUpDownLineScrollsTranscriptWhileRunning(t *testing.T) {
+func TestUpDownRecallHistoryEvenWhileRunning(t *testing.T) {
 	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateRunning}}
 	m := newModel(a)
 	m.width, m.height = 100, 24
 	m.resize()
-	for i := 0; i < 50; i++ {
-		m.messages = append(m.messages, &api.Message{
-			Source: api.MessageSourceModel, Type: api.MessageTypeText,
-			Payload: fmt.Sprintf("line %d", i), Timestamp: time.Now(),
-		})
+	m.messages = []*api.Message{
+		{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "first query"},
+		{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "answer"},
+		{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "second query"},
 	}
 	m.dirty = true
 	m.refresh()
 	m.viewport.GotoBottom()
-	atBottom := m.viewport.YOffset
 
-	// Up scrolls the transcript up by one line (not the input history).
+	// Up/Down recall input history even while the agent is running
+	// (transcript scrolling lives on the mouse wheel + PgUp/PgDn),
+	// like opencode and Claude Code.
 	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyUp})
-	if m.viewport.YOffset >= atBottom {
-		t.Errorf("expected Up to scroll the transcript up while running, YOffset = %d (bottom %d)", m.viewport.YOffset, atBottom)
+	if got := m.input.Value(); got != "second query" {
+		t.Errorf("after up while running: input = %q, want %q (history recall)", got, "second query")
 	}
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyDown})
 	if got := m.input.Value(); got != "" {
-		t.Errorf("Up while running must not touch the input draft, got %q", got)
+		t.Errorf("after down while running: input = %q, want empty (history restored)", got)
+	}
+}
+
+func TestMouseReportBurstDoesNotLeakIntoInput(t *testing.T) {
+	// A fast scroll wheel packs many SGR mouse reports into one read; a
+	// chunk boundary that splits a sequence drops the ESC and/or the
+	// trailing M, and the leftovers arrive as literal runes.
+	bursts := []string{
+		"\x1b[<64;140;44M",                     // one full report
+		"[<64;140;44M",                         // ESC eaten by the parser
+		"[<64;140;44M[<64;140;44M[<65;140;44M", // fast-scroll burst
+		"[<64;140;44M[<64;140",                 // split mid-sequence
+		"[<",                                   // bare fragment
+	}
+	for _, burst := range bursts {
+		m := newModel(nil)
+		_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(burst)})
+		if got := m.input.Value(); got != "" {
+			t.Errorf("burst %q leaked into the input: %q", burst, got)
+		}
+	}
+}
+
+func TestSplitMouseReportAcrossMessagesDoesNotLeak(t *testing.T) {
+	// When a fast scroll splits an SGR report at the read boundary, the
+	// parser's ESC branch stops after one rune, so the report arrives as a
+	// lone Alt+'[' followed by the remainder in a separate message. This is
+	// the sequence that leaked; neither message is recognisable on its own.
+	m := newModel(nil)
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("["), Alt: true})
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("<64;140")})
+	if got := m.input.Value(); got != "" {
+		t.Errorf("split report leaked into the input: %q", got)
+	}
+	// The tail of that report arrives next and is still swallowed, up to
+	// and including the terminator.
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(";44M")})
+	if got := m.input.Value(); got != "" {
+		t.Errorf("report tail leaked into the input: %q", got)
+	}
+	// Typing resumes normally once the report has been consumed.
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
+	if got := m.input.Value(); got != "k" {
+		t.Errorf("typing after a split report: value = %q, want %q", got, "k")
+	}
+}
+
+func TestSwallowModeIsBounded(t *testing.T) {
+	// A false positive must not eat input indefinitely: swallowing gives up
+	// after maxSwallowedRunes even if no terminator ever arrives.
+	m := newModel(nil)
+	m.swallowMouseSeq = true
+	m.swallowedRunes = 1
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(strings.Repeat("a", maxSwallowedRunes+8))})
+	if m.swallowMouseSeq {
+		t.Error("swallow mode should have given up after maxSwallowedRunes")
+	}
+	// Once it gives up, the rest of that message and everything after it is
+	// treated as real input again.
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("ok")})
+	if got := m.input.Value(); !strings.HasSuffix(got, "ok") {
+		t.Errorf("input after bounded swallow = %q, want it to end with %q", got, "ok")
+	}
+}
+
+func TestMouseReportStrippedButRealInputKept(t *testing.T) {
+	// Real text mixed with report fragments keeps the text.
+	m := newModel(nil)
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("[<64;140;44Mkubectl get pods")})
+	if got := m.input.Value(); got != "kubectl get pods" {
+		t.Errorf("value = %q, want %q", got, "kubectl get pods")
 	}
 
-	// Down scrolls back down.
-	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyDown})
-	if m.viewport.YOffset != atBottom {
-		t.Errorf("expected Down to scroll back to the bottom while running, YOffset = %d (want %d)", m.viewport.YOffset, atBottom)
+	// Ordinary typing arrives one rune per message and is never touched,
+	// even when the rune is one that appears inside a report.
+	m2 := newModel(nil)
+	for _, r := range []rune{'[', '<', '6', '4', 'M'} {
+		_, _ = m2.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	}
+	if got := m2.input.Value(); got != "[<64M" {
+		t.Errorf("single-rune typing altered: value = %q, want %q", got, "[<64M")
 	}
 }
 
@@ -933,7 +1009,7 @@ func TestSlashHelpPrintsReferenceLocally(t *testing.T) {
 func TestSlashMCPPrintsDetailsLocally(t *testing.T) {
 	a := &agent.Agent{Session: &api.Session{
 		ID:         "test",
-		AgentState:  api.AgentStateIdle,
+		AgentState: api.AgentStateIdle,
 		MCPStatus: &api.MCPStatus{
 			TotalServers:   2,
 			ConnectedCount: 1,
@@ -2218,8 +2294,8 @@ func TestRenderToolResultFailedStyle(t *testing.T) {
 	msg := &api.Message{
 		Type: api.MessageTypeToolCallResponse,
 		Payload: map[string]any{
-			"stdout":   "partial output",
-			"stderr":   "Error from server: not found",
+			"stdout":    "partial output",
+			"stderr":    "Error from server: not found",
 			"exit_code": float64(1),
 		},
 	}
@@ -2247,8 +2323,8 @@ func TestRenderToolResultExitCodeDistinguishes(t *testing.T) {
 	msg := &api.Message{
 		Type: api.MessageTypeToolCallResponse,
 		Payload: map[string]any{
-			"stderr":     "OOMKilled",
-			"exit_code":  float64(137),
+			"stderr":    "OOMKilled",
+			"exit_code": float64(137),
 		},
 	}
 	got := m.renderToolResult(msg)
@@ -2288,7 +2364,7 @@ func TestRenderToolResultColorizesDiff(t *testing.T) {
 	msg := &api.Message{
 		Type: api.MessageTypeToolCallResponse,
 		Payload: map[string]any{
-			"stdout":     "--- a\n+++ b\n@@ -1 +1 @@\n-foo\n+bar\n",
+			"stdout":    "--- a\n+++ b\n@@ -1 +1 @@\n-foo\n+bar\n",
 			"exit_code": float64(0),
 		},
 	}
@@ -2309,7 +2385,7 @@ func TestRenderToolGroupFailedHeader(t *testing.T) {
 
 	req := &api.Message{Type: api.MessageTypeToolCallRequest, Payload: "kubectl get pod missing"}
 	resp := &api.Message{
-		Type: api.MessageTypeToolCallResponse,
+		Type:    api.MessageTypeToolCallResponse,
 		Payload: map[string]any{"stderr": "not found", "exit_code": float64(1)},
 	}
 	got := m.renderToolGroup(req, resp, 90)
@@ -2438,8 +2514,8 @@ func TestKubeContextRefreshesAfterTurn(t *testing.T) {
 	path := writeKubeConfig(t, "agent-context", true)
 	store := sessions.NewInMemoryChatStore()
 	a := &agent.Agent{
-		Session:        &api.Session{ID: "test", AgentState: api.AgentStateRunning, ChatMessageStore: store},
-		Kubeconfig:     path,
+		Session:    &api.Session{ID: "test", AgentState: api.AgentStateRunning, ChatMessageStore: store},
+		Kubeconfig: path,
 	}
 	m := newModel(a)
 	m.width, m.height = 100, 40

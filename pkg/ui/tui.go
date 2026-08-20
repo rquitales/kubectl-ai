@@ -132,10 +132,12 @@ type TUI struct {
 }
 
 func NewTUI(agent *agent.Agent) *TUI {
-	// Mouse capture is intentionally NOT enabled: selecting text with the
-	// mouse copies natively in every terminal (no modifier keys). Scrolling
-	// still works because terminals translate the wheel to arrow keys in
-	// alt-screen mode, which scroll the viewport (plus PgUp/PgDn).
+	// Mouse cell-motion capture is enabled from Init (via the
+	// EnableMouseCellMotion command) rather than as a program option, so the
+	// mouse-enable escape sequence is written after the first render when
+	// the terminal is in alt-screen mode and ready to consume it —
+	// otherwise some terminals echo the sequence as literal text into the
+	// input box on startup.
 	return &TUI{
 		program: tea.NewProgram(newModel(agent), tea.WithAltScreen()),
 		agent:   agent,
@@ -312,6 +314,12 @@ type model struct {
 	// Return deliver a phantom LF (KeyCtrlJ) right after the CR; it is
 	// swallowed so it doesn't leave a stray newline in the next draft.
 	justSubmitted bool
+
+	// swallowMouseSeq is set while a mouse report that the input parser
+	// split across reads is still being consumed; swallowedRunes bounds
+	// how long that can last (see filterMouseRunes).
+	swallowMouseSeq bool
+	swallowedRunes  int
 	spinner       spinner.Model
 	list          list.Model
 	cache         *renderCache
@@ -450,7 +458,13 @@ func newModel(agent *agent.Agent) model {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(textarea.Blink, m.spinner.Tick, m.tick())
+	// Enable mouse cell-motion capture so the scroll wheel scrolls the
+	// transcript. Disable it when quitting so the terminal stops sending
+	// mouse reports (which otherwise leak as literal text after exit).
+	return tea.Batch(
+		textarea.Blink, m.spinner.Tick, m.tick(),
+		tea.EnableMouseCellMotion,
+	)
 }
 
 func (m model) tick() tea.Cmd {
@@ -463,10 +477,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		m.dirty = true
 		m.resize()
-		return m, nil
+		// A terminal resize makes the renderer re-enter alt-screen mode and
+		// re-emit the mouse-enable sequence; re-enable mouse cell-motion so
+		// bubbletea keeps consuming mouse events (otherwise the terminal's
+		// SGR mouse reports leak into the input box as literal text).
+		return m, tea.EnableMouseCellMotion
 
 	case tea.KeyMsg:
 		return m.handleKey(msg)
+
+	case tea.MouseMsg:
+		return m.handleMouse(msg)
 
 	case *api.Message:
 		return m.handleAgentMsg(msg)
@@ -804,6 +825,77 @@ func (m *model) navigateList(keyType tea.KeyType) tea.Cmd {
 	return cmd
 }
 
+// maxSwallowedRunes bounds how far filterMouseRunes will keep dropping
+// input while looking for a mouse report's terminator. A real SGR report
+// is ~13 bytes; this is a safety valve so a false positive can never eat
+// more than a few keystrokes.
+const maxSwallowedRunes = 32
+
+// isMouseSeqStart reports whether a split SGR mouse report begins at
+// runes[i]. A full report looks like "\x1b[<64;140;44M"; a read boundary
+// can cut it anywhere, so the recognizable openings are ESC+"[", "[<",
+// and "<" followed by a digit. None of these occur as a multi-rune burst
+// of genuine typed input.
+func isMouseSeqStart(runes []rune, i int) bool {
+	if i+1 >= len(runes) {
+		return false
+	}
+	switch runes[i] {
+	case '\x1b':
+		return runes[i+1] == '['
+	case '[':
+		return runes[i+1] == '<'
+	case '<':
+		return runes[i+1] >= '0' && runes[i+1] <= '9'
+	}
+	return false
+}
+
+// filterMouseRunes drops SGR mouse-report fragments from a burst of input
+// runes, carrying state across messages.
+//
+// A fast scroll wheel packs many reports into one read. When the input
+// parser's chunk boundary splits a report it emits the pieces as ordinary
+// runes — and because the ESC branch stops after a single rune, the "["
+// arrives in its own message ahead of the "<64;140" remainder. Matching
+// per-message therefore cannot work; swallowing has to span messages,
+// which is what swallowMouseSeq tracks. Swallowing ends at the report's
+// M/m terminator, or at maxSwallowedRunes as a safety valve.
+func (m *model) filterMouseRunes(runes []rune) []rune {
+	out := make([]rune, 0, len(runes))
+	for i := 0; i < len(runes); i++ {
+		if m.swallowMouseSeq {
+			m.swallowedRunes++
+			r := runes[i]
+			if r == 'M' || r == 'm' || m.swallowedRunes > maxSwallowedRunes {
+				m.swallowMouseSeq = false
+				m.swallowedRunes = 0
+			}
+			continue
+		}
+		if isMouseSeqStart(runes, i) {
+			m.swallowMouseSeq = true
+			m.swallowedRunes = 1
+			continue
+		}
+		out = append(out, runes[i])
+	}
+	return out
+}
+
+// handleMouse routes mouse events: the scroll wheel scrolls the
+// transcript viewport. Other mouse events (clicks, motion) are ignored.
+func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	const wheelStep = 3
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		m.viewport.ScrollUp(wheelStep)
+	case tea.MouseButtonWheelDown:
+		m.viewport.ScrollDown(wheelStep)
+	}
+	return m, nil
+}
+
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.justSubmitted {
 		m.justSubmitted = false
@@ -812,6 +904,32 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// that follows the CR, so it doesn't leave a stray newline in
 			// the next draft.
 			return m, nil
+		}
+	}
+
+	// A fast scroll wheel packs many SGR mouse reports into a single read,
+	// and a chunk boundary that splits one leaves fragments that reach us
+	// as ordinary runes. Drop them before they can land in the input box.
+	//
+	// The parser emits a split report's leading "\x1b[" as a lone '[' with
+	// Alt set, ahead of the "<64;140" remainder, so that artifact has to be
+	// recognised on its own; from there filterMouseRunes swallows the rest
+	// across however many messages it spans.
+	if msg.Type == tea.KeyRunes {
+		if !m.swallowMouseSeq && msg.Alt && len(msg.Runes) == 1 && msg.Runes[0] == '[' {
+			m.swallowMouseSeq = true
+			m.swallowedRunes = 1
+			return m, nil
+		}
+		// Ordinary typing arrives one rune at a time, so single-rune
+		// messages are left alone unless a report is already in flight.
+		if m.swallowMouseSeq || len(msg.Runes) > 1 {
+			if cleaned := m.filterMouseRunes(msg.Runes); len(cleaned) != len(msg.Runes) {
+				if len(cleaned) == 0 {
+					return m, nil
+				}
+				msg.Runes = cleaned
+			}
 		}
 	}
 
@@ -827,7 +945,8 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// Bracketed paste arrives as a single key message with Paste set.
-	// Handle it before anything else so pasted text never triggers shortcuts.
+	// Handle it before anything else so pasted text never triggers
+	// shortcuts.
 	if msg.Paste {
 		return m.handlePaste(msg)
 	}
@@ -835,7 +954,10 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyCtrlC, tea.KeyCtrlD:
 		m.quitting = true
-		return m, tea.Quit
+		// Disable mouse capture on quit so the terminal stops sending SGR
+		// mouse reports (which would otherwise leak as literal text after
+		// the program exits and the renderer is no longer consuming them).
+		return m, tea.Batch(tea.Quit, tea.DisableMouse)
 	case tea.KeyEsc:
 		return m.handleEsc()
 	case tea.KeyCtrlL:
@@ -962,17 +1084,10 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.inChoiceMode {
 			return m, m.navigateList(tea.KeyUp)
 		}
-		// While the agent is running the input is disabled, so arrows are
-		// free: use them to line-scroll the transcript (PgUp/PgDn scroll
-		// half a page; this gives finer control while reading a reply).
-		if s := m.agentState(); s == api.AgentStateRunning || s == api.AgentStateInitializing {
-			m.viewport.ScrollUp(1)
-			return m, nil
-		}
 		// Within a multi-line draft, Up moves the cursor until the first
 		// line; from there (and for single-line drafts) it recalls older
 		// input history, like opencode and Claude Code. Transcript
-		// scrolling lives on PgUp/PgDn.
+		// scrolling lives on the mouse wheel and PgUp/PgDn.
 		if m.input.LineCount() > 1 && m.input.Line() > 0 {
 			m.input.CursorUp()
 			return m, nil
@@ -981,10 +1096,6 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyDown:
 		if m.inChoiceMode {
 			return m, m.navigateList(tea.KeyDown)
-		}
-		if s := m.agentState(); s == api.AgentStateRunning || s == api.AgentStateInitializing {
-			m.viewport.ScrollDown(1)
-			return m, nil
 		}
 		if m.input.LineCount() > 1 && m.input.Line() < m.input.LineCount()-1 {
 			m.input.CursorDown()
