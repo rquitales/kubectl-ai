@@ -639,6 +639,25 @@ func TestPhantomLFAfterSubmitIsSwallowed(t *testing.T) {
 	}
 }
 
+func TestMouseReportEscapeSequenceSwallowed(t *testing.T) {
+	m := newModel(nil)
+	// Enabling mouse capture can make terminals emit capability-report
+	// escape sequences as KeyRunes (e.g. "[<64;110;75M"). These must
+	// be swallowed, not pasted into the input box.
+	for _, seq := range []string{"[<64;110;75M", "[?1003h", "[?1006h"} {
+		m.input.Reset()
+		_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(seq)})
+		if got := m.input.Value(); got != "" {
+			t.Errorf("escape sequence %q leaked into the input: %q", seq, got)
+		}
+	}
+	// A normal runnable keystroke is not swallowed.
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	if got := m.input.Value(); got != "x" {
+		t.Errorf("normal rune leaked/swallowed: value = %q, want %q", got, "x")
+	}
+}
+
 func testSessions() []api.SessionInfo {
 	return []api.SessionInfo{
 		{ID: "s1", Name: "first", ModelID: "model-a", LastModified: time.Now(), MessageCount: 3},

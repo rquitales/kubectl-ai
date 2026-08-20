@@ -835,6 +835,16 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	// Enabling mouse cell-motion capture can make some terminals emit
+	// capability-report or mode-status escape sequences as KeyRunes (e.g.
+	// "[<64;110;75M"). These aren't user keystrokes; swallow them so
+	// they don't get pasted into the input box.
+	if msg.Type == tea.KeyRunes {
+		if s := msg.String(); strings.HasPrefix(s, "[<") || strings.HasPrefix(s, "[?") {
+			return m, nil
+		}
+	}
+
 	// While the session browser is open it captures all keys except quit
 	// (including pastes, which are routed by handleBrowserKey).
 	if m.browserOpen && msg.Type != tea.KeyCtrlC && msg.Type != tea.KeyCtrlD {
