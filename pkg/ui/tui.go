@@ -452,11 +452,7 @@ func newModel(agent *agent.Agent) model {
 }
 
 func (m model) Init() tea.Cmd {
-	// Enable mouse cell-motion capture here (after the first render) rather
-	// than as a program option, so the enable escape sequence is written when
-	// the terminal is in alt-screen mode and ready — otherwise some
-	// terminals echo it as literal text into the input box on startup.
-	return tea.Batch(textarea.Blink, m.spinner.Tick, m.tick(), tea.EnableMouseCellMotion)
+	return tea.Batch(textarea.Blink, m.spinner.Tick, m.tick())
 }
 
 func (m model) tick() tea.Cmd {
@@ -473,9 +469,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		return m.handleKey(msg)
-
-	case tea.MouseMsg:
-		return m.handleMouse(msg)
 
 	case *api.Message:
 		return m.handleAgentMsg(msg)
@@ -813,21 +806,6 @@ func (m *model) navigateList(keyType tea.KeyType) tea.Cmd {
 	return cmd
 }
 
-// handleMouse routes mouse events: the scroll wheel scrolls the
-// transcript viewport. Other mouse events (clicks, motion) are ignored —
-// text selection still copies natively in most terminals under
-// cell-motion mode, and copy is available via Ctrl+Y.
-func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
-	const wheelStep = 3
-	switch msg.Button {
-	case tea.MouseButtonWheelUp:
-		m.viewport.ScrollUp(wheelStep)
-	case tea.MouseButtonWheelDown:
-		m.viewport.ScrollDown(wheelStep)
-	}
-	return m, nil
-}
-
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.justSubmitted {
 		m.justSubmitted = false
@@ -835,22 +813,6 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// Terminals that send CRLF for Return: swallow the phantom LF
 			// that follows the CR, so it doesn't leave a stray newline in
 			// the next draft.
-			return m, nil
-		}
-	}
-
-	// Mouse cell-motion capture can make terminals emit SGR mouse
-	// reports (e.g. "\x1b[<64;140;44M") or capability-response escape
-	// sequences as KeyRunes — sometimes flagged as bracketed paste. These
-	// aren't user keystrokes; swallow them before the paste handler so
-	// they don't get inserted into the input box. Match the ESC (0x1b)
-	// introducer with or without a following "[", plus bare "[<" / "[?",
-	// and any KeyRunes whose first rune is a non-printable control char.
-	if msg.Type == tea.KeyRunes {
-		s := msg.String()
-		if strings.HasPrefix(s, "\x1b") ||
-			strings.HasPrefix(s, "[<") || strings.HasPrefix(s, "[?") ||
-			(len(msg.Runes) > 0 && msg.Runes[0] < 0x20 && msg.Runes[0] != '\n' && msg.Runes[0] != '\t') {
 			return m, nil
 		}
 	}
@@ -868,14 +830,8 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// Bracketed paste arrives as a single key message with Paste set.
 	// Handle it before anything else so pasted text never triggers
-	// shortcuts — but a mouse SGR report may also arrive flagged as
-	// paste, so drop those first.
+	// shortcuts.
 	if msg.Paste {
-		if s := msg.String(); strings.HasPrefix(s, "\x1b") ||
-			strings.HasPrefix(s, "[<") || strings.HasPrefix(s, "[?") ||
-			(len(msg.Runes) > 0 && msg.Runes[0] < 0x20 && msg.Runes[0] != '\n' && msg.Runes[0] != '\t') {
-			return m, nil
-		}
 		return m.handlePaste(msg)
 	}
 

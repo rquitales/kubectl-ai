@@ -564,34 +564,6 @@ func TestUpDownRecallHistoryEvenWhileRunning(t *testing.T) {
 	}
 }
 
-func TestMouseWheelScrollsTranscript(t *testing.T) {
-	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
-	m := newModel(a)
-	m.width, m.height = 100, 24
-	m.resize()
-	for i := 0; i < 50; i++ {
-		m.messages = append(m.messages, &api.Message{
-			Source: api.MessageSourceModel, Type: api.MessageTypeText,
-			Payload: fmt.Sprintf("line %d", i), Timestamp: time.Now(),
-		})
-	}
-	m.dirty = true
-	m.refresh()
-	m.viewport.GotoBottom()
-	atBottom := m.viewport.YOffset
-
-	// Mouse wheel up scrolls the transcript up.
-	_, _ = m.handleMouse(tea.MouseMsg{Button: tea.MouseButtonWheelUp})
-	if m.viewport.YOffset >= atBottom {
-		t.Errorf("expected wheel-up to scroll the transcript up, YOffset = %d (bottom %d)", m.viewport.YOffset, atBottom)
-	}
-	// Mouse wheel down scrolls back down.
-	_, _ = m.handleMouse(tea.MouseMsg{Button: tea.MouseButtonWheelDown})
-	if m.viewport.YOffset != atBottom {
-		t.Errorf("expected wheel-down to scroll back to the bottom, YOffset = %d (want %d)", m.viewport.YOffset, atBottom)
-	}
-}
-
 func TestHistorySkipsConsecutiveDuplicates(t *testing.T) {
 	m := newModel(nil)
 	m.messages = []*api.Message{
@@ -636,36 +608,6 @@ func TestPhantomLFAfterSubmitIsSwallowed(t *testing.T) {
 	}
 	if m.inputHeight != 1 {
 		t.Errorf("inputHeight = %d, want 1", m.inputHeight)
-	}
-}
-
-func TestMouseReportEscapeSequenceSwallowed(t *testing.T) {
-	m := newModel(nil)
-	// Enabling mouse capture can make terminals emit mouse-event
-	// reports or capability-response escape sequences as KeyRunes —
-	// with or without the leading ESC (0x1b) that terminals strip.
-	// These must be swallowed, not pasted into the input box.
-	for _, seq := range []string{
-		"[<64;110;75M", "[?1003h", "[?1006h",
-		"\x1b[<64;110;75M", "\x1b[?1003h",
-	} {
-		m.input.Reset()
-		_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(seq)})
-		if got := m.input.Value(); got != "" {
-			t.Errorf("escape sequence %q leaked into the input: %q", seq, got)
-		}
-	}
-	// A stray report whose first rune is a non-printable control char
-	// (no ESC) is also swallowed.
-	m.input.Reset()
-	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{0x01, 'x'}})
-	if got := m.input.Value(); got != "" {
-		t.Errorf("control-char report leaked into the input: %q", got)
-	}
-	// A normal runnable keystroke is not swallowed.
-	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
-	if got := m.input.Value(); got != "x" {
-		t.Errorf("normal rune leaked/swallowed: value = %q, want %q", got, "x")
 	}
 }
 
