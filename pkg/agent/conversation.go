@@ -2105,9 +2105,43 @@ func (c *Agent) DispatchToolCalls(ctx context.Context) error {
 				Result: result,
 			})
 		}
+		// Cap oversized tool output before it enters the session history so a
+		// massive stdout (e.g. kubectl get -A across many clusters) can't
+		// bloat the context and brick the session past the model's context
+		// limit. The full output was already delivered to the LLM via
+		// currChatContent above; the stored/Ui copy only needs to be
+		// representative.
+		payload = capToolResultOutput(payload)
 		c.addMessage(api.MessageSourceAgent, api.MessageTypeToolCallResponse, payload)
 	}
 	return nil
+}
+
+// maxToolOutputBytes is the cap on a single tool-call result's stdout/stderr
+// before it is stored in the session history. 16KB is enough to read the
+// head of a table/list and diagnose a failure without flooding context.
+const maxToolOutputBytes = 16 * 1024
+
+// capToolResultOutput truncates oversized stdout/stderr in a tool-call
+// result payload (a map[string]any from tools.ToolResultToMap) to
+// maxToolOutputBytes, appending a "[+N bytes truncated]" marker. String
+// payloads (shim observations) are capped too. Other payload shapes pass
+// through unchanged.
+func capToolResultOutput(payload any) any {
+	switch p := payload.(type) {
+	case string:
+		if len(p) > maxToolOutputBytes {
+			return p[:maxToolOutputBytes] + fmt.Sprintf("\n[+%d bytes truncated]\n", len(p)-maxToolOutputBytes)
+		}
+		return p
+	case map[string]any:
+		for _, k := range []string{"stdout", "stderr"} {
+			if s, ok := p[k].(string); ok && len(s) > maxToolOutputBytes {
+				p[k] = s[:maxToolOutputBytes] + fmt.Sprintf("\n[+%d bytes truncated]\n", len(s)-maxToolOutputBytes)
+			}
+		}
+	}
+	return payload
 }
 
 // The key idea is to treat all tool calls to be executed atomically or not
