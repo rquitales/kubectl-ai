@@ -954,6 +954,13 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.inChoiceMode {
 			return m, m.navigateList(tea.KeyUp)
 		}
+		// While the agent is running the input is disabled, so arrows are
+		// free: use them to line-scroll the transcript (PgUp/PgDn scroll
+		// half a page; this gives finer control while reading a reply).
+		if s := m.agentState(); s == api.AgentStateRunning || s == api.AgentStateInitializing {
+			m.viewport.ScrollUp(1)
+			return m, nil
+		}
 		// Within a multi-line draft, Up moves the cursor until the first
 		// line; from there (and for single-line drafts) it recalls older
 		// input history, like opencode and Claude Code. Transcript
@@ -966,6 +973,10 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyDown:
 		if m.inChoiceMode {
 			return m, m.navigateList(tea.KeyDown)
+		}
+		if s := m.agentState(); s == api.AgentStateRunning || s == api.AgentStateInitializing {
+			m.viewport.ScrollDown(1)
+			return m, nil
 		}
 		if m.input.LineCount() > 1 && m.input.Line() < m.input.LineCount()-1 {
 			m.input.CursorDown()

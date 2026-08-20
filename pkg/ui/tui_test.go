@@ -537,6 +537,38 @@ func TestUpDownRecallsHistory(t *testing.T) {
 	}
 }
 
+func TestUpDownLineScrollsTranscriptWhileRunning(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateRunning}}
+	m := newModel(a)
+	m.width, m.height = 100, 24
+	m.resize()
+	for i := 0; i < 50; i++ {
+		m.messages = append(m.messages, &api.Message{
+			Source: api.MessageSourceModel, Type: api.MessageTypeText,
+			Payload: fmt.Sprintf("line %d", i), Timestamp: time.Now(),
+		})
+	}
+	m.dirty = true
+	m.refresh()
+	m.viewport.GotoBottom()
+	atBottom := m.viewport.YOffset
+
+	// Up scrolls the transcript up by one line (not the input history).
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyUp})
+	if m.viewport.YOffset >= atBottom {
+		t.Errorf("expected Up to scroll the transcript up while running, YOffset = %d (bottom %d)", m.viewport.YOffset, atBottom)
+	}
+	if got := m.input.Value(); got != "" {
+		t.Errorf("Up while running must not touch the input draft, got %q", got)
+	}
+
+	// Down scrolls back down.
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyDown})
+	if m.viewport.YOffset != atBottom {
+		t.Errorf("expected Down to scroll back to the bottom while running, YOffset = %d (want %d)", m.viewport.YOffset, atBottom)
+	}
+}
+
 func TestHistorySkipsConsecutiveDuplicates(t *testing.T) {
 	m := newModel(nil)
 	m.messages = []*api.Message{
