@@ -822,6 +822,65 @@ func TestSlashHelpPrintsReferenceLocally(t *testing.T) {
 	}
 }
 
+func TestSlashMCPPrintsDetailsLocally(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{
+		ID:         "test",
+		AgentState:  api.AgentStateIdle,
+		MCPStatus: &api.MCPStatus{
+			TotalServers:   2,
+			ConnectedCount: 1,
+			FailedCount:    1,
+			ServerInfoList: []api.ServerConnectionInfo{
+				{Name: "k8s-tools", IsConnected: true, AvailableTools: []api.MCPTool{{Name: "get-pods"}, {Name: "get-nodes"}}},
+				{Name: "broken-server", IsConnected: false},
+			},
+		},
+	}}
+	m := newModel(a)
+	m.input.SetValue("/mcp")
+
+	_, cmd := m.handleEnter()
+	// /mcp is handled locally: no command is sent to the agent.
+	if cmd != nil {
+		select {
+		case got := <-a.Input:
+			t.Fatalf("/mcp must not reach the agent, got %v", got)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	// An MCP details message is appended to the transcript (query + details).
+	if len(m.messages) != 2 {
+		t.Fatalf("expected 2 transcript messages (query + mcp), got %d", len(m.messages))
+	}
+	detail, ok := m.messages[1].Payload.(string)
+	if !ok {
+		t.Fatalf("expected a string mcp payload, got %T", m.messages[1].Payload)
+	}
+	if !strings.Contains(detail, "MCP servers") || !strings.Contains(detail, "1/2 connected") {
+		t.Errorf("mcp text missing summary, got:\n%s", detail)
+	}
+	if !strings.Contains(detail, "k8s-tools") || !strings.Contains(detail, "broken-server") {
+		t.Errorf("mcp text missing server rows, got:\n%s", detail)
+	}
+	// /mcp is offered for autocomplete.
+	if !strings.Contains(strings.Join(slashCompletions("/m"), ","), "/mcp") {
+		t.Error("expected /mcp in slash autocomplete")
+	}
+}
+
+func TestSlashMCPUnconfigured(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.input.SetValue("/mcp")
+	_, _ = m.handleEnter()
+	if len(m.messages) != 2 {
+		t.Fatalf("expected 2 transcript messages, got %d", len(m.messages))
+	}
+	if got := m.messages[1].Payload.(string); !strings.Contains(got, "No MCP servers") {
+		t.Errorf("expected a no-MCP message when unconfigured, got:\n%s", got)
+	}
+}
+
 func TestShiftTabTogglesAutoMode(t *testing.T) {
 	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
 	m := newModel(a)

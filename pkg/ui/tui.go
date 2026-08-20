@@ -1737,6 +1737,13 @@ func (m *model) handleEnter() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// Intercept the /mcp command (handled locally, prints MCP server
+	// connection details into the transcript).
+	if v := strings.ToLower(value); v == "/mcp" {
+		m.appendLocalMessage(mcpStatusText(m.agent.GetSession()))
+		return m, nil
+	}
+
 	m.thinkStart = time.Now()
 
 	return m, func() tea.Msg {
@@ -2886,7 +2893,7 @@ func (m model) viewBottomDivider() string {
 var slashCommands = []string{
 	"/model", "/models", "/tools", "/sessions", "/session", "/new", "/save",
 	"/rename", "/resume", "/delete", "/delete-session", "/clear", "/exit",
-	"/quit", "/compact", "/context", "/namespace", "/ns", "/help",
+	"/quit", "/compact", "/context", "/namespace", "/ns", "/help", "/mcp",
 }
 
 // slashCompletions returns the commands matching the input prefix, or nil
@@ -2942,6 +2949,40 @@ func helpText() string {
 
 Type **!command** to run a shell command, or **@path** to attach a file.
 `
+}
+
+// mcpStatusText returns a markdown summary of the MCP server connection
+// status, printed to the transcript by the /mcp command. It details each
+// configured server's connection state and available tools — the full picture
+// behind the status-bar '🔌 N/M' indicator.
+func mcpStatusText(session *api.Session) string {
+	status := session.MCPStatus
+	if status == nil || status.TotalServers == 0 {
+		return "No MCP servers are configured."
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "## MCP servers\n\n")
+	fmt.Fprintf(&sb, "%d/%d connected", status.ConnectedCount, status.TotalServers)
+	if status.FailedCount > 0 {
+		fmt.Fprintf(&sb, " • %d failed", status.FailedCount)
+	}
+	fmt.Fprintf(&sb, "\n\n")
+	fmt.Fprintf(&sb, "| Server | Status | Tools |\n")
+	fmt.Fprintf(&sb, "| --- | --- | --- |\n")
+	for _, srv := range status.ServerInfoList {
+		name := srv.Name
+		if name == "" {
+			name = "(unnamed)"
+		}
+		state := "✗ disconnected"
+		if srv.IsConnected {
+			state = "✓ connected"
+		}
+		tools := fmt.Sprintf("%d", len(srv.AvailableTools))
+		fmt.Fprintf(&sb, "| %s | %s | %s |\n", name, state, tools)
+	}
+	return sb.String()
 }
 
 // lastToken returns the input's trailing whitespace-separated token
