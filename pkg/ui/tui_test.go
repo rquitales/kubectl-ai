@@ -2175,3 +2175,91 @@ func TestNamespaceAutocomplete(t *testing.T) {
 		t.Errorf("expected tab to cycle to the next namespace, got %q", second)
 	}
 }
+
+func TestFitHintsDropsLeastImportant(t *testing.T) {
+	hints := []string{"Enter: send", "Ctrl+P: commands", "Ctrl+C: quit"}
+	sep := " • "
+
+	// Everything fits.
+	got := fitHints(hints, sep, 100)
+	if len(got) != 3 {
+		t.Errorf("wide: got %d hints, want 3: %v", len(got), got)
+	}
+
+	// Only the first two fit; the least-important (quit) drops off, but the
+	// first two are preserved in priority order.
+	got = fitHints(hints, sep, lipgloss.Width("Enter: send")+lipgloss.Width(sep)+lipgloss.Width("Ctrl+P: commands"))
+	if len(got) != 2 || got[0] != "Enter: send" || got[1] != "Ctrl+P: commands" {
+		t.Errorf("narrow: got %v, want first two in order", got)
+	}
+
+	// Only the first fits.
+	got = fitHints(hints, sep, lipgloss.Width("Enter: send"))
+	if len(got) != 1 || got[0] != "Enter: send" {
+		t.Errorf("very narrow: got %v, want only the first", got)
+	}
+
+	// Nothing fits at all.
+	got = fitHints(hints, sep, 0)
+	if got != nil {
+		t.Errorf("zero width: got %v, want nil", got)
+	}
+}
+
+func TestViewHelpNeverWraps(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+
+	for _, w := range []int{20, 30, 40, 60, 80, 120, 200} {
+		m.width = w
+		help := m.viewHelp(api.AgentStateIdle)
+		// The help bar is styled with bottom padding (one blank row under it),
+		// so the invariant is that the *content* never wraps: its rendered
+		// width must not exceed the terminal width. The leading/trailing
+		// padding (2 + 2) is included in the rendered width.
+		if got := lipgloss.Width(help); got > w {
+			t.Errorf("width=%d: rendered help width %d exceeds terminal (wrapped):\n%s", w, got, help)
+		}
+		// The primary action is always present, even on the narrowest terminal.
+		if !strings.Contains(help, "Enter: send") {
+			t.Errorf("width=%d: expected 'Enter: send' to survive, got:\n%s", w, help)
+		}
+	}
+}
+
+func TestViewHelpWideShowsAllHints(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.width, m.height = 200, 40
+	m.resize()
+	// Fill the transcript so the scroll hint is added.
+	for i := 0; i < 50; i++ {
+		m.messages = append(m.messages, &api.Message{
+			Source: api.MessageSourceModel, Type: api.MessageTypeText,
+			Payload: fmt.Sprintf("line %d", i), Timestamp: time.Now(),
+		})
+	}
+	m.dirty = true
+	m.refresh()
+	m.viewport.GotoBottom()
+
+	help := m.viewHelp(api.AgentStateIdle)
+	for _, want := range []string{"Enter: send", "Ctrl+P: commands", "Ctrl+C: quit", "Shift+Tab: auto", "PgUp/PgDn: scroll"} {
+		if !strings.Contains(help, want) {
+			t.Errorf("wide terminal: expected %q in help, got:\n%s", want, help)
+		}
+	}
+}
+
+func TestViewHelpRunningShowsCancel(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.width = 60
+	help := m.viewHelp(api.AgentStateRunning)
+	if !strings.Contains(help, "Ctrl+C: cancel") {
+		t.Errorf("running: expected cancel hint, got:\n%s", help)
+	}
+	if strings.Contains(help, "Enter: send") {
+		t.Errorf("running: must not show the idle send hint, got:\n%s", help)
+	}
+}

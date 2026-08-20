@@ -2655,6 +2655,10 @@ func (m model) inputBox() lipgloss.Style {
 }
 
 func (m model) viewHelp(state api.AgentState) string {
+	// Each entry is a key hint. They are ordered by importance: the most
+	// essential bindings come first, so as the terminal narrows the less
+	// critical ones drop off and the bar never wraps into an ugly
+	// multi-line mess.
 	var hints []string
 	switch {
 	case m.browserOpen:
@@ -2662,14 +2666,53 @@ func (m model) viewHelp(state api.AgentState) string {
 	case m.inChoiceMode:
 		hints = []string{"↑/↓: navigate", "Enter: select", "Ctrl+C: quit"}
 	case state == api.AgentStateRunning:
-		hints = []string{"Ctrl+C: cancel"}
+		hints = []string{"Ctrl+C: cancel", "Esc: interrupt"}
 	default:
-		hints = []string{"Enter: send", "Ctrl+J: newline", "Ctrl+P: commands", "↑/↓: history", "Ctrl+L: clear screen", "Ctrl+Y: copy", "Ctrl+O: expand", "Shift+Tab: auto", "Esc: clear/stop", "Ctrl+C: quit"}
+		hints = []string{
+			"Enter: send", "Ctrl+P: commands", "↑/↓: history",
+			"Ctrl+J: newline", "Ctrl+L: clear", "Ctrl+Y: copy",
+			"Ctrl+O: expand", "Shift+Tab: auto", "Esc: clear/stop",
+			"Ctrl+C: quit",
+		}
 		if m.viewport.TotalLineCount() > m.viewport.Height {
 			hints = append(hints, "PgUp/PgDn: scroll")
 		}
 	}
-	return dimStyle.Padding(0, 2, 1, 2).Render(strings.Join(hints, " • "))
+	// Fit the hints to the available width, dropping the least-important
+	// trailing ones when they would cause a wrap. The padding (left+right=4)
+	// and the separators (" • ") are accounted for.
+	sep := " • "
+	avail := max(m.width-4, 0)
+	fitted := fitHints(hints, sep, avail)
+	if len(fitted) == 0 && len(hints) > 0 {
+		// Even the first hint doesn't fit: show it truncated rather than an
+		// empty bar, so the primary action is always discoverable.
+		fitted = []string{truncateRunes(hints[0], max(avail, 1))}
+	}
+	return dimStyle.Padding(0, 2, 1, 2).Render(strings.Join(fitted, sep))
+}
+
+// fitHints greedily selects hints from the front of the slice so the joined
+// string (with sep between entries) fits within width. It preserves priority
+// order: the first/most-important hints are kept and trailing ones drop off.
+func fitHints(hints []string, sep string, width int) []string {
+	if width <= 0 || len(hints) == 0 {
+		return nil
+	}
+	var out []string
+	used := 0
+	for _, h := range hints {
+		extra := lipgloss.Width(h)
+		if len(out) > 0 {
+			extra += lipgloss.Width(sep)
+		}
+		if used+extra > width {
+			break
+		}
+		used += extra
+		out = append(out, h)
+	}
+	return out
 }
 
 // formatRelativeTime renders t as a short relative duration like "5m ago".
