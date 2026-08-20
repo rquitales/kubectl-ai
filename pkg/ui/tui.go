@@ -452,7 +452,13 @@ func newModel(agent *agent.Agent) model {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(textarea.Blink, m.spinner.Tick, m.tick())
+	// Enable mouse cell-motion capture so the scroll wheel scrolls the
+	// transcript. Disable it when quitting so the terminal stops sending
+	// mouse reports (which otherwise leak as literal text after exit).
+	return tea.Batch(
+		textarea.Blink, m.spinner.Tick, m.tick(),
+		tea.EnableMouseCellMotion,
+	)
 }
 
 func (m model) tick() tea.Cmd {
@@ -469,6 +475,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		return m.handleKey(msg)
+
+	case tea.MouseMsg:
+		return m.handleMouse(msg)
 
 	case *api.Message:
 		return m.handleAgentMsg(msg)
@@ -806,6 +815,19 @@ func (m *model) navigateList(keyType tea.KeyType) tea.Cmd {
 	return cmd
 }
 
+// handleMouse routes mouse events: the scroll wheel scrolls the
+// transcript viewport. Other mouse events (clicks, motion) are ignored.
+func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	const wheelStep = 3
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		m.viewport.ScrollUp(wheelStep)
+	case tea.MouseButtonWheelDown:
+		m.viewport.ScrollDown(wheelStep)
+	}
+	return m, nil
+}
+
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.justSubmitted {
 		m.justSubmitted = false
@@ -838,7 +860,10 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyCtrlC, tea.KeyCtrlD:
 		m.quitting = true
-		return m, tea.Quit
+		// Disable mouse capture on quit so the terminal stops sending SGR
+		// mouse reports (which would otherwise leak as literal text after
+		// the program exits and the renderer is no longer consuming them).
+		return m, tea.Batch(tea.Quit, tea.DisableMouse)
 	case tea.KeyEsc:
 		return m.handleEsc()
 	case tea.KeyCtrlL:
