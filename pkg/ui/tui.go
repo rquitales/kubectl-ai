@@ -2120,7 +2120,11 @@ func (m model) renderToolGroup(req, resp *api.Message, w int) string {
 	if failed {
 		marker, headStyle = "✗ ", errorText
 	}
-	header := headStyle.Render(marker + truncateRunes(cmd, max(w-4, 20)))
+	// Render the marker and command without pre-truncating; the toolBox width
+	// wraps the content so a long path or URL stays fully visible instead of
+	// being cut to "…". The body is joined after a newline so it wraps as its
+	// own line(s) under the command.
+	header := headStyle.Render(marker + cmd)
 
 	body := m.renderToolResult(resp)
 	if strings.TrimSpace(body) == "" {

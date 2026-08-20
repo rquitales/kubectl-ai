@@ -1598,6 +1598,25 @@ func TestRenderToolGroupPairedRequestAndResult(t *testing.T) {
 	}
 }
 
+func TestRenderToolGroupWrapsLongCommand(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+
+	long := "kubectl apply -f https://raw.githubusercontent.com/example-org/manifests/main/big-deployment-with-long-name.yaml"
+	req := &api.Message{Type: api.MessageTypeToolCallRequest, Payload: long}
+	resp := &api.Message{Type: api.MessageTypeToolCallResponse, Payload: map[string]any{"stdout": "pod created\n"}}
+
+	got := m.renderToolGroup(req, resp, 90)
+	// The tail of the command (the part truncation would have eaten) is visible
+	// because the command wraps rather than being cut to "…".
+	if !strings.Contains(got, "deployment-with-long-name.yaml") {
+		t.Errorf("expected the long command to wrap and keep its tail visible, got:\n%s", got)
+	}
+	if strings.Contains(got, "…") {
+		t.Errorf("expected no truncation ellipsis on a wrapped long command, got:\n%s", got)
+	}
+}
+
 func TestRenderToolGroupEmptyResultKeepsHeader(t *testing.T) {
 	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
 	m := newModel(a)
