@@ -1428,6 +1428,13 @@ func (c *Agent) compactConversation(ctx context.Context) (answer string, handled
 		Payload:   "⏳ Compacting conversation…",
 		Timestamp: time.Now(),
 	}
+	// Flip to Running so the TUI shows the spinner (and the bottom-divider
+	// scroll cue) during the summarization call, then back to Done so the
+	// input box returns.
+	c.setAgentState(api.AgentStateRunning)
+	defer func() {
+		c.setAgentState(api.AgentStateDone)
+	}()
 
 	completion, err := c.LLM.GenerateCompletion(ctx, &gollm.CompletionRequest{
 		Model:  c.Model,
