@@ -360,6 +360,8 @@ type model struct {
 	// Session browser state
 	browserOpen     bool
 	browserSessions []api.SessionInfo
+	allBrowserSessions []api.SessionInfo // full set; browserSessions is the filtered view
+	browserFilter    string              // substring filter applied to allBrowserSessions
 	browserIndex    int
 	browserStatus   browserStatusMsg // transient info/error shown in the browser footer
 	renaming        bool
@@ -609,17 +611,21 @@ func (m *model) openBrowser(sessions []api.SessionInfo) {
 		selectedID = s.ID
 	}
 
-	m.browserSessions = sessions
+	m.allBrowserSessions = sessions
+	if !m.browserOpen {
+		// Opening fresh: clear any prior filter. A refresh keeps it.
+		m.browserFilter = ""
+		m.browserStatus = browserStatusMsg{}
+		m.renaming = false
+	}
+	m.applyBrowserFilter()
+	// Select the previously-selected session within the filtered view.
 	m.browserIndex = 0
-	for i, s := range sessions {
+	for i, s := range m.browserSessions {
 		if s.ID == selectedID {
 			m.browserIndex = i
 			break
 		}
-	}
-	if !m.browserOpen {
-		m.browserStatus = browserStatusMsg{}
-		m.renaming = false
 	}
 	m.browserOpen = true
 	m.dirty = true
@@ -627,11 +633,41 @@ func (m *model) openBrowser(sessions []api.SessionInfo) {
 	m.viewport.GotoBottom()
 }
 
+// applyBrowserFilter recomputes browserSessions (the filtered view) from
+// allBrowserSessions (the full set) using the current browserFilter. A
+// session matches when the filter is a substring of its name, ID, or
+// first-message preview (case-insensitive).
+func (m *model) applyBrowserFilter() {
+	filter := strings.ToLower(m.browserFilter)
+	if filter == "" {
+		m.browserSessions = m.allBrowserSessions
+		return
+	}
+	var matched []api.SessionInfo
+	for _, s := range m.allBrowserSessions {
+		if sessionMatchesFilter(s, filter) {
+			matched = append(matched, s)
+		}
+	}
+	m.browserSessions = matched
+}
+
+// sessionMatchesFilter reports whether s matches the case-insensitive
+// substring filter on its name, ID, or first-message preview.
+func sessionMatchesFilter(s api.SessionInfo, filter string) bool {
+	return strings.Contains(strings.ToLower(s.Name), filter) ||
+		strings.Contains(strings.ToLower(s.ID), filter) ||
+		strings.Contains(strings.ToLower(s.FirstMessage), filter)
+}
+
 // closeBrowser closes the session browser.
 func (m *model) closeBrowser() {
 	m.browserOpen = false
 	m.renaming = false
 	m.browserStatus = browserStatusMsg{}
+	m.browserFilter = ""
+	m.allBrowserSessions = nil
+	m.browserSessions = nil
 	m.updateViewportHeight()
 }
 
@@ -1529,6 +1565,14 @@ func (m *model) handleBrowserKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	switch msg.Type {
 	case tea.KeyEsc:
+		// Esc clears an active filter; only with no filter does it close.
+		if m.browserFilter != "" {
+			m.browserFilter = ""
+			m.applyBrowserFilter()
+			m.browserIndex = 0
+			m.dirty = true
+			return m, nil
+		}
 		m.closeBrowser()
 		return m, nil
 	case tea.KeyUp:
@@ -1554,8 +1598,24 @@ func (m *model) handleBrowserKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.agent.Input <- &api.SessionPickerResponse{SessionID: selectedID}
 			return nil
 		}
+	case tea.KeyBackspace:
+		// Edit the filter: drop the last character and re-apply.
+		if m.browserFilter != "" {
+			m.browserFilter = m.browserFilter[:len(m.browserFilter)-1]
+			m.applyBrowserFilter()
+			if m.browserIndex >= len(m.browserSessions) {
+				m.browserIndex = max(len(m.browserSessions)-1, 0)
+			}
+			m.dirty = true
+		}
+		return m, nil
 	}
 
+	// r, d, ctrl+n, j, k are reserved browser commands (rename, delete, new,
+	// navigate). They never filter, so typing them won't start a search —
+	// but every other printable character does (letters, digits, punctuation),
+	// like an fzf-style picker. This keeps destructive keys safe while letting
+	// users filter by ordinary text.
 	switch msg.String() {
 	case "k":
 		m.moveBrowserSelection(-1)
@@ -1591,8 +1651,35 @@ func (m *model) handleBrowserKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.setBrowserStatus(fmt.Sprintf("Delete %q? (y to confirm)", label), true)
 			return m, nil
 		}
+	default:
+		// Any other printable character filters the session list.
+		if r := msg.String(); r != "" && isPrintableBrowserRune(r) {
+			m.appendBrowserFilter(r)
+		}
 	}
 	return m, nil
+}
+
+// appendBrowserFilter appends a character to the filter and re-applies it,
+// clamping the selection to the filtered list.
+func (m *model) appendBrowserFilter(r string) {
+	m.browserFilter += r
+	m.applyBrowserFilter()
+	if m.browserIndex >= len(m.browserSessions) {
+		m.browserIndex = max(len(m.browserSessions)-1, 0)
+	}
+	m.dirty = true
+}
+
+// isPrintableBrowserRune reports whether r is a single printable character
+// suitable for the filter input (letters, digits, punctuation — not
+// control sequences or multi-char bindings).
+func isPrintableBrowserRune(r string) bool {
+	if len([]rune(r)) != 1 {
+		return false
+	}
+	c := []rune(r)[0]
+	return c >= 0x20 && c < 0x7f
 }
 
 func (m *model) moveBrowserSelection(delta int) {
@@ -2595,7 +2682,11 @@ func (m model) viewSessionBrowser() string {
 	sb.WriteString("\n\n")
 
 	if len(m.browserSessions) == 0 {
-		sb.WriteString(mutedStyle.Render("  No sessions found."))
+		if m.browserFilter != "" {
+			sb.WriteString(mutedStyle.Render(fmt.Sprintf("  No sessions match %q", m.browserFilter)))
+		} else {
+			sb.WriteString(mutedStyle.Render("  No sessions found."))
+		}
 		sb.WriteString("\n")
 	} else {
 		currentID := ""
@@ -2650,11 +2741,16 @@ func (m model) viewSessionBrowser() string {
 			sb.WriteString(successText.Render(m.browserStatus.text))
 		}
 	default:
-		hint := "↑/↓/j/k: navigate • enter: switch • r: rename • d: delete • ctrl+n: new • esc: close"
-		if len(m.browserSessions) > m.browserRows() {
+		hint := "↑/↓/j/k: navigate • type to filter • enter: switch • r: rename • d: delete • ctrl+n: new • esc: close"
+		if m.browserFilter != "" {
+			hint = fmt.Sprintf("filter: %q  (%d match%s, backspace: edit • esc: clear)",
+				m.browserFilter, len(m.browserSessions), pluralS(len(m.browserSessions)))
+		} else if len(m.browserSessions) > m.browserRows() {
 			hint += fmt.Sprintf(" • %d/%d", m.browserIndex+1, len(m.browserSessions))
 		}
-		sb.WriteString(dimStyle.Render(hint))
+		// The hint must stay on one line so the browser frame fits small terminals;
+		// truncate to the box's inner width (border + padding = 4).
+		sb.WriteString(dimStyle.Render(truncateRunes(hint, max(m.width-6, 10))))
 	}
 
 	return lipgloss.NewStyle().Padding(0, 1).Render(
