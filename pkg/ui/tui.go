@@ -2077,6 +2077,13 @@ func (m *model) handleAgentMsg(msg *api.Message) (tea.Model, tea.Cmd) {
 	if session.AgentState == api.AgentStateRunning || session.AgentState == api.AgentStateInitializing {
 		return m, m.spinner.Tick
 	}
+
+	// A turn just finished (idle/done). A /context or /namespace meta
+	// command may have changed the active kubeconfig override; refresh
+	// the status bar's kube context immediately instead of waiting up to
+	// kubeContextTTL for the next tick.
+	m.resolveKubeContext()
+
 	return m, nil
 }
 

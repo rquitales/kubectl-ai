@@ -2326,6 +2326,42 @@ func TestResolveKubeContextPrefersAgentPath(t *testing.T) {
 	}
 }
 
+func TestKubeContextRefreshesAfterTurn(t *testing.T) {
+	// Start with a kubeconfig pointing at "agent-context".
+	path := writeKubeConfig(t, "agent-context", true)
+	store := sessions.NewInMemoryChatStore()
+	a := &agent.Agent{
+		Session:        &api.Session{ID: "test", AgentState: api.AgentStateRunning, ChatMessageStore: store},
+		Kubeconfig:     path,
+	}
+	m := newModel(a)
+	m.width, m.height = 100, 40
+	m.resize()
+	if m.kubeContext.context != "agent-context" {
+		t.Fatalf("precondition: expected agent-context at startup, got %q", m.kubeContext.context)
+	}
+
+	// Simulate a /context switch: rewrite the kubeconfig to a new context,
+	// then deliver the agent's "Switched to context" text message with the
+	// session going done — exactly what handleAgentMsg sees.
+	newPath := writeKubeConfig(t, "new-context", true)
+	a.Kubeconfig = newPath
+	switched := &api.Message{
+		Source:    api.MessageSourceAgent,
+		Type:      api.MessageTypeText,
+		Payload:   "Switched to context `new-context` (session only — global kubeconfig unchanged).",
+		Timestamp: time.Now(),
+	}
+	a.Session.AgentState = api.AgentStateDone
+	m.handleAgentMsg(switched)
+
+	// The status bar reflects the new context immediately, without waiting
+	// for the kubeContextTTL tick.
+	if m.kubeContext.context != "new-context" {
+		t.Errorf("expected the kube context to refresh after the turn, got %q", m.kubeContext.context)
+	}
+}
+
 func TestViewStatusShowsKubeContext(t *testing.T) {
 	a := &agent.Agent{Session: &api.Session{ID: "test", ModelID: "m", AgentState: api.AgentStateIdle}}
 	m := newModel(a)
