@@ -2775,12 +2775,21 @@ func (m model) viewSessionBrowser() string {
 				}
 			}
 			meta := fmt.Sprintf("%s • %d msgs • %s", s.ModelID, s.MessageCount, formatRelativeTime(s.LastModified))
-			if s.ID == currentID {
+			isCurrent := s.ID == currentID
+			if isCurrent {
 				meta = "current • " + meta
 			}
 
 			if i == m.browserIndex {
-				sb.WriteString(primaryText.Render("> "+name) + "  " + dimStyle.Render(meta))
+				// The selected row gets a "> " cursor; the current session
+				// also gets a "●" marker so it's obvious at a glance.
+				marker := "> "
+				if isCurrent {
+					marker = "●> "
+				}
+				sb.WriteString(primaryText.Render(marker+name) + "  " + dimStyle.Render(meta))
+			} else if isCurrent {
+				sb.WriteString(successText.Render("● ") + nameStyle.Render(name) + "  " + dimStyle.Render(meta))
 			} else {
 				sb.WriteString("  " + nameStyle.Render(name) + "  " + dimStyle.Render(meta))
 			}
