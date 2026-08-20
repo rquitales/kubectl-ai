@@ -1961,6 +1961,52 @@ func TestShellModeStyling(t *testing.T) {
 	}
 }
 
+func TestAutoModeWarningBorderIdle(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.width, m.height = 100, 40
+	m.resize()
+
+	// Auto mode off: the idle input border is the primary color.
+	if got := m.inputBox().GetBorderTopForeground(); got != colorPrimary {
+		t.Errorf("auto-off border = %v, want colorPrimary %v", got, colorPrimary)
+	}
+
+	// Turn auto mode on: the border switches to warning so it's unmistakable.
+	if !a.ToggleSkipPermissions() {
+		t.Fatal("expected ToggleSkipPermissions to enable auto mode")
+	}
+	if got := m.inputBox().GetBorderTopForeground(); got != colorWarning {
+		t.Errorf("auto-on border = %v, want colorWarning %v", got, colorWarning)
+	}
+
+	// The rendered idle input box carries the warning border (asserted via
+	// the style directly — lipgloss strips ANSI codes in non-terminal tests,
+	// so the rendered string can't be compared for color).
+}
+
+func TestAutoModeWarningBorderRunning(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateRunning}}
+	m := newModel(a)
+	m.width, m.height = 100, 40
+	m.resize()
+
+	// While running with auto mode off, the (dim) running box uses the dim
+	// border.
+	if got := m.runningBox().GetBorderTopForeground(); got != colorDim {
+		t.Errorf("auto-off running border = %v, want colorDim %v", got, colorDim)
+	}
+
+	// While running with auto mode on, the running box keeps the warning
+	// border so auto mode is still visible during execution.
+	if !a.ToggleSkipPermissions() {
+		t.Fatal("expected ToggleSkipPermissions to enable auto mode")
+	}
+	if got := m.runningBox().GetBorderTopForeground(); got != colorWarning {
+		t.Errorf("auto-on running border = %v, want colorWarning %v", got, colorWarning)
+	}
+}
+
 func writeFiles(t *testing.T, dir string, names ...string) {
 	t.Helper()
 	for _, n := range names {

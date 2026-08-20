@@ -2607,7 +2607,7 @@ func (m model) viewInput(state api.AgentState) string {
 			elapsed = " " + formatDuration(time.Since(m.thinkStart))
 		}
 		content := primaryText.Render(m.spinner.View()+" Thinking...") + mutedStyle.Render(elapsed)
-		return lipgloss.NewStyle().Padding(0, 1).Render(inputBoxDim.Width(m.width - 4).Render(content))
+		return lipgloss.NewStyle().Padding(0, 1).Render(m.runningBox().Width(m.width - 4).Render(content))
 	}
 
 	// The textarea has a fixed internal height; show only as many lines as
@@ -2645,13 +2645,29 @@ func (m model) viewInput(state api.AgentState) string {
 	return lipgloss.NewStyle().Padding(0, 1).Render(m.inputBox().Width(m.width - 4).Render(content))
 }
 
-// inputBox returns the input box style: a warning-colored border for `!`
-// shell escape commands, primary otherwise.
+// inputBox returns the input box style. The border is warning-colored when
+// auto-accept mode is on (so it's unmistakable that commands will run without
+// approval — like Claude Code's yellow auto border) or for `!` shell escape
+// commands, primary otherwise.
 func (m model) inputBox() lipgloss.Style {
 	if m.shellMode() {
 		return inputBox.BorderForeground(colorWarning)
 	}
+	if m.agent != nil && m.agent.SkipPermissionsEnabled() {
+		return inputBox.BorderForeground(colorWarning)
+	}
 	return inputBox
+}
+
+// runningBox returns the dimmed box style shown while the agent is running.
+// Like inputBox, it uses the warning border when auto-accept mode is on, so
+// the "commands run without approval" cue stays visible during execution
+// rather than reverting to a plain dim border.
+func (m model) runningBox() lipgloss.Style {
+	if m.agent != nil && m.agent.SkipPermissionsEnabled() {
+		return inputBoxDim.BorderForeground(colorWarning)
+	}
+	return inputBoxDim
 }
 
 func (m model) viewHelp(state api.AgentState) string {
