@@ -647,6 +647,18 @@ func TestBrowserOpensWithCurrentSessionSelected(t *testing.T) {
 	}
 }
 
+func TestBrowserMarksCurrentSessionWithIcon(t *testing.T) {
+	m := newBrowserModel()
+	m.openBrowser(testSessions())
+
+	got := m.viewSessionBrowser()
+	// The current session (s2) is marked with a "●" icon so it's obvious at a
+	// glance, not just buried in the meta text.
+	if !strings.Contains(got, "●") {
+		t.Errorf("expected a ● current-session marker, got:\n%s", got)
+	}
+}
+
 func TestBrowserNavigationWraps(t *testing.T) {
 	m := newBrowserModel()
 	m.openBrowser(testSessions())
