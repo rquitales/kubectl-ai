@@ -1417,6 +1417,18 @@ func (c *Agent) compactConversation(ctx context.Context) (answer string, handled
 		conversation = conversation[len(conversation)-maxTranscriptBytes:]
 	}
 
+	// Surface an ephemeral status message so the user sees the compact is
+	// in progress (the summarization LLM call can take a few seconds and
+	// otherwise appears to hang with no feedback). It goes straight to the
+	// output channel and is NOT stored, so an LLM error leaves the history
+	// intact and the message vanishes on the next snapshot.
+	c.Output <- &api.Message{
+		Source:    api.MessageSourceAgent,
+		Type:      api.MessageTypeText,
+		Payload:   "⏳ Compacting conversation…",
+		Timestamp: time.Now(),
+	}
+
 	completion, err := c.LLM.GenerateCompletion(ctx, &gollm.CompletionRequest{
 		Model:  c.Model,
 		Prompt: "Summarize this conversation concisely for continuing the task. Keep key facts, decisions, and current state:\n\n" + conversation,

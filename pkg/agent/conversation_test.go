@@ -1053,7 +1053,7 @@ func TestCompactConversation(t *testing.T) {
 			return nil
 		})
 
-	a := &Agent{LLM: llm, llmChat: chat, Model: "test-model", Output: make(chan any, 1)}
+	a := &Agent{LLM: llm, llmChat: chat, Model: "test-model", Output: make(chan any, 2)}
 	a.Session = &api.Session{ChatMessageStore: store}
 
 	ans, handled, err := a.handleMetaQuery(ctx, "/compact")
