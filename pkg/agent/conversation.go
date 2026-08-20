@@ -296,7 +296,7 @@ func (s *Agent) Init(ctx context.Context) error {
 	log := klog.FromContext(ctx)
 
 	s.Input = make(chan any, 10)
-	s.Output = make(chan any, 10)
+	s.Output = make(chan any, 64)
 	s.currIteration = 0
 	s.allowedTools = map[string]bool{}
 	// when we support session, we will need to initialize this with the
@@ -447,6 +447,12 @@ func (s *Agent) rebuildChat(ctx context.Context) error {
 
 	return nil
 }
+
+// streamDeltaInterval is the minimum spacing between live text-delta
+// emissions. Fast providers can produce a chunk every few milliseconds;
+// unthrottled, that backpressures the buffered UI output channel and stalls
+// the whole run (the TUI renders a frame per message received).
+const streamDeltaInterval = 150 * time.Millisecond
 
 // deriveSessionName builds a short session name from the first real user
 // message (skipping slash commands and bare meta commands), so the name
@@ -864,6 +870,7 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 				// text message share one ID, so UIs can update the streaming
 				// entry in place and finally replace it with the stored message.
 				streamID := uuid.New().String()
+				lastDeltaEmit := time.Time{}
 
 				for response, err := range stream {
 					if err != nil {
@@ -899,15 +906,20 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 						if text, ok := part.AsText(); ok {
 							log.Info("text response", "text", text)
 							streamedText += text
-							// Stream the accumulated text live. Deltas are
-							// ephemeral: they go straight to the output channel
-							// and are never stored in the session.
-							c.Output <- &api.Message{
-								ID:        streamID,
-								Source:    api.MessageSourceModel,
-								Type:      api.MessageTypeTextDelta,
-								Payload:   streamedText,
-								Timestamp: time.Now(),
+							// Stream the accumulated text live, throttled to
+							// streamDeltaInterval so a fast provider can't
+							// backpressure the UI channel and stall the run.
+							// Deltas are ephemeral: they go straight to the
+							// output channel and are never stored.
+							if time.Since(lastDeltaEmit) >= streamDeltaInterval {
+								lastDeltaEmit = time.Now()
+								c.Output <- &api.Message{
+									ID:        streamID,
+									Source:    api.MessageSourceModel,
+									Type:      api.MessageTypeTextDelta,
+									Payload:   streamedText,
+									Timestamp: time.Now(),
+								}
 							}
 						}
 

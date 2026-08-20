@@ -451,6 +451,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if time.Since(m.kubeContextLast) > kubeContextTTL {
 			m.resolveKubeContext()
 		}
+		// Keep the spinner alive while the agent is running, even when no
+		// other messages are arriving (e.g. during quiet stretches between
+		// live text deltas, without spawning per-chunk tick chains).
+		if m.agentState() == api.AgentStateRunning || m.agentState() == api.AgentStateInitializing {
+			m.spinner, _ = m.spinner.Update(msg)
+		}
 		return m, m.tick()
 
 	case sessionListMsg:
