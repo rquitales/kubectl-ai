@@ -1648,7 +1648,8 @@ func TestRenderMessagesLoneToolRequestShowsRunning(t *testing.T) {
 	m.width, m.height = 100, 40
 	m.resize()
 
-	// A request whose result has not arrived yet renders standalone.
+	// A request whose result has not arrived yet renders standalone with a
+	// live spinner frame (not a static "Running" label).
 	m.messages = []*api.Message{
 		{Source: api.MessageSourceModel, Type: api.MessageTypeToolCallRequest, Payload: "kubectl get nodes", Timestamp: time.Now()},
 	}
@@ -1658,8 +1659,33 @@ func TestRenderMessagesLoneToolRequestShowsRunning(t *testing.T) {
 	if !strings.Contains(got, "kubectl get nodes") {
 		t.Errorf("expected the command, got:\n%s", got)
 	}
-	if !strings.Contains(got, "Running") {
-		t.Errorf("expected a 'Running' indicator for an in-flight call, got:\n%s", got)
+	// The MiniDot spinner's first frame is ⠋; the in-flight call shows it
+	// inside the tool box (a rounded border) instead of a literal word.
+	if !strings.Contains(got, "⠋") {
+		t.Errorf("expected a live spinner frame for an in-flight call, got:\n%s", got)
+	}
+	if strings.Contains(got, "Running") {
+		t.Errorf("an in-flight call must not show the static 'Running' label, got:\n%s", got)
+	}
+}
+
+func TestHasInFlightToolCall(t *testing.T) {
+	m := newModel(nil)
+	if m.hasInFlightToolCall() {
+		t.Error("expected no in-flight call with no messages")
+	}
+	// A trailing tool-call request with no response is in-flight.
+	m.messages = []*api.Message{
+		{Type: api.MessageTypeText, Payload: "hi"},
+		{Type: api.MessageTypeToolCallRequest, Payload: "kubectl get pods"},
+	}
+	if !m.hasInFlightToolCall() {
+		t.Error("expected an in-flight call when the last message is a tool-call request")
+	}
+	// A tool-call request followed by its response is NOT in-flight.
+	m.messages = append(m.messages, &api.Message{Type: api.MessageTypeToolCallResponse, Payload: "ok"})
+	if m.hasInFlightToolCall() {
+		t.Error("expected no in-flight call once the response has arrived")
 	}
 }
 

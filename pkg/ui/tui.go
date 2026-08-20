@@ -467,6 +467,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// live text deltas, without spawning per-chunk tick chains).
 		if m.agentState() == api.AgentStateRunning || m.agentState() == api.AgentStateInitializing {
 			m.spinner, _ = m.spinner.Update(msg)
+			// An in-flight tool call renders the live spinner in the
+			// transcript; re-render so it advances each tick instead of
+			// freezing on a single frame.
+			if m.hasInFlightToolCall() {
+				m.dirty = true
+				m.refresh()
+				atBottom := m.viewport.AtBottom()
+				if atBottom {
+					m.viewport.GotoBottom()
+				}
+			}
 		}
 		return m, m.tick()
 
@@ -2076,8 +2087,20 @@ func (m model) renderToolCall(msg *api.Message, w int) string {
 	if !ok {
 		return ""
 	}
-	content := successText.Render("⚡ Running") + " " + dimStyle.Render("·") + " " + textStyle.Render(payload)
+	// An in-flight call (no result yet) shows the live spinner rather than a
+	// static icon, so it reads as actively running — like Claude Code.
+	content := successText.Render(m.spinner.View()) + " " + dimStyle.Render("·") + " " + textStyle.Render(payload)
 	return toolBox.Width(w).Render(content) + "\n"
+}
+
+// hasInFlightToolCall reports whether the transcript ends with a tool-call
+// request whose result hasn't arrived yet (the entry the spinner animates on).
+func (m model) hasInFlightToolCall() bool {
+	if len(m.messages) == 0 {
+		return false
+	}
+	last := m.messages[len(m.messages)-1]
+	return last.Type == api.MessageTypeToolCallRequest
 }
 
 // renderToolGroup renders a tool-call request and its result as a single
