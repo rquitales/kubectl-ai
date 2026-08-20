@@ -2695,7 +2695,11 @@ func (m model) renderError(msg *api.Message, w int) string {
 	if !ok {
 		return ""
 	}
-	content := errorText.Render("✗ Error") + "\n" + errorText.Render(payload)
+	// Wrap the error body to the box's inner width (border + padding = 4) so a
+	// long multi-line error (kubectl output, a stack trace) wraps instead of
+	// overflowing the box.
+	body := errorText.Width(max(w-4, 10)).Render(payload)
+	content := errorText.Render("✗ Error") + "\n" + body
 	return errorBox.Width(w).Render(content) + "\n"
 }
 
