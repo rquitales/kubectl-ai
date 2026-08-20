@@ -2006,6 +2006,50 @@ func TestTextDeltaThrottlesViewportRefresh(t *testing.T) {
 	}
 }
 
+func TestTextDeltaShowsLiveCursorWhileRunning(t *testing.T) {
+	m, _ := newStreamModel() // AgentStateRunning
+	const streamID = "stream-1"
+	m.handleAgentMsg(textDelta(streamID, "partial reply"))
+
+	got := m.renderMessages()
+	// Glamour interleaves ANSI codes, so check the words individually rather
+	// than the full phrase.
+	if !strings.Contains(got, "partial") || !strings.Contains(got, "reply") {
+		t.Fatalf("expected the streamed text, got:\n%s", got)
+	}
+	// A live-streaming delta shows a cursor at the tail (rendered outside
+	// glamour, so the glyph is contiguous).
+	if !strings.Contains(got, "▋") {
+		t.Errorf("expected a live cursor on the streaming delta, got:\n%s", got)
+	}
+}
+
+func TestFinalTextHasNoLiveCursor(t *testing.T) {
+	m, store := newStreamModel()
+	const streamID = "stream-1"
+	m.handleAgentMsg(textDelta(streamID, "the answer"))
+
+	// The agent finishes: the final Text message (same ID) replaces the delta
+	// and the agent goes idle. The cursor must not appear on the final reply.
+	final := &api.Message{
+		ID: streamID, Source: api.MessageSourceModel, Type: api.MessageTypeText,
+		Payload: "the answer", Timestamp: time.Now(),
+	}
+	if err := store.AddChatMessage(final); err != nil {
+		t.Fatalf("AddChatMessage: %v", err)
+	}
+	m.agent.Session.AgentState = api.AgentStateIdle
+	m.handleAgentMsg(final)
+
+	got := m.renderMessages()
+	if !strings.Contains(got, "answer") {
+		t.Fatalf("expected the final text, got:\n%s", got)
+	}
+	if strings.Contains(got, "▋") {
+		t.Errorf("the final reply must not show a live cursor, got:\n%s", got)
+	}
+}
+
 func TestShellModeStyling(t *testing.T) {
 	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
 	m := newModel(a)

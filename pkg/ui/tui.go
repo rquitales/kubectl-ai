@@ -1987,7 +1987,15 @@ func (m model) renderTextMsg(msg *api.Message, r *glamour.TermRenderer, w int) s
 			label += dimStyle.Italic(true).Render(" · " + formatTokens(msg.Tokens))
 		}
 		rendered, _ := r.Render(payload)
-		return agentMsg.Width(w+2).Render(label+"\n"+strings.TrimSpace(rendered)) + "\n"
+		body := strings.TrimSpace(rendered)
+		// A live-streaming delta is the incomplete text the model is still
+		// producing (the final Text message replaces it). Append a cursor so
+		// it's visually obvious the reply is still being typed — like Claude
+		// Code and opencode — instead of looking like a stalled reply.
+		if msg.Type == api.MessageTypeTextDelta && m.agentState() == api.AgentStateRunning {
+			body += primaryText.Render(" ▋")
+		}
+		return agentMsg.Width(w+2).Render(label+"\n"+body) + "\n"
 	}
 	return ""
 }
