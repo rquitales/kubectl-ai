@@ -584,6 +584,48 @@ func TestMouseReportBurstDoesNotLeakIntoInput(t *testing.T) {
 	}
 }
 
+func TestSplitMouseReportAcrossMessagesDoesNotLeak(t *testing.T) {
+	// When a fast scroll splits an SGR report at the read boundary, the
+	// parser's ESC branch stops after one rune, so the report arrives as a
+	// lone Alt+'[' followed by the remainder in a separate message. This is
+	// the sequence that leaked; neither message is recognisable on its own.
+	m := newModel(nil)
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("["), Alt: true})
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("<64;140")})
+	if got := m.input.Value(); got != "" {
+		t.Errorf("split report leaked into the input: %q", got)
+	}
+	// The tail of that report arrives next and is still swallowed, up to
+	// and including the terminator.
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(";44M")})
+	if got := m.input.Value(); got != "" {
+		t.Errorf("report tail leaked into the input: %q", got)
+	}
+	// Typing resumes normally once the report has been consumed.
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
+	if got := m.input.Value(); got != "k" {
+		t.Errorf("typing after a split report: value = %q, want %q", got, "k")
+	}
+}
+
+func TestSwallowModeIsBounded(t *testing.T) {
+	// A false positive must not eat input indefinitely: swallowing gives up
+	// after maxSwallowedRunes even if no terminator ever arrives.
+	m := newModel(nil)
+	m.swallowMouseSeq = true
+	m.swallowedRunes = 1
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(strings.Repeat("a", maxSwallowedRunes+8))})
+	if m.swallowMouseSeq {
+		t.Error("swallow mode should have given up after maxSwallowedRunes")
+	}
+	// Once it gives up, the rest of that message and everything after it is
+	// treated as real input again.
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("ok")})
+	if got := m.input.Value(); !strings.HasSuffix(got, "ok") {
+		t.Errorf("input after bounded swallow = %q, want it to end with %q", got, "ok")
+	}
+}
+
 func TestMouseReportStrippedButRealInputKept(t *testing.T) {
 	// Real text mixed with report fragments keeps the text.
 	m := newModel(nil)

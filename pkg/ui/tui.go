@@ -24,7 +24,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -315,6 +314,12 @@ type model struct {
 	// Return deliver a phantom LF (KeyCtrlJ) right after the CR; it is
 	// swallowed so it doesn't leave a stray newline in the next draft.
 	justSubmitted bool
+
+	// swallowMouseSeq is set while a mouse report that the input parser
+	// split across reads is still being consumed; swallowedRunes bounds
+	// how long that can last (see filterMouseRunes).
+	swallowMouseSeq bool
+	swallowedRunes  int
 	spinner       spinner.Model
 	list          list.Model
 	cache         *renderCache
@@ -820,28 +825,62 @@ func (m *model) navigateList(keyType tea.KeyType) tea.Cmd {
 	return cmd
 }
 
-// mouseReportRe matches SGR mouse reports and the fragments a burst-split
-// read leaves behind. A full report is "\x1b[<64;140;44M"; when the input
-// reader's chunk boundary lands mid-sequence the ESC and/or the trailing
-// M/m are missing, so both are optional here. The "[<" pair is the
-// distinctive marker — no ordinary keystroke produces it.
-var mouseReportRe = regexp.MustCompile(`(?:\x1b)?\[<[0-9;]*[Mm]?`)
+// maxSwallowedRunes bounds how far filterMouseRunes will keep dropping
+// input while looking for a mouse report's terminator. A real SGR report
+// is ~13 bytes; this is a safety valve so a false positive can never eat
+// more than a few keystrokes.
+const maxSwallowedRunes = 32
 
-// sanitizeRunes strips mouse-report fragments from a burst of input runes.
-// A fast scroll wheel packs many SGR reports into one read; if the chunk
-// boundary splits a sequence, the partial bytes fail to parse as a MouseMsg
-// and fall through as literal runes, which would otherwise land in the
-// input box. Returns the cleaned runes and whether anything was stripped.
-//
-// Only multi-rune bursts are sanitized by the caller: ordinary typing
-// arrives one rune at a time, so real input is never touched.
-func sanitizeRunes(runes []rune) ([]rune, bool) {
-	s := string(runes)
-	cleaned := mouseReportRe.ReplaceAllString(s, "")
-	if cleaned == s {
-		return runes, false
+// isMouseSeqStart reports whether a split SGR mouse report begins at
+// runes[i]. A full report looks like "\x1b[<64;140;44M"; a read boundary
+// can cut it anywhere, so the recognizable openings are ESC+"[", "[<",
+// and "<" followed by a digit. None of these occur as a multi-rune burst
+// of genuine typed input.
+func isMouseSeqStart(runes []rune, i int) bool {
+	if i+1 >= len(runes) {
+		return false
 	}
-	return []rune(cleaned), true
+	switch runes[i] {
+	case '\x1b':
+		return runes[i+1] == '['
+	case '[':
+		return runes[i+1] == '<'
+	case '<':
+		return runes[i+1] >= '0' && runes[i+1] <= '9'
+	}
+	return false
+}
+
+// filterMouseRunes drops SGR mouse-report fragments from a burst of input
+// runes, carrying state across messages.
+//
+// A fast scroll wheel packs many reports into one read. When the input
+// parser's chunk boundary splits a report it emits the pieces as ordinary
+// runes — and because the ESC branch stops after a single rune, the "["
+// arrives in its own message ahead of the "<64;140" remainder. Matching
+// per-message therefore cannot work; swallowing has to span messages,
+// which is what swallowMouseSeq tracks. Swallowing ends at the report's
+// M/m terminator, or at maxSwallowedRunes as a safety valve.
+func (m *model) filterMouseRunes(runes []rune) []rune {
+	out := make([]rune, 0, len(runes))
+	for i := 0; i < len(runes); i++ {
+		if m.swallowMouseSeq {
+			m.swallowedRunes++
+			r := runes[i]
+			if r == 'M' || r == 'm' || m.swallowedRunes > maxSwallowedRunes {
+				m.swallowMouseSeq = false
+				m.swallowedRunes = 0
+			}
+			continue
+		}
+		if isMouseSeqStart(runes, i) {
+			m.swallowMouseSeq = true
+			m.swallowedRunes = 1
+			continue
+		}
+		out = append(out, runes[i])
+	}
+	return out
 }
 
 // handleMouse routes mouse events: the scroll wheel scrolls the
@@ -868,20 +907,29 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// A fast scroll wheel packs many SGR mouse reports into a single read.
-	// When the chunk boundary splits a sequence, the partial bytes fail to
-	// parse as a MouseMsg and arrive here as literal runes, which would
-	// land in the input box. Strip those fragments before anything else.
+	// A fast scroll wheel packs many SGR mouse reports into a single read,
+	// and a chunk boundary that splits one leaves fragments that reach us
+	// as ordinary runes. Drop them before they can land in the input box.
 	//
-	// Only multi-rune bursts are sanitized: ordinary typing delivers one
-	// rune per message, so real keystrokes are never altered.
-	if msg.Type == tea.KeyRunes && len(msg.Runes) > 1 {
-		cleaned, stripped := sanitizeRunes(msg.Runes)
-		if stripped {
-			if len(cleaned) == 0 {
-				return m, nil // the burst was nothing but mouse reports
+	// The parser emits a split report's leading "\x1b[" as a lone '[' with
+	// Alt set, ahead of the "<64;140" remainder, so that artifact has to be
+	// recognised on its own; from there filterMouseRunes swallows the rest
+	// across however many messages it spans.
+	if msg.Type == tea.KeyRunes {
+		if !m.swallowMouseSeq && msg.Alt && len(msg.Runes) == 1 && msg.Runes[0] == '[' {
+			m.swallowMouseSeq = true
+			m.swallowedRunes = 1
+			return m, nil
+		}
+		// Ordinary typing arrives one rune at a time, so single-rune
+		// messages are left alone unless a report is already in flight.
+		if m.swallowMouseSeq || len(msg.Runes) > 1 {
+			if cleaned := m.filterMouseRunes(msg.Runes); len(cleaned) != len(msg.Runes) {
+				if len(cleaned) == 0 {
+					return m, nil
+				}
+				msg.Runes = cleaned
 			}
-			msg.Runes = cleaned
 		}
 	}
 
