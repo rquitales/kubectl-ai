@@ -1784,16 +1784,89 @@ func (m *model) refresh() {
 	m.dirty = false
 }
 
+// renderWelcome renders the empty-state panel shown when the transcript is
+// empty: the logo and tagline, the current kube context (front and center,
+// since "which cluster am I pointed at?" is the most important thing to know
+// before you act), and a compact command reference.
+func (m model) renderWelcome() string {
+	var sb strings.Builder
+	sb.WriteString("\n")
+	sb.WriteString(primaryText.Render(logo))
+	sb.WriteString("\n")
+	tagline := "Your AI-powered Kubernetes assistant"
+	sb.WriteString(mutedStyle.PaddingLeft(1).Render(truncateRunes(tagline, max(m.width-2, 10))))
+	sb.WriteString("\n\n")
+
+	// Kube context panel — the safety-critical "what am I pointed at?" cue.
+	// A prod-looking context is rendered in the warning color.
+	if m.kubeContextOK {
+		ctxStyle := lipgloss.NewStyle().Foreground(colorSecondary).Bold(true)
+		label := "Connected to"
+		if m.kubeContext.isProd() {
+			ctxStyle = lipgloss.NewStyle().Foreground(colorWarning).Bold(true)
+			label = "⚠ Connected to (prod)"
+		}
+		sb.WriteString(inputBox.Width(max(m.width-6, 30)).
+			Render("⎈ " + dimStyle.Render(label+" ") + ctxStyle.Render(m.kubeContext.String())))
+		sb.WriteString("\n\n")
+	} else {
+		sb.WriteString(dimStyle.PaddingLeft(1).Render("⎈ No kubeconfig found — set $KUBECONFIG or ~/.kube/config"))
+		sb.WriteString("\n\n")
+	}
+
+	// Command reference: two compact columns when there's room, a single
+	// column when the terminal is narrow so the rows never wrap.
+	commands := [][2]string{
+		{"/sessions", "browse & resume sessions"},
+		{"/context", "switch kube context"},
+		{"/namespace", "switch namespace"},
+		{"/model", "switch model"},
+		{"/rename", "rename this session"},
+		{"/compact", "summarize & free context"},
+		{"/clear", "clear the transcript"},
+		{"/exit", "quit"},
+	}
+	renderRow := func(c [2]string) string {
+		return primaryText.Render("  "+c[0]) + " " + dimStyle.Render(c[1])
+	}
+	// A two-column row needs room for the widest left + widest right entry
+	// plus a gap; fall back to a single column below that width.
+	colWidth := 0
+	for _, c := range commands {
+		if w := lipgloss.Width(c[0] + " " + c[1]); w > colWidth {
+			colWidth = w
+		}
+	}
+	twoCol := m.width >= colWidth*2+6
+	var rows []string
+	if twoCol {
+		half := (len(commands) + 1) / 2
+		for i := 0; i < half; i++ {
+			left := renderRow(commands[i])
+			right := ""
+			if i+half < len(commands) {
+				right = "  " + renderRow(commands[i+half])
+			}
+			rows = append(rows, left+right)
+		}
+	} else {
+		for _, c := range commands {
+			rows = append(rows, renderRow(c))
+		}
+	}
+	sb.WriteString(strings.Join(rows, "\n"))
+	sb.WriteString("\n\n")
+	footer := "Type a message, or drag-select to copy (Ctrl+Y copies the last reply)"
+	sb.WriteString(dimStyle.PaddingLeft(1).Render(truncateRunes(footer, max(m.width-2, 10))))
+	sb.WriteString("\n")
+	return sb.String()
+}
+
 func (m model) renderMessages() string {
 	var sb strings.Builder
 
 	if len(m.messages) == 0 {
-		sb.WriteString(fmt.Sprintf("\n%s\n\n%s\n%s\n%s\n%s\n",
-			primaryText.Render(logo),
-			mutedStyle.PaddingLeft(1).Render("Your AI-powered Kubernetes assistant"),
-			dimStyle.PaddingLeft(1).Render("Type a message to get started"),
-			dimStyle.PaddingLeft(1).Render("Type /sessions to browse and resume past sessions"),
-			dimStyle.PaddingLeft(1).Render("Drag-select with your mouse to copy, or press Ctrl+Y to copy the last reply")))
+		sb.WriteString(m.renderWelcome())
 	} else {
 		width := min(m.viewport.Width-6, 90)
 		if width < 40 {
