@@ -3408,7 +3408,7 @@ func (m *model) completionHint() string {
 func (m model) viewInput(state api.AgentState) string {
 	// Show dimmed input hint when in choice mode (picker is inline above)
 	if m.inChoiceMode {
-		content := mutedStyle.Render("Use ↑/↓ to navigate, Enter to select")
+		content := mutedStyle.Render("Use ↑/↓ to navigate, Enter to select, Esc to decline")
 		return lipgloss.NewStyle().Padding(0, 1).Render(inputBoxDim.Width(m.width - 4).Render(content))
 	}
 
@@ -3499,7 +3499,7 @@ func (m model) viewHelp(state api.AgentState) string {
 	case m.browserOpen:
 		return "" // the browser renders its own key hints
 	case m.inChoiceMode:
-		hints = []string{"↑/↓: navigate", "Enter: select", "Ctrl+C: quit"}
+		hints = []string{"↑/↓: navigate", "Enter: select", "Esc: decline", "Ctrl+C: quit"}
 	case state == api.AgentStateRunning:
 		hints = []string{"↑/↓: scroll", "Ctrl+C: cancel", "Esc: interrupt"}
 	default:
