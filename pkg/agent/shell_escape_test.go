@@ -64,7 +64,7 @@ func TestShellEscapeCommand(t *testing.T) {
 func newShellEscapeTestAgent(executor sandbox.Executor) *Agent {
 	a := &Agent{
 		Output:   make(chan any, 10),
-		executor: executor,
+		Executor: executor,
 	}
 	a.Session = &api.Session{ChatMessageStore: sessions.NewInMemoryChatStore()}
 	return a

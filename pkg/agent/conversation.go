@@ -23,6 +23,7 @@ import (
 	"html/template"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -88,6 +89,10 @@ type Agent struct {
 
 	// Kubeconfig is the path to the kubeconfig file.
 	Kubeconfig string
+	// kubeconfigOverride is the session-scoped kubeconfig override path
+	// (set by /context or /namespace), applied via KUBECONFIG for this
+	// process without mutating the base file.
+	kubeconfigOverride string
 	// Sandbox indicates whether to execute tools in a sandbox environment
 	Sandbox string
 
@@ -116,7 +121,7 @@ type Agent struct {
 	workDir string
 
 	// executor is the executor for tool execution
-	executor sandbox.Executor
+	Executor sandbox.Executor
 
 	// Session optionally provides a session to use.
 	// This is used by the UI to track the state of the agent and the conversation.
@@ -356,19 +361,19 @@ func (s *Agent) Init(ctx context.Context) error {
 			return fmt.Errorf("failed to create sandbox: %w", err)
 		}
 
-		s.executor = sb
+		s.Executor = sb
 		log.Info("Created sandbox", "name", sandboxName, "image", sandboxImage)
 
 	case "seatbelt":
 		if runtime.GOOS != "darwin" {
 			return fmt.Errorf("seatbelt sandbox is only supported on macOS")
 		}
-		s.executor = sandbox.NewSeatbeltExecutor()
+		s.Executor = sandbox.NewSeatbeltExecutor()
 		log.Info("Using Seatbelt executor")
 
 	case "":
 		// No sandbox, use local executor
-		s.executor = sandbox.NewLocalExecutor()
+		s.Executor = sandbox.NewLocalExecutor()
 
 	default:
 		return fmt.Errorf("unknown sandbox type: %s", s.Sandbox)
@@ -379,10 +384,10 @@ func (s *Agent) Init(ctx context.Context) error {
 	// Register tools with executor if none registered yet
 	// We clone existing tools (e.g. custom tools) to ensure we have a fresh map
 	// This avoids polluting the global default tools and ensures thread safety.
-	s.Tools = s.Tools.CloneWithExecutor(s.executor)
+	s.Tools = s.Tools.CloneWithExecutor(s.Executor)
 
-	s.Tools.RegisterTool(tools.NewBashTool(s.executor))
-	s.Tools.RegisterTool(tools.NewKubectlTool(s.executor))
+	s.Tools.RegisterTool(tools.NewBashTool(s.Executor))
+	s.Tools.RegisterTool(tools.NewKubectlTool(s.Executor))
 
 	if err := s.rebuildChat(ctx); err != nil {
 		return err
@@ -536,10 +541,10 @@ func (c *Agent) Close() error {
 
 	// Close sandbox if enabled
 	// Close executor if it exists
-	if c.executor != nil {
+	if c.Executor != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
-		if err := c.executor.Close(ctx); err != nil {
+		if err := c.Executor.Close(ctx); err != nil {
 			klog.Warningf("error cleaning up executor: %v", err)
 		} else {
 			klog.Info("Executor cleaned up successfully")
@@ -1081,23 +1086,25 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 // slashCommands maps slash-command names (without the leading slash) to
 // their canonical meta query form.
 var slashCommands = map[string]string{
-	"clear":    "clear",
-	"reset":    "reset",
-	"compact":  "compact",
-	"exit":     "exit",
-	"quit":     "quit",
-	"model":    "model",
-	"models":   "models",
-	"tools":    "tools",
-	"session":  "session",
-	"sessions": "sessions",
-	"new":      "new-session",
-	"save":     "save-session",
-	"rename":   "rename-session",
-	"resume":   "resume-session",
-	"delete":   "delete-session",
-	"context":  "context",
-	"contexts": "context",
+	"clear":     "clear",
+	"reset":     "reset",
+	"compact":   "compact",
+	"exit":      "exit",
+	"quit":      "quit",
+	"model":     "model",
+	"models":    "models",
+	"tools":     "tools",
+	"session":   "session",
+	"sessions":  "sessions",
+	"new":       "new-session",
+	"save":      "save-session",
+	"rename":    "rename-session",
+	"resume":    "resume-session",
+	"delete":    "delete-session",
+	"context":   "context",
+	"contexts":  "context",
+	"namespace": "namespace",
+	"ns":        "namespace",
 }
 
 // normalizeSlashCommand translates a slash-prefixed command (e.g. "/rename
@@ -1149,7 +1156,7 @@ func shellEscapeCommand(query string) (command string, ok bool) {
 // next turn.
 func (c *Agent) runShellEscape(ctx context.Context, command string) {
 	log := klog.FromContext(ctx)
-	if c.executor == nil {
+	if c.Executor == nil {
 		c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: cannot run shell command: no executor configured")
 		return
 	}
@@ -1158,7 +1165,7 @@ func (c *Agent) runShellEscape(ctx context.Context, command string) {
 	defer cancel()
 
 	log.Info("Running shell escape command", "command", command)
-	result, err := c.executor.Execute(execCtx, command, nil, "")
+	result, err := c.Executor.Execute(execCtx, command, nil, "")
 
 	var output string
 	if err != nil {
@@ -1224,6 +1231,8 @@ func (c *Agent) handleMetaQuery(ctx context.Context, query string) (answer strin
 		return "Available tools:\n\n  - " + strings.Join(c.Tools.Names(), "\n  - ") + "\n\n", true, nil
 	case "context":
 		return c.handleContextQuery("")
+	case "namespace", "ns":
+		return c.handleNamespaceQuery(ctx, "")
 	case "session":
 		if c.SessionBackend != "filesystem" {
 			return "Ephemeral session (memory backed). No persistent info available.", true, nil
@@ -1300,6 +1309,11 @@ func (c *Agent) handleMetaQuery(ctx context.Context, query string) (answer strin
 
 	if query == "context" || strings.HasPrefix(query, "context ") {
 		return c.handleContextQuery(strings.TrimSpace(strings.TrimPrefix(query, "context")))
+	}
+
+	if query == "namespace" || query == "ns" || strings.HasPrefix(query, "namespace ") || strings.HasPrefix(query, "ns ") {
+		name := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(query, "namespace"), "ns"))
+		return c.handleNamespaceQuery(ctx, name)
 	}
 
 	if query == "delete-session" || strings.HasPrefix(query, "delete-session ") {
@@ -1450,22 +1464,22 @@ func (c *Agent) NewSession() (string, error) {
 		}
 
 		c.sessionMu.Lock()
-		if c.executor != nil {
+		if c.Executor != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			if err := c.executor.Close(ctx); err != nil {
+			if err := c.Executor.Close(ctx); err != nil {
 				klog.Warningf("error closing old executor: %v", err)
 			}
 			cancel()
 		}
 
-		c.executor = sb
+		c.Executor = sb
 		klog.Info("Created new sandbox for new session", "name", sandboxName)
 
 		// Re-bind all tools to the new executor
-		c.Tools = c.Tools.CloneWithExecutor(c.executor)
+		c.Tools = c.Tools.CloneWithExecutor(c.Executor)
 
-		c.Tools.RegisterTool(tools.NewBashTool(c.executor))
-		c.Tools.RegisterTool(tools.NewKubectlTool(c.executor))
+		c.Tools.RegisterTool(tools.NewBashTool(c.Executor))
+		c.Tools.RegisterTool(tools.NewKubectlTool(c.Executor))
 		c.sessionMu.Unlock()
 	}
 
@@ -1622,19 +1636,77 @@ func (c *Agent) DeleteSession(sessionID string) error {
 	return manager.DeleteSession(sessionID)
 }
 
-// handleContextQuery answers the "context" meta query: bare lists the
-// current and available kube contexts; "context <name>" switches the
-// current context in the kubeconfig.
+// kubeconfigOverride is the path of the session-scoped kubeconfig override
+// the agent has applied via /context or /namespace (empty when none).
+// ActiveKubeconfig returns it when set, else the agent's base kubeconfig.
+func (c *Agent) ActiveKubeconfig() string {
+	c.sessionMu.Lock()
+	defer c.sessionMu.Unlock()
+	if c.kubeconfigOverride != "" {
+		return c.kubeconfigOverride
+	}
+	return c.Kubeconfig
+}
+
+// applyKubeOverride builds (or rebuilds) the session-scoped kubeconfig
+// override with the given context and/or namespace and points KUBECONFIG at
+// it for this process. The base kubeconfig file is never mutated.
+func (c *Agent) applyKubeOverride(context, namespace string) error {
+	if c.workDir == "" {
+		return fmt.Errorf("no working directory for the override kubeconfig")
+	}
+	outPath := filepath.Join(c.workDir, "kubeconfig-override")
+	if err := kube.WriteOverride(c.Kubeconfig, outPath, context, namespace); err != nil {
+		return err
+	}
+
+	c.sessionMu.Lock()
+	c.kubeconfigOverride = outPath
+	c.sessionMu.Unlock()
+	return os.Setenv("KUBECONFIG", outPath)
+}
+
+// resetKubeOverride clears the session-scoped override and restores the base
+// kubeconfig for the process.
+func (c *Agent) resetKubeOverride() {
+	c.sessionMu.Lock()
+	path := c.kubeconfigOverride
+	c.kubeconfigOverride = ""
+	c.sessionMu.Unlock()
+
+	if path != "" {
+		_ = os.Remove(path)
+	}
+	if c.Kubeconfig != "" {
+		_ = os.Setenv("KUBECONFIG", c.Kubeconfig)
+	} else {
+		_ = os.Unsetenv("KUBECONFIG")
+	}
+}
+
+// handleContextQuery answers the "context" meta query: bare shows the
+// current and available kube contexts; "context <name>" applies a
+// session-scoped override (the global kubeconfig is untouched);
+// "context --reset" clears the override.
 func (c *Agent) handleContextQuery(name string) (answer string, handled bool, err error) {
-	current, _, ok := kube.CurrentContext(c.Kubeconfig)
+	if name == "--reset" {
+		c.resetKubeOverride()
+		return "Cleared the session context override.", true, nil
+	}
+
 	if name == "" {
+		current, _, ok := kube.CurrentContext(c.ActiveKubeconfig())
 		names, err := kube.ListContexts(c.Kubeconfig)
 		if err != nil {
 			return "", false, fmt.Errorf("listing contexts: %w", err)
 		}
 		var b strings.Builder
 		if ok {
-			b.WriteString("Current context: `" + current + "`\n\n")
+			if c.kubeconfigOverride != "" {
+				b.WriteString("Current context (session override): `" + current + "`\n\n")
+			} else {
+				b.WriteString("Current context: `" + current + "`\n\n")
+			}
 		}
 		b.WriteString("Available contexts:\n\n")
 		for _, n := range names {
@@ -1644,18 +1716,82 @@ func (c *Agent) handleContextQuery(name string) (answer string, handled bool, er
 				b.WriteString("  - " + n + "\n")
 			}
 		}
-		b.WriteString("\nSwitch with `/context <name>`.")
+		b.WriteString("\nSwitch with `/context <name>` (session-scoped, global kubeconfig untouched).")
 		return b.String(), true, nil
 	}
 
-	if err := kube.UseContext(c.Kubeconfig, name); err != nil {
+	if err := c.applyKubeOverride(name, ""); err != nil {
 		names, _ := kube.ListContexts(c.Kubeconfig)
 		if len(names) > 0 {
 			return "", false, fmt.Errorf("%v. Available contexts: %s", err, strings.Join(names, ", "))
 		}
 		return "", false, err
 	}
-	return fmt.Sprintf("Switched to context `%s`.", name), true, nil
+	return fmt.Sprintf("Switched to context `%s` (session only — global kubeconfig unchanged).", name), true, nil
+}
+
+// handleNamespaceQuery answers the "namespace" meta query: bare shows the
+// current namespace and live namespaces from the cluster; "namespace <name>"
+// applies a session-scoped namespace override; "namespace --reset" clears it.
+func (c *Agent) handleNamespaceQuery(ctx context.Context, name string) (answer string, handled bool, err error) {
+	if name == "--reset" {
+		c.resetKubeOverride()
+		return "Cleared the session namespace override.", true, nil
+	}
+
+	if name == "" {
+		_, current, ok := kube.CurrentContext(c.ActiveKubeconfig())
+		names, err := c.ListNamespaces(ctx)
+		var b strings.Builder
+		if ok {
+			if c.kubeconfigOverride != "" {
+				b.WriteString("Current namespace (session override): `" + current + "`\n\n")
+			} else {
+				b.WriteString("Current namespace: `" + current + "`\n\n")
+			}
+		}
+		if err != nil {
+			b.WriteString("Could not list namespaces from the cluster: " + err.Error())
+		} else {
+			b.WriteString("Namespaces in this cluster:\n\n")
+			for _, n := range names {
+				if n == current {
+					b.WriteString("  - " + n + " (current)\n")
+				} else {
+					b.WriteString("  - " + n + "\n")
+				}
+			}
+		}
+		b.WriteString("\nSwitch with `/namespace <name>` (session-scoped).")
+		return b.String(), true, nil
+	}
+
+	if err := c.applyKubeOverride("", name); err != nil {
+		return "", false, err
+	}
+	return fmt.Sprintf("Switched to namespace `%s` (session only — global kubeconfig unchanged).", name), true, nil
+}
+
+// ListNamespaces returns live namespaces from the cluster through the
+// executor (which inherits the session override via KUBECONFIG). Safe to
+// call from UI goroutines.
+func (c *Agent) ListNamespaces(ctx context.Context) ([]string, error) {
+	if c.Executor == nil {
+		return nil, fmt.Errorf("no executor available to list namespaces")
+	}
+	execCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	res, err := c.Executor.Execute(execCtx, "kubectl get namespaces -o custom-columns=NAME:.metadata.name --no-headers", os.Environ(), c.workDir)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, line := range strings.Split(res.Stdout, "\n") {
+		if n := strings.TrimSpace(line); n != "" {
+			names = append(names, n)
+		}
+	}
+	return names, nil
 }
 
 // openModelPicker presents an interactive picker of the provider's models
@@ -1862,7 +1998,7 @@ func (c *Agent) DispatchToolCalls(ctx context.Context) error {
 		output, err := call.ParsedToolCall.InvokeTool(ctx, tools.InvokeToolOptions{
 			Kubeconfig: c.Kubeconfig,
 			WorkDir:    c.workDir,
-			Executor:   c.executor,
+			Executor:   c.Executor,
 		})
 
 		if err != nil {

@@ -321,6 +321,9 @@ type model struct {
 	// Kube context names for /context autocomplete, cached briefly.
 	contextNames     []string
 	contextNamesLast time.Time
+	// Cluster namespaces for /namespace autocomplete, cached briefly.
+	namespaceNames     []string
+	namespaceNamesLast time.Time
 	// sessionID tracks the active session so switches are detectable.
 	sessionID string
 	// Kube context/namespace shown in the status bar; resolved once at
@@ -767,6 +770,26 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.toggleAutoMode()
 	case tea.KeyTab:
 		if m.inChoiceMode {
+			return m, nil
+		}
+		// Namespace autocomplete: cycle the partial after "/namespace " (or
+		// "/ns ") through live cluster namespaces.
+		if v := m.input.Value(); strings.HasPrefix(v, "/namespace ") || strings.HasPrefix(v, "/ns ") {
+			cmd := "/namespace "
+			if strings.HasPrefix(v, "/ns ") {
+				cmd = "/ns "
+			}
+			if m.tabIndex < len(m.tabMatches) && v == cmd+m.tabMatches[m.tabIndex] {
+				m.tabIndex = (m.tabIndex + 1) % len(m.tabMatches)
+			} else {
+				m.tabMatches = m.namespaceMatches()
+				m.tabIndex = 0
+			}
+			if len(m.tabMatches) > 0 {
+				m.input.SetValue(cmd + m.tabMatches[m.tabIndex])
+				m.input.CursorEnd()
+				m.syncInputHeight()
+			}
 			return m, nil
 		}
 		// Kube context autocomplete: cycle the partial after "/context "
@@ -2158,13 +2181,13 @@ func loadKubeContext(path string) (info kubeContextInfo, ok bool) {
 	return info, true
 }
 
-// resolveKubeContext (re)loads the status bar's kube context, preferring
-// the agent's explicit kubeconfig path when set. Failures are silent: the
-// indicator simply disappears.
+// resolveKubeContext (re)loads the status bar's kube context from the
+// agent's active kubeconfig (the session override when one is applied, else
+// the base path). Failures are silent: the indicator simply disappears.
 func (m *model) resolveKubeContext() {
 	path := ""
 	if m.agent != nil {
-		path = m.agent.Kubeconfig
+		path = m.agent.ActiveKubeconfig()
 	}
 	m.kubeContext, m.kubeContextOK = loadKubeContext(path)
 	m.kubeContextLast = time.Now()
@@ -2295,7 +2318,7 @@ func (m model) viewDivider() string {
 var slashCommands = []string{
 	"/model", "/models", "/tools", "/sessions", "/session", "/new", "/save",
 	"/rename", "/resume", "/delete", "/delete-session", "/clear", "/exit",
-	"/quit", "/compact", "/context",
+	"/quit", "/compact", "/context", "/namespace", "/ns",
 }
 
 // slashCompletions returns the commands matching the input prefix, or nil
@@ -2329,12 +2352,50 @@ func (m model) shellMode() bool {
 }
 
 // completionHintVisible reports whether a hint line (slash completions,
-// file mentions, context names, or the shell marker) is shown under the input.
+// file mentions, context names, namespaces, or the shell marker) is shown
+// under the input.
 func (m *model) completionHintVisible() bool {
 	return m.shellMode() ||
 		len(slashCompletions(m.input.Value())) > 0 ||
 		len(m.fileMatches()) > 0 ||
-		len(m.contextMatches()) > 0
+		len(m.contextMatches()) > 0 ||
+		len(m.namespaceMatches()) > 0
+}
+
+// namespaceMatches returns cluster namespaces matching the partial after
+// "/namespace " or "/ns " in the input, or nil otherwise. Names come from a
+// live cluster query and are cached briefly.
+func (m *model) namespaceMatches() []string {
+	v := m.input.Value()
+	var prefix string
+	switch {
+	case strings.HasPrefix(v, "/namespace "):
+		prefix = strings.TrimPrefix(v, "/namespace ")
+	case strings.HasPrefix(v, "/ns "):
+		prefix = strings.TrimPrefix(v, "/ns ")
+	default:
+		return nil
+	}
+	if m.agent == nil {
+		return nil
+	}
+	if time.Since(m.namespaceNamesLast) > 30*time.Second || m.namespaceNamesLast.IsZero() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		names, err := m.agent.ListNamespaces(ctx)
+		if err != nil {
+			return nil
+		}
+		m.namespaceNames = names
+		m.namespaceNamesLast = time.Now()
+	}
+	var matches []string
+	for _, n := range m.namespaceNames {
+		if strings.HasPrefix(n, prefix) {
+			matches = append(matches, n)
+		}
+	}
+	return matches
 }
 
 // contextMatches returns kube context names matching the partial after
@@ -2398,12 +2459,17 @@ func (m model) fileMatches() []string {
 }
 
 // completionHint renders the dim hint line shown under the input: the shell
-// marker, file mention matches, context names, or slash-command completions.
+// marker, context names, namespaces, file mention matches, or slash-command
+// completions.
 func (m *model) completionHint() string {
 	if m.shellMode() {
 		return dimStyle.Render("  shell command")
 	}
 	if matches := m.contextMatches(); len(matches) > 0 {
+		hint := "  " + strings.Join(matches, "  ")
+		return dimStyle.Render(truncateRunes(hint, max(m.input.Width(), 20)))
+	}
+	if matches := m.namespaceMatches(); len(matches) > 0 {
 		hint := "  " + strings.Join(matches, "  ")
 		return dimStyle.Render(truncateRunes(hint, max(m.input.Width(), 20)))
 	}

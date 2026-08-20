@@ -27,6 +27,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/agent"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
+	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/sandbox"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/sessions"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -1908,5 +1909,73 @@ func TestContextAutocomplete(t *testing.T) {
 	second := m.input.Value()
 	if second == first {
 		t.Errorf("expected tab to cycle to the next context, got %q", second)
+	}
+}
+
+// fakeExecutor returns a canned result for executor calls.
+type fakeExecutor struct {
+	result *sandbox.ExecResult
+	err    error
+}
+
+func (f *fakeExecutor) Execute(ctx context.Context, command string, env []string, workDir string) (*sandbox.ExecResult, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.result, nil
+}
+
+func (f *fakeExecutor) Close(ctx context.Context) error { return nil }
+
+func TestNamespaceAutocomplete(t *testing.T) {
+	path := writeAgentKubeConfig(t, "prod", "prod", "staging")
+	a := &agent.Agent{
+		Session:    &api.Session{ID: "test", AgentState: api.AgentStateIdle},
+		Kubeconfig: path,
+		Executor:   &fakeExecutor{result: &sandbox.ExecResult{Stdout: "default\nkube-system\npayments\n"}},
+	}
+	m := newModel(a)
+	m.width, m.height = 100, 40
+	m.resize()
+
+	// No matches outside the namespace command.
+	m.input.SetValue("hello")
+	if got := m.namespaceMatches(); got != nil {
+		t.Errorf("expected no matches outside /namespace, got %v", got)
+	}
+
+	// Prefix matches and hint.
+	m.input.SetValue("/namespace pay")
+	if got := m.namespaceMatches(); len(got) != 1 || got[0] != "payments" {
+		t.Errorf("namespaceMatches(/namespace pay) = %v, want [payments]", got)
+	}
+	if !m.completionHintVisible() {
+		t.Error("expected hint visible for /namespace partial")
+	}
+	if got := m.completionHint(); !strings.Contains(got, "payments") {
+		t.Errorf("completionHint = %q, want payments", got)
+	}
+	base := m.inputHeight + 2
+	if got := m.inputBlockHeight(); got != base+1 {
+		t.Errorf("inputBlockHeight = %d, want %d with the namespace hint", got, base+1)
+	}
+
+	// /ns alias matches too.
+	m.input.SetValue("/ns kube")
+	if got := m.namespaceMatches(); len(got) != 1 || got[0] != "kube-system" {
+		t.Errorf("namespaceMatches(/ns kube) = %v, want [kube-system]", got)
+	}
+
+	// Tab cycles, keeping the command prefix.
+	m.input.SetValue("/ns ")
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyTab})
+	first := m.input.Value()
+	if !strings.HasPrefix(first, "/ns ") || first == "/ns " {
+		t.Errorf("after tab: input = %q, want a namespace name", first)
+	}
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyTab})
+	second := m.input.Value()
+	if second == first {
+		t.Errorf("expected tab to cycle to the next namespace, got %q", second)
 	}
 }
