@@ -2198,17 +2198,17 @@ func TestRenderToolResultSuccessStaysDim(t *testing.T) {
 
 func TestRenderToolResultColorizesDiff(t *testing.T) {
 	m := newModel(nil)
+	m.expandToolResults = true // show the full diff, not the collapsed 3 lines
 	msg := &api.Message{
 		Type: api.MessageTypeToolCallResponse,
 		Payload: map[string]any{
-			"stdout":     "diff -u a b\n--- a\n+++ b\n@@ -1,2 +1,2 @@\n-foo\n+bar\n context\n",
+			"stdout":     "--- a\n+++ b\n@@ -1 +1 @@\n-foo\n+bar\n",
 			"exit_code": float64(0),
 		},
 	}
-	// The diff's addition (+bar) and deletion (-foo) lines must be present so
-	// the coloring is applied to the right content; the render itself
-	// colorizes them, which we assert via the presence of the lines.
 	got := m.renderToolResult(msg)
+	// The diff's addition (+bar) and deletion (-foo) lines render with
+	// diff coloring (green/red); assert the content is present.
 	if !strings.Contains(got, "+bar") {
 		t.Errorf("expected the diff addition line present, got:\n%s", got)
 	}
