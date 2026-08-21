@@ -609,7 +609,17 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 						log.Info("No query provided, skipping agentic loop")
 						continue
 					}
-					c.addMessage(api.MessageSourceUser, api.MessageTypeText, query.Query)
+					// Shell escape: "!<command>" runs locally via the executor
+					// instead of being sent to the LLM.
+					if command, ok := shellEscapeCommand(query.Query); ok {
+						c.addMessage(api.MessageSourceUser, api.MessageTypeText, query.Query)
+						c.runShellEscape(ctx, command)
+						continue
+					}
+					// Inline @file mentions: the transcript shows compact
+					// "[+path]" chips, while the LLM gets the file contents.
+					llmQuery, attachments := expandFileMentions(query.Query)
+					c.addMessage(api.MessageSourceUser, api.MessageTypeText, displayQueryWithChips(query.Query, attachments))
 					// we don't need the agentic loop for meta queries
 					// for ex. model, tools, etc.
 					answer, handled, err := c.handleMetaQuery(ctx, query.Query)
@@ -643,7 +653,9 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 					c.setAgentState(api.AgentStateRunning)
 					runCtx = c.StartRun(ctx)
 					c.currIteration = 0
-					c.currChatContent = []any{query.Query}
+					// Preserve any pending observations (e.g. shell escape
+					// output) so the LLM sees them with this query.
+					c.currChatContent = append(c.currChatContent, llmQuery)
 					c.pendingFunctionCalls = []ToolCallAnalysis{}
 					log.Info("Set agent state to running, will process agentic loop", "currIteration", c.currIteration, "currChatContent", len(c.currChatContent))
 				}
@@ -1031,6 +1043,59 @@ func unknownCommandMessage(query string) string {
 	}
 	sort.Strings(names)
 	return fmt.Sprintf("Unknown command `%s`. Available commands: %s", query, strings.Join(names, " "))
+}
+
+// shellEscapeTimeout bounds how long a "!<command>" shell escape may run.
+const shellEscapeTimeout = 30 * time.Second
+
+// shellEscapeCommand extracts the command from a shell escape query
+// ("!kubectl get pods"). ok is false when the query is not a shell escape.
+func shellEscapeCommand(query string) (command string, ok bool) {
+	trimmed := strings.TrimSpace(query)
+	if !strings.HasPrefix(trimmed, "!") {
+		return "", false
+	}
+	return strings.TrimSpace(strings.TrimPrefix(trimmed, "!")), true
+}
+
+// runShellEscape executes a "!<command>" query locally via the agent's
+// executor, records the output in the transcript like a tool result, and
+// appends it to the chat context as an observation so the LLM sees it on the
+// next turn.
+func (c *Agent) runShellEscape(ctx context.Context, command string) {
+	log := klog.FromContext(ctx)
+	if c.executor == nil {
+		c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: cannot run shell command: no executor configured")
+		return
+	}
+
+	execCtx, cancel := context.WithTimeout(ctx, shellEscapeTimeout)
+	defer cancel()
+
+	log.Info("Running shell escape command", "command", command)
+	result, err := c.executor.Execute(execCtx, command, nil, "")
+
+	var output string
+	if err != nil {
+		output = fmt.Sprintf("Error: %v", err)
+	} else {
+		output = result.Stdout + result.Stderr
+		if result.Error != "" {
+			output += fmt.Sprintf("\nError: %s", result.Error)
+		}
+	}
+	if execCtx.Err() == context.DeadlineExceeded {
+		output += fmt.Sprintf("\n(timed out after %s)", shellEscapeTimeout)
+	}
+	output = strings.TrimRight(output, "\n")
+	if output == "" {
+		output = "(no output)"
+	}
+
+	c.addMessage(api.MessageSourceAgent, api.MessageTypeText, fmt.Sprintf("$ %s\n%s", command, output))
+
+	observation := fmt.Sprintf("User ran: %s\nOutput:\n%s", command, output)
+	c.currChatContent = append(c.currChatContent, observation)
 }
 
 func (c *Agent) handleMetaQuery(ctx context.Context, query string) (answer string, handled bool, err error) {
