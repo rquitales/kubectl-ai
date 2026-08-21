@@ -484,6 +484,20 @@ func (m *model) setBrowserStatus(text string, isErr bool) {
 	m.browserStatus = browserStatusMsg{text: text, isErr: isErr}
 }
 
+// appendLocalMessage adds a transient agent-styled message to the
+// transcript (for UI-originated events; it is not persisted).
+func (m *model) appendLocalMessage(text string) {
+	m.messages = append(m.messages, &api.Message{
+		Source:    api.MessageSourceAgent,
+		Type:      api.MessageTypeText,
+		Payload:   text,
+		Timestamp: time.Now(),
+	})
+	m.dirty = true
+	m.refresh()
+	m.viewport.GotoBottom()
+}
+
 // openBrowser opens the session browser with the given sessions, selecting
 // the current session when possible and preserving the selection across
 // refreshes by session ID. When the browser is already open (a refresh),
@@ -637,6 +651,18 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.historyIdx = -1
 		m.historyDraft = ""
 		m.syncInputHeight()
+		return m, nil
+	case tea.KeyShiftTab:
+		// Toggle auto-accept mode (skip permission prompts), like opencode
+		// and Claude Code.
+		if m.agent != nil {
+			enabled := m.agent.ToggleSkipPermissions()
+			if enabled {
+				m.appendLocalMessage("⚡ Auto mode on — the agent will run tools without asking for permission.")
+			} else {
+				m.appendLocalMessage("Auto mode off — you'll be asked to approve modifying commands.")
+			}
+		}
 		return m, nil
 	case tea.KeyEnter:
 		if msg.Alt {
@@ -1313,6 +1339,9 @@ func (m model) viewStatus(session *api.Session) string {
 	model = truncateRunes(model, 30)
 
 	left := primaryText.Render("kubectl-ai") + sep + mutedStyle.Render(name) + sep + m.viewState(session.AgentState)
+	if m.agent != nil && m.agent.SkipPermissionsEnabled() {
+		left += sep + warnText.Render("⚡AUTO")
+	}
 	right := lipgloss.NewStyle().Foreground(colorSecondary).Render(model)
 
 	// The status bar must always be exactly one line, no matter the
@@ -1422,7 +1451,7 @@ func (m model) viewHelp(state api.AgentState) string {
 	case state == api.AgentStateRunning:
 		hints = []string{"Ctrl+C: cancel"}
 	default:
-		hints = []string{"Enter: send", "Ctrl+J: newline", "↑/↓: history", "Esc: clear", "Ctrl+C: quit"}
+		hints = []string{"Enter: send", "Ctrl+J: newline", "↑/↓: history", "Shift+Tab: auto", "Esc: clear", "Ctrl+C: quit"}
 		if m.viewport.TotalLineCount() > m.viewport.Height {
 			hints = append(hints, "PgUp/PgDn: scroll")
 		}

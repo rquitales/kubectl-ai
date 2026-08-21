@@ -792,7 +792,7 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 					continue // Skip execution for interactive commands
 				}
 
-				if !c.SkipPermissions && modifiesResourceToolCallIndex >= 0 {
+				if !c.SkipPermissionsEnabled() && modifiesResourceToolCallIndex >= 0 {
 					// In RunOnce mode, exit with error if permission is required
 					if c.RunOnce {
 						var commandDescriptions []string
@@ -1204,6 +1204,36 @@ func (c *Agent) LoadSession(sessionID string) error {
 	return nil
 }
 
+// ToggleSkipPermissions flips auto-accept mode (skipping permission
+// prompts) and returns the new state. Safe to call from UI goroutines.
+func (c *Agent) ToggleSkipPermissions() bool {
+	c.sessionMu.Lock()
+	defer c.sessionMu.Unlock()
+	c.SkipPermissions = !c.SkipPermissions
+	return c.SkipPermissions
+}
+
+// SkipPermissionsEnabled reports whether auto-accept mode is on.
+// Safe to call from any goroutine.
+func (c *Agent) SkipPermissionsEnabled() bool {
+	c.sessionMu.Lock()
+	defer c.sessionMu.Unlock()
+	return c.skipPermissions()
+}
+
+// setSkipPermissionsEnabled sets auto-accept mode under the lock.
+func (c *Agent) setSkipPermissionsEnabled(enabled bool) {
+	c.sessionMu.Lock()
+	defer c.sessionMu.Unlock()
+	c.SkipPermissions = enabled
+}
+
+// skipPermissions reads the flag without locking; the caller must hold
+// sessionMu.
+func (c *Agent) skipPermissions() bool {
+	return c.SkipPermissions
+}
+
 // openModelPicker presents an interactive picker of the provider's models
 // (used by the bare "model" meta query).
 func (c *Agent) openModelPicker(ctx context.Context) (answer string, handled bool, err error) {
@@ -1491,7 +1521,7 @@ func (c *Agent) handleChoice(ctx context.Context, choice *api.UserChoiceResponse
 	case 1:
 		dispatchToolCalls = true
 	case 2:
-		c.SkipPermissions = true
+		c.setSkipPermissionsEnabled(true)
 		dispatchToolCalls = true
 	case 3:
 		c.currChatContent = append(c.currChatContent, gollm.FunctionCallResult{

@@ -663,3 +663,29 @@ func TestSlashCommandPassesThroughToAgent(t *testing.T) {
 		t.Errorf("Query = %q, want %q", resp.Query, "/rename my session")
 	}
 }
+
+func TestShiftTabTogglesAutoMode(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.width, m.height = 100, 40
+	m.resize()
+
+	if a.SkipPermissionsEnabled() {
+		t.Fatal("precondition: auto mode off")
+	}
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyShiftTab})
+	if !a.SkipPermissionsEnabled() {
+		t.Error("expected auto mode on after shift+tab")
+	}
+	if len(m.messages) == 0 {
+		t.Error("expected a transcript confirmation message")
+	}
+	if got := m.View(); !strings.Contains(got, "AUTO") {
+		t.Error("expected AUTO indicator in status bar")
+	}
+
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyShiftTab})
+	if a.SkipPermissionsEnabled() {
+		t.Error("expected auto mode off after second shift+tab")
+	}
+}
