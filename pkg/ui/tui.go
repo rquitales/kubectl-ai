@@ -451,52 +451,52 @@ func newModel(agent *agent.Agent) model {
 	return m
 }
 
-// Mouse capture for wheel scrolling, matching what Claude Code emits so the
-// behaviour works on the same terminals (confirmed on Apple Terminal):
+// Wheel scrolling via DECSET 1007 (Alternate Scroll Mode) only.
 //
-//	ESC[?1000h  X10 mouse tracking  — button press/release + wheel, NO drag
-//	ESC[?1006h  SGR mouse encoding — coordinates as decimal, M/m terminator
-//	ESC[?1007h  Alternate Scroll Mode — wheel also delivered as arrow keys
+// 1007 makes the terminal translate the scroll wheel into Up/Down arrow
+// keys while the app is in the alternate screen buffer, and reports NOTHING
+// else — no button presses, no drags. So native click-and-drag text
+// selection is never stolen, and no SGR mouse reports are ever generated
+// (which means no burst-split leak into the input box). The wheel arrives
+// as ordinary arrow keys, which the Up/Down handler scrolls (see handleKey)
+// when the input is empty.
 //
-// This is deliberately NOT cell-motion (1002) or all-motion (1003), which
-// additionally report drag events and so steal click-and-drag text selection
-// from the terminal. X10 reports only press/release/wheel; on Apple Terminal
-// a drag still selects (the press is captured but drag motion is not
-// reported), which is how Claude Code keeps both working. The 1007 path is a
-// belt-and-suspenders way for the wheel to also arrive as arrow keys.
+// This is deliberately NOT X10 (1000) or cell/all-motion (1002/1003): on
+// Apple Terminal those capture the drag (breaking selection) and emit SGR
+// reports that leak on fast scroll. 1007 is the only mode that gives wheel
+// scrolling without taking the mouse.
 //
-// The DECSET sequences are written directly to os.Stdout from the command —
-// not via tea.Printf, which is suppressed while the altscreen is active (we
-// always run in altscreen) and wraps the payload as a printed line rather
-// than a raw control sequence. Writing to os.Stdout is the same pattern the
-// clipboard copy (OSC 52) already uses in this file.
-type enableMouseMsg struct{}
-type disableMouseMsg struct{}
+// The DECSET sequence is written directly to os.Stdout — not via tea.Printf,
+// which is suppressed while the altscreen is active (we always run in
+// altscreen) and wraps the payload as a printed line rather than a raw
+// control sequence. This is the same pattern the clipboard copy (OSC 52)
+// already uses in this file.
+type enableWheelMsg struct{}
+type disableWheelMsg struct{}
 
 const (
-	decSetMouse   = "\x1b[?1000h\x1b[?1006h\x1b[?1007h"
-	decResetMouse = "\x1b[?1007l\x1b[?1006l\x1b[?1000l"
+	decSetWheel   = "\x1b[?1007h"
+	decResetWheel = "\x1b[?1007l"
 )
 
-func enableMouse() tea.Cmd {
+func enableWheel() tea.Cmd {
 	return func() tea.Msg {
-		_, _ = os.Stdout.WriteString(decSetMouse)
-		return enableMouseMsg{}
+		_, _ = os.Stdout.WriteString(decSetWheel)
+		return enableWheelMsg{}
 	}
 }
-func disableMouse() tea.Cmd {
+func disableWheel() tea.Cmd {
 	return func() tea.Msg {
-		_, _ = os.Stdout.WriteString(decResetMouse)
-		return disableMouseMsg{}
+		_, _ = os.Stdout.WriteString(decResetWheel)
+		return disableWheelMsg{}
 	}
 }
 
 func (m model) Init() tea.Cmd {
 	return tea.Batch(
 		textarea.Blink, m.spinner.Tick, m.tick(),
-		// Enable mouse wheel scrolling (X10 + SGR + alt-scroll). See
-		// enableMouseMsg above.
-		enableMouse(),
+		// Enable wheel scrolling via DECSET 1007. See enableWheelMsg above.
+		enableWheel(),
 	)
 }
 
@@ -510,20 +510,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		m.dirty = true
 		m.resize()
-		// A resize can reset the terminal's mouse/scroll-mode state, so
-		// re-request it; otherwise the wheel stops scrolling after resizing.
-		return m, enableMouse()
+		// A resize can reset the terminal's scroll-mode state, so re-request
+		// it; otherwise the wheel stops scrolling after resizing.
+		return m, enableWheel()
 
-	case enableMouseMsg, disableMouseMsg:
+	case enableWheelMsg, disableWheelMsg:
 		// The DECSET sequence was already written to os.Stdout by the
 		// command; nothing more to do here.
 		return m, nil
 
 	case tea.KeyMsg:
 		return m.handleKey(msg)
-
-	case tea.MouseMsg:
-		return m.handleMouse(msg)
 
 	case *api.Message:
 		return m.handleAgentMsg(msg)
@@ -861,21 +858,6 @@ func (m *model) navigateList(keyType tea.KeyType) tea.Cmd {
 	return cmd
 }
 
-// handleMouse routes mouse events. Under X10 (1000) the scroll wheel
-// arrives as WheelUp/WheelDown button events, which we scroll; clicks and
-// drags are not reported as motion (only press/release), so the terminal
-// keeps drag-selection — we ignore non-wheel events here.
-func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
-	const wheelStep = 3
-	switch msg.Button {
-	case tea.MouseButtonWheelUp:
-		m.viewport.ScrollUp(wheelStep)
-	case tea.MouseButtonWheelDown:
-		m.viewport.ScrollDown(wheelStep)
-	}
-	return m, nil
-}
-
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.justSubmitted {
 		m.justSubmitted = false
@@ -908,9 +890,9 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyCtrlC, tea.KeyCtrlD:
 		m.quitting = true
-		// Reset mouse/scroll modes on quit so the terminal reverts to its
-		// default behavior after exit.
-		return m, tea.Batch(tea.Quit, disableMouse())
+		// Reset alternate scroll mode on quit so the terminal reverts to its
+		// default wheel behavior after exit.
+		return m, tea.Batch(tea.Quit, disableWheel())
 	case tea.KeyEsc:
 		return m.handleEsc()
 	case tea.KeyCtrlL:
