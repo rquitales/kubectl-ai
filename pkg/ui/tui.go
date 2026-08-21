@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"strings"
 	"sync"
@@ -25,9 +26,10 @@ import (
 
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/agent"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
+	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/spinner"
-	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
@@ -115,8 +117,14 @@ type TUI struct {
 }
 
 func NewTUI(agent *agent.Agent) *TUI {
+	// Mouse capture is enabled for smooth wheel scrolling. Text can still be
+	// selected/copied with the terminal's standard bypass for mouse-capturing
+	// apps (hold Shift on most terminals, Option on iTerm2, while dragging) —
+	// the same convention opencode, vim and tmux users are used to. We do NOT
+	// use WithMouseAllMotion: we only care about the wheel, and cell motion
+	// keeps the event volume down.
 	return &TUI{
-		program: tea.NewProgram(newModel(agent), tea.WithAltScreen(), tea.WithMouseAllMotion()),
+		program: tea.NewProgram(newModel(agent), tea.WithAltScreen(), tea.WithMouseCellMotion()),
 		agent:   agent,
 	}
 }
@@ -130,6 +138,9 @@ func (u *TUI) Run(ctx context.Context) error {
 	}
 	klog.SetOutput(io.Discard)
 	klog.LogToStderr(false)
+	// The standard log package captured the original stderr at init time;
+	// silence it as well so provider logs can't corrupt the UI.
+	log.SetOutput(io.Discard)
 
 	go func() {
 		for {
@@ -165,6 +176,26 @@ func (m *model) fetchSessions() tea.Msg {
 }
 
 type tickMsg time.Time
+
+const (
+	// maxInputHeight is the maximum number of lines the input box grows to
+	// before it starts scrolling internally.
+	maxInputHeight = 8
+	// pasteCollapseLines is the minimum number of lines in a pasted chunk
+	// for it to be collapsed into a compact placeholder token instead of
+	// being inserted into the input verbatim.
+	pasteCollapseLines = 3
+)
+
+// pastedBlock holds the contents of a large paste. Instead of flooding the
+// input with the full text, the paste is attached to the draft and shown as
+// a compact "[+N lines]" chip below the input (like opencode). The attached
+// content is appended to the message when it is submitted.
+type pastedBlock struct {
+	id      int
+	lines   int
+	content string
+}
 
 // Render cache for markdown
 type renderCache struct {
@@ -212,18 +243,29 @@ func (rc *renderCache) getRenderer(width int) (*glamour.TermRenderer, error) {
 
 // Model state
 type model struct {
-	agent      *agent.Agent
-	viewport   viewport.Model
-	input      textinput.Model
-	spinner    spinner.Model
-	list       list.Model
-	cache      *renderCache
-	messages   []*api.Message
-	width      int
-	height     int
-	dirty      bool
-	quitting   bool
-	thinkStart time.Time
+	agent       *agent.Agent
+	viewport    viewport.Model
+	input       textarea.Model
+	inputHeight int
+	pastes      []pastedBlock
+	nextPasteID int
+	// Input history navigation (previous submitted messages, oldest first).
+	inputHistory []string
+	historyIdx   int // -1 when not navigating
+	historyDraft string
+	// justSubmitted is set after a submit. Terminals that send CRLF for
+	// Return deliver a phantom LF (KeyCtrlJ) right after the CR; it is
+	// swallowed so it doesn't leave a stray newline in the next draft.
+	justSubmitted bool
+	spinner       spinner.Model
+	list          list.Model
+	cache         *renderCache
+	messages      []*api.Message
+	width         int
+	height        int
+	dirty         bool
+	quitting      bool
+	thinkStart    time.Time
 	// Choice mode tracking
 	inChoiceMode   bool
 	choicePrompt   string
@@ -233,15 +275,31 @@ type model struct {
 }
 
 func newModel(agent *agent.Agent) model {
-	ti := textinput.New()
+	ti := textarea.New()
 	ti.Placeholder = "Ask kubectl-ai anything..."
 	ti.Focus()
 	ti.Prompt = ""
 	ti.CharLimit = 4096
-	ti.Width = 80
-	ti.TextStyle = textStyle
-	ti.PlaceholderStyle = dimStyle
+	ti.ShowLineNumbers = false
+	ti.SetWidth(80)
+	// The textarea keeps a fixed internal height and we clip the rendered
+	// view to the content's height (see viewInput). This avoids a class of
+	// scroll bugs: the textarea scrolls its internal viewport to follow the
+	// cursor, and shrinking/growing the height afterwards leaves the scroll
+	// offset stale (e.g. the first line vanishing after Ctrl+J).
+	ti.SetHeight(maxInputHeight)
+	ti.FocusedStyle.Base = textStyle
+	ti.FocusedStyle.Text = textStyle
+	ti.FocusedStyle.Placeholder = dimStyle
+	ti.FocusedStyle.CursorLine = lipgloss.NewStyle()
 	ti.Cursor.Style = primaryText
+	// Enter submits the message (handled by us); Ctrl+J or Alt+Enter inserts
+	// a newline.
+	ti.KeyMap.InsertNewline = key.NewBinding(key.WithKeys("ctrl+j", "alt+enter"))
+	// Plain Up/Down are handled by us (input history navigation, and cursor
+	// movement within multi-line drafts); Ctrl+P/N also moves between lines.
+	ti.KeyMap.LinePrevious = key.NewBinding(key.WithKeys("ctrl+p"))
+	ti.KeyMap.LineNext = key.NewBinding(key.WithKeys("ctrl+n"))
 
 	sp := spinner.New()
 	sp.Spinner = spinner.MiniDot
@@ -255,21 +313,22 @@ func newModel(agent *agent.Agent) model {
 	l.SetShowTitle(false)
 
 	vp := viewport.New(80, 20)
-	vp.MouseWheelEnabled = true
 
 	return model{
-		agent:    agent,
-		input:    ti,
-		viewport: vp,
-		spinner:  sp,
-		list:     l,
-		cache:    newRenderCache(),
-		dirty:    true,
+		agent:       agent,
+		input:       ti,
+		inputHeight: 1,
+		historyIdx:  -1,
+		viewport:    vp,
+		spinner:     sp,
+		list:        l,
+		cache:       newRenderCache(),
+		dirty:       true,
 	}
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(textinput.Blink, m.spinner.Tick, m.tick())
+	return tea.Batch(textarea.Blink, m.spinner.Tick, m.tick())
 }
 
 func (m model) tick() tea.Cmd {
@@ -348,7 +407,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *model) resize() {
 	m.viewport.Width = m.width - 2
-	m.input.Width = m.width - 6
+	// The textarea must fit the input box's content area exactly: box border
+	// (2) + box padding (2) + outer padding (2) = 6, plus 2 cells of slack
+	// so rendered lines never reach the terminal's last column and wrap.
+	m.input.SetWidth(max(m.width-8, 20))
 	m.list.SetWidth(m.width - 4)
 	m.updateViewportHeight()
 	m.refresh()
@@ -356,11 +418,61 @@ func (m *model) resize() {
 }
 
 func (m *model) updateViewportHeight() {
-	// Layout: status(1) + 2 dividers(2) + input(3) + help(1) + bottom padding(1) = 8
-	contentH := m.height - 8
+	// Layout: status(1) + 2 dividers(2) + input block + help(1) + bottom padding(1)
+	contentH := m.height - (m.inputBlockHeight() + 5)
 
 	contentH = max(contentH, 5)
 	m.viewport.Height = contentH
+}
+
+// inputBlockHeight returns the number of terminal rows the input area
+// occupies. It must match what viewInput renders.
+func (m *model) inputBlockHeight() int {
+	if m.inChoiceMode || m.agentState() == api.AgentStateRunning || m.agentState() == api.AgentStateInitializing {
+		return 3 // one-line hint/spinner box + 2 borders
+	}
+	h := m.inputHeight + 2 // +2 for the box borders
+	if len(m.pastes) > 0 {
+		h++ // paste attachment chips line
+	}
+	return h
+}
+
+func (m *model) agentState() api.AgentState {
+	if m.agent == nil {
+		return api.AgentStateIdle
+	}
+	return m.agent.AgentState()
+}
+
+// syncInputHeight recomputes the input box height from its (soft-wrapped)
+// content, capped at maxInputHeight lines, and adjusts the viewport height
+// accordingly. The textarea itself keeps a fixed internal height; we only
+// clip how many of its rendered lines we show (see viewInput).
+func (m *model) syncInputHeight() {
+	h := min(visualLines(m.input.Value(), m.input.Width()), maxInputHeight)
+	if h == m.inputHeight {
+		return
+	}
+	m.inputHeight = h
+	m.updateViewportHeight()
+}
+
+// visualLines estimates how many terminal rows s occupies when soft-wrapped
+// at the given width.
+func visualLines(s string, width int) int {
+	if width <= 0 {
+		return 1
+	}
+	lines := 0
+	for _, l := range strings.Split(s, "\n") {
+		if w := lipgloss.Width(l); w == 0 {
+			lines++
+		} else {
+			lines += (w + width - 1) / width
+		}
+	}
+	return max(lines, 1)
 }
 
 func (m *model) navigateList(keyType tea.KeyType) tea.Cmd {
@@ -372,49 +484,182 @@ func (m *model) navigateList(keyType tea.KeyType) tea.Cmd {
 }
 
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.justSubmitted {
+		m.justSubmitted = false
+		if msg.Type == tea.KeyCtrlJ {
+			// Terminals that send CRLF for Return: swallow the phantom LF
+			// that follows the CR, so it doesn't leave a stray newline in
+			// the next draft.
+			return m, nil
+		}
+	}
+
+	// Bracketed paste arrives as a single key message with Paste set.
+	// Handle it before anything else so pasted text never triggers shortcuts.
+	if msg.Paste {
+		return m.handlePaste(msg)
+	}
+
 	switch msg.Type {
 	case tea.KeyCtrlC, tea.KeyCtrlD:
 		m.quitting = true
 		return m, tea.Quit
 	case tea.KeyEsc:
 		m.input.Reset()
+		m.pastes = nil
+		m.historyIdx = -1
+		m.historyDraft = ""
+		m.syncInputHeight()
 		return m, nil
 	case tea.KeyEnter:
+		if msg.Alt {
+			// Alt+Enter inserts a newline (bound in the textarea keymap).
+			var cmd tea.Cmd
+			m.input, cmd = m.input.Update(msg)
+			m.syncInputHeight()
+			return m, cmd
+		}
 		return m.handleEnter()
 	case tea.KeyUp:
 		if m.inChoiceMode {
 			return m, m.navigateList(tea.KeyUp)
 		}
-		m.viewport.ScrollUp(1)
+		// Within a multi-line draft, Up moves the cursor until the first
+		// line; from there (and for single-line drafts) it recalls older
+		// input history, like opencode and Claude Code.
+		if m.input.LineCount() > 1 && m.input.Line() > 0 {
+			m.input.CursorUp()
+			return m, nil
+		}
+		m.historyPrev()
 	case tea.KeyDown:
 		if m.inChoiceMode {
 			return m, m.navigateList(tea.KeyDown)
 		}
-		m.viewport.ScrollDown(1)
+		if m.input.LineCount() > 1 && m.input.Line() < m.input.LineCount()-1 {
+			m.input.CursorDown()
+			return m, nil
+		}
+		m.historyNext()
 	case tea.KeyPgUp:
 		m.viewport.ScrollUp(m.viewport.Height / 2)
 	case tea.KeyPgDown:
 		m.viewport.ScrollDown(m.viewport.Height / 2)
+	case tea.KeyBackspace:
+		if m.inChoiceMode {
+			return m, nil
+		}
+		// With an empty input, Backspace detaches the most recent paste.
+		if m.input.Value() == "" && len(m.pastes) > 0 {
+			m.pastes = m.pastes[:len(m.pastes)-1]
+			m.syncInputHeight()
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.input, cmd = m.input.Update(msg)
+		m.syncInputHeight()
+		return m, cmd
 	default:
-		switch msg.String() {
-		case "ctrl+u":
-			m.viewport.ScrollUp(m.viewport.Height / 2)
-		case "ctrl+d":
-			m.viewport.ScrollDown(m.viewport.Height / 2)
-		case "j":
-			if m.inChoiceMode {
+		if m.inChoiceMode {
+			switch msg.String() {
+			case "j":
 				return m, m.navigateList(tea.KeyDown)
-			}
-		case "k":
-			if m.inChoiceMode {
+			case "k":
 				return m, m.navigateList(tea.KeyUp)
 			}
+			// Don't let keystrokes accumulate invisibly in the input
+			// while a choice picker is active.
+			return m, nil
 		}
 		// Default: send to text input
 		var cmd tea.Cmd
 		m.input, cmd = m.input.Update(msg)
+		m.syncInputHeight()
 		return m, cmd
 	}
+	return m, nil
+}
+
+// rebuildInputHistory refreshes the input history from the current session's
+// user messages (oldest first, consecutive duplicates removed).
+func (m *model) rebuildInputHistory() {
+	m.inputHistory = m.inputHistory[:0]
+	for _, msg := range m.messages {
+		if msg.Source != api.MessageSourceUser || msg.Type != api.MessageTypeText {
+			continue
+		}
+		p, ok := msg.Payload.(string)
+		if !ok || strings.TrimSpace(p) == "" {
+			continue
+		}
+		if n := len(m.inputHistory); n > 0 && m.inputHistory[n-1] == p {
+			continue
+		}
+		m.inputHistory = append(m.inputHistory, p)
+	}
+}
+
+// historyPrev recalls the previous submitted message into the input, saving
+// the current draft when navigation starts.
+func (m *model) historyPrev() {
+	if m.historyIdx == -1 {
+		m.rebuildInputHistory()
+		if len(m.inputHistory) == 0 {
+			return
+		}
+		m.historyDraft = m.input.Value()
+		m.historyIdx = len(m.inputHistory) - 1
+	} else if m.historyIdx > 0 {
+		m.historyIdx--
+	} else {
+		return // already at the oldest entry
+	}
+	m.input.SetValue(m.inputHistory[m.historyIdx])
+	m.syncInputHeight()
+}
+
+// historyNext moves towards newer history entries, finally restoring the
+// draft that was being edited when navigation started.
+func (m *model) historyNext() {
+	if m.historyIdx == -1 {
+		return
+	}
+	if m.historyIdx < len(m.inputHistory)-1 {
+		m.historyIdx++
+		m.input.SetValue(m.inputHistory[m.historyIdx])
+	} else {
+		m.historyIdx = -1
+		m.input.SetValue(m.historyDraft)
+		m.historyDraft = ""
+	}
+	m.syncInputHeight()
+}
+
+// handlePaste inserts pasted text into the input. Large multi-line pastes are
+// attached to the draft and shown as a compact "[+N lines]" chip below the
+// input (like opencode) instead of flooding the input; the attached content
+// is appended to the message on submit. Short pastes are inserted verbatim.
+func (m *model) handlePaste(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.inChoiceMode {
+		return m, nil
+	}
+
+	content := strings.ReplaceAll(string(msg.Runes), "\r\n", "\n")
+	content = strings.ReplaceAll(content, "\r", "\n")
+	// A trailing newline is almost always a copy artifact; drop it so that
+	// pasting a single line doesn't grow the input.
+	content = strings.TrimSuffix(content, "\n")
+	if content == "" {
+		return m, nil
+	}
+
+	if n := strings.Count(content, "\n") + 1; n >= pasteCollapseLines {
+		m.nextPasteID++
+		m.pastes = append(m.pastes, pastedBlock{id: m.nextPasteID, lines: n, content: content})
+	} else {
+		m.input.InsertString(content)
+	}
+	m.syncInputHeight()
 	return m, nil
 }
 
@@ -453,7 +698,19 @@ func (m *model) handleEnter() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	value := strings.TrimSpace(m.input.Value())
+	value := m.input.Value()
+	// Attach the full content of collapsed pastes to the submitted message.
+	if len(m.pastes) > 0 {
+		var parts []string
+		if strings.TrimSpace(value) != "" {
+			parts = append(parts, value)
+		}
+		for _, p := range m.pastes {
+			parts = append(parts, p.content)
+		}
+		value = strings.Join(parts, "\n\n")
+	}
+	value = strings.TrimSpace(value)
 	if value == "" {
 		return m, nil
 	}
@@ -466,12 +723,17 @@ func (m *model) handleEnter() (tea.Model, tea.Cmd) {
 		Timestamp: time.Now(),
 	})
 	m.input.Reset()
+	m.pastes = nil
+	m.historyIdx = -1
+	m.historyDraft = ""
+	m.justSubmitted = true
+	m.syncInputHeight()
 	m.dirty = true
 	m.refresh()
 	m.viewport.GotoBottom()
 
 	// Intercept "sessions" command
-	if value == "sessions" {
+	if strings.EqualFold(value, "sessions") {
 		return m, m.fetchSessions
 	}
 
@@ -530,8 +792,14 @@ func (m *model) handleAgentMsg(msg *api.Message) (tea.Model, tea.Cmd) {
 		m.choiceOptionID = ""
 	}
 
+	// Only follow the transcript to the bottom if the user is already at the
+	// bottom; yanking the viewport down while the user scrolled up (e.g. to
+	// select text for copying) is hostile.
+	atBottom := m.viewport.AtBottom()
 	m.refresh()
-	m.viewport.GotoBottom()
+	if atBottom {
+		m.viewport.GotoBottom()
+	}
 
 	if session.AgentState == api.AgentStateRunning || session.AgentState == api.AgentStateInitializing {
 		return m, m.spinner.Tick
@@ -551,10 +819,12 @@ func (m model) renderMessages() string {
 	var sb strings.Builder
 
 	if len(m.messages) == 0 {
-		sb.WriteString(fmt.Sprintf("\n%s\n\n%s\n%s\n",
+		sb.WriteString(fmt.Sprintf("\n%s\n\n%s\n%s\n%s\n%s\n",
 			primaryText.Render(logo),
 			mutedStyle.PaddingLeft(1).Render("Your AI-powered Kubernetes assistant"),
-			dimStyle.PaddingLeft(1).Render("Type a message to get started")))
+			dimStyle.PaddingLeft(1).Render("Type a message to get started"),
+			dimStyle.PaddingLeft(1).Render("Type 'sessions' to browse and resume past sessions"),
+			dimStyle.PaddingLeft(1).Render("Hold Shift (Option on iTerm2) and drag to copy text")))
 	} else {
 		width := min(m.viewport.Width-6, 90)
 		if width < 40 {
@@ -748,7 +1018,26 @@ func (m model) viewInput(state api.AgentState) string {
 		return lipgloss.NewStyle().Padding(0, 1).Render(inputBoxDim.Width(m.width - 4).Render(content))
 	}
 
-	return lipgloss.NewStyle().Padding(0, 1).Render(inputBox.Width(m.width - 4).Render(m.input.View()))
+	// The textarea has a fixed internal height; show only as many lines as
+	// the content needs (it scrolls internally once content exceeds
+	// maxInputHeight, so the cursor line is always within the window).
+	view := m.input.View()
+	lines := strings.Split(view, "\n")
+	if len(lines) > m.inputHeight {
+		lines = lines[:m.inputHeight]
+	}
+	content := strings.Join(lines, "\n")
+
+	// Collapsed pastes are shown as chips below the input.
+	if len(m.pastes) > 0 {
+		chips := make([]string, len(m.pastes))
+		for i, p := range m.pastes {
+			chips[i] = warnText.Render(fmt.Sprintf("[+%d lines]", p.lines))
+		}
+		content += "\n" + strings.Join(chips, " ")
+	}
+
+	return lipgloss.NewStyle().Padding(0, 1).Render(inputBox.Width(m.width - 4).Render(content))
 }
 
 func (m model) viewHelp(state api.AgentState) string {
@@ -758,9 +1047,9 @@ func (m model) viewHelp(state api.AgentState) string {
 	} else if state == api.AgentStateRunning {
 		hints = []string{"Ctrl+C: cancel"}
 	} else {
-		hints = []string{"Enter: send", "Esc: clear", "Ctrl+C: quit"}
+		hints = []string{"Enter: send", "Ctrl+J: newline", "↑/↓: history", "Esc: clear", "Ctrl+C: quit"}
 		if m.viewport.TotalLineCount() > m.viewport.Height {
-			hints = append(hints, "↑/↓: scroll")
+			hints = append(hints, "PgUp/PgDn: scroll")
 		}
 	}
 	return dimStyle.Padding(0, 2, 1, 2).Render(strings.Join(hints, " • "))
