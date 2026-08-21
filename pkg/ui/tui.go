@@ -132,12 +132,18 @@ type TUI struct {
 }
 
 func NewTUI(agent *agent.Agent) *TUI {
-	// Mouse cell-motion capture is enabled from Init (via the
-	// EnableMouseCellMotion command) rather than as a program option, so the
-	// mouse-enable escape sequence is written after the first render when
-	// the terminal is in alt-screen mode and ready to consume it —
-	// otherwise some terminals echo the sequence as literal text into the
-	// input box on startup.
+	// Enable wheel scrolling (DECSET 1007, Alternate Scroll Mode) BEFORE
+	// handing the terminal to bubbletea. Writing it here — before
+	// tea.NewProgram and thus before any rendering — avoids the startup
+	// frame storm, where an out-of-band os.Stdout write from a tea.Cmd can
+	// race with the renderer's compressed frame flushes and get dropped.
+	// DEC private modes are terminal-wide and persist across the alt-screen
+	// switch that WithAltScreen performs next, so setting 1007 here survives
+	// 1049h. This is the only mode we enable: it reports ONLY the wheel as
+	// arrow keys, never button presses or drags, so native click-and-drag
+	// text selection keeps working (unlike 1000/1002/1003, which capture the
+	// drag and on Apple Terminal also leak SGR reports on fast scroll).
+	_, _ = os.Stdout.WriteString("\x1b[?1007h")
 	return &TUI{
 		program: tea.NewProgram(newModel(agent), tea.WithAltScreen()),
 		agent:   agent,
