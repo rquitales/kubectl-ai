@@ -622,3 +622,44 @@ func TestBrowserShrinksViewport(t *testing.T) {
 		t.Error("expected non-empty view with browser open")
 	}
 }
+
+func TestSlashSessionsCommandOpensBrowser(t *testing.T) {
+	for _, value := range []string{"sessions", "/sessions", "/session"} {
+		m := newBrowserModel()
+		m.input.SetValue(value)
+
+		_, cmd := m.handleEnter()
+		if cmd == nil {
+			t.Fatalf("%q: expected a command (fetch sessions)", value)
+		}
+		select {
+		case got := <-m.agent.Input:
+			t.Fatalf("intercepted %q must not reach the agent, got %v", value, got)
+		case <-time.After(50 * time.Millisecond):
+		}
+		if m.input.Value() != "" {
+			t.Errorf("%q: expected input to be cleared", value)
+		}
+	}
+}
+
+func TestSlashCommandPassesThroughToAgent(t *testing.T) {
+	m := newBrowserModel()
+	m.input.SetValue("/rename my session")
+
+	_, cmd := m.handleEnter()
+	if cmd == nil {
+		t.Fatal("expected a command sending the query")
+	}
+	go cmd()
+	got := <-m.agent.Input
+	resp, ok := got.(*api.UserInputResponse)
+	if !ok {
+		t.Fatalf("expected *api.UserInputResponse, got %T", got)
+	}
+	// The agent resolves slash commands centrally; the TUI forwards them
+	// verbatim.
+	if resp.Query != "/rename my session" {
+		t.Errorf("Query = %q, want %q", resp.Query, "/rename my session")
+	}
+}

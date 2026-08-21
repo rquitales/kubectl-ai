@@ -978,8 +978,8 @@ func (m *model) handleEnter() (tea.Model, tea.Cmd) {
 	m.refresh()
 	m.viewport.GotoBottom()
 
-	// Intercept "sessions" command
-	if strings.EqualFold(value, "sessions") {
+	// Intercept the sessions command (handled locally, not sent to the LLM)
+	if v := strings.ToLower(value); v == "/sessions" || v == "/session" || v == "sessions" {
 		return m, m.fetchSessions
 	}
 
@@ -1073,7 +1073,7 @@ func (m model) renderMessages() string {
 			primaryText.Render(logo),
 			mutedStyle.PaddingLeft(1).Render("Your AI-powered Kubernetes assistant"),
 			dimStyle.PaddingLeft(1).Render("Type a message to get started"),
-			dimStyle.PaddingLeft(1).Render("Type 'sessions' to browse and resume past sessions"),
+			dimStyle.PaddingLeft(1).Render("Type /sessions to browse and resume past sessions"),
 			dimStyle.PaddingLeft(1).Render("Hold Shift (Option on iTerm2) and drag to copy text")))
 	} else {
 		width := min(m.viewport.Width-6, 90)

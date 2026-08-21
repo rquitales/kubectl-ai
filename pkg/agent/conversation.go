@@ -834,9 +834,66 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 	return nil
 }
 
+// slashCommands maps slash-command names (without the leading slash) to
+// their canonical meta query form.
+var slashCommands = map[string]string{
+	"clear":    "clear",
+	"reset":    "reset",
+	"exit":     "exit",
+	"quit":     "quit",
+	"model":    "model",
+	"models":   "models",
+	"tools":    "tools",
+	"session":  "session",
+	"sessions": "sessions",
+	"new":      "new-session",
+	"save":     "save-session",
+	"rename":   "rename-session",
+	"resume":   "resume-session",
+}
+
+// normalizeSlashCommand translates a slash-prefixed command (e.g. "/rename
+// my session") into the canonical meta query form ("rename-session my
+// session"). ok is false when the command name is not recognized.
+func normalizeSlashCommand(query string) (normalized string, ok bool) {
+	body := strings.TrimSpace(strings.TrimPrefix(query, "/"))
+	head, rest := body, ""
+	if i := strings.IndexAny(body, " \t"); i >= 0 {
+		head, rest = body[:i], strings.TrimSpace(body[i+1:])
+	}
+	canonical, known := slashCommands[strings.ToLower(head)]
+	if !known {
+		return "", false
+	}
+	if rest != "" {
+		return canonical + " " + rest, true
+	}
+	return canonical, true
+}
+
+// unknownCommandMessage is returned for unrecognized slash commands, so they
+// are never sent to the LLM as regular prompts.
+func unknownCommandMessage(query string) string {
+	names := make([]string, 0, len(slashCommands))
+	for name := range slashCommands {
+		names = append(names, "/"+name)
+	}
+	sort.Strings(names)
+	return fmt.Sprintf("Unknown command `%s`. Available commands: %s", query, strings.Join(names, " "))
+}
+
 func (c *Agent) handleMetaQuery(ctx context.Context, query string) (answer string, handled bool, err error) {
 	// UIs may forward the query with surrounding whitespace/newlines.
 	query = strings.TrimSpace(query)
+	// Resolve slash commands before anything else; unknown ones are
+	// rejected here and never reach the LLM.
+	if strings.HasPrefix(query, "/") {
+		normalized, ok := normalizeSlashCommand(query)
+		if !ok {
+			return unknownCommandMessage(query), true, nil
+		}
+		query = normalized
+	}
 	switch query {
 	case "clear", "reset":
 		c.sessionMu.Lock()
