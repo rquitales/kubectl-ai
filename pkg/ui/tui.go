@@ -397,6 +397,14 @@ type model struct {
 	// Command palette state
 	paletteOpen  bool
 	paletteIndex int
+	// Click-opened picker state (model uses the agent-driven choice list;
+	// context and namespace use this local overlay). Mirrors the palette.
+	pickerOpen   bool
+	pickerKind   pickerKind
+	pickerTitle  string
+	pickerItems  []pickerItem
+	pickerIndex  int
+	pickerStatus string // "Loading…" / error while fetching
 	// Session rename mode: the input captures a new session name instead
 	// of a chat message.
 	sessionRename bool
@@ -531,11 +539,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Keep the spinner alive while the agent is running, even when no
 		// other messages are arriving (e.g. during quiet stretches between
 		// live text deltas, without spawning per-chunk tick chains).
-		if m.agentState() == api.AgentStateRunning || m.agentState() == api.AgentStateInitializing {
+		if m.agentState() == api.AgentStateRunning || m.agentState() == api.AgentStateInitializing || m.pickerOpen {
 			m.spinner, _ = m.spinner.Update(msg)
 			// An in-flight tool call renders the live spinner in the
 			// transcript; re-render so it advances each tick instead of
-			// freezing on a single frame.
+			// freezing on a single frame. The picker's "Loading…" row uses
+			// the same spinner, so advance it here too.
 			if m.hasInFlightToolCall() {
 				m.dirty = true
 				m.refresh()
@@ -543,6 +552,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if atBottom {
 					m.viewport.GotoBottom()
 				}
+			}
+			if m.pickerOpen {
+				m.dirty = true
 			}
 		}
 		return m, m.tick()
@@ -632,6 +644,54 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refresh()
 		m.viewport.GotoBottom()
 		return m, nil
+
+	case contextListMsg:
+		// Drop the result if the user closed the picker or switched kinds.
+		if !m.pickerOpen || m.pickerKind != pickerContext {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.pickerStatus = msg.err.Error()
+			return m, nil
+		}
+		m.pickerItems = make([]pickerItem, len(msg.names))
+		for i, n := range msg.names {
+			m.pickerItems[i] = pickerItem{value: n, current: n == msg.current}
+		}
+		m.pickerIndex = 0
+		// Preselect the active row, like the session browser does.
+		for i, it := range m.pickerItems {
+			if it.current {
+				m.pickerIndex = i
+				break
+			}
+		}
+		m.pickerStatus = ""
+		m.updateViewportHeight()
+		return m, nil
+
+	case namespaceListMsg:
+		if !m.pickerOpen || m.pickerKind != pickerNamespace {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.pickerStatus = msg.err.Error()
+			return m, nil
+		}
+		m.pickerItems = make([]pickerItem, len(msg.names))
+		for i, n := range msg.names {
+			m.pickerItems[i] = pickerItem{value: n, current: n == msg.current}
+		}
+		m.pickerIndex = 0
+		for i, it := range m.pickerItems {
+			if it.current {
+				m.pickerIndex = i
+				break
+			}
+		}
+		m.pickerStatus = ""
+		m.updateViewportHeight()
+		return m, nil
 	}
 	return m, nil
 }
@@ -691,6 +751,9 @@ func (m *model) openBrowser(sessions []api.SessionInfo) {
 		m.browserFilter = ""
 		m.browserStatus = browserStatusMsg{}
 		m.renaming = false
+		if m.pickerOpen {
+			m.closePicker()
+		}
 	}
 	m.applyBrowserFilter()
 	// Select the previously-selected session within the filtered view.
@@ -766,6 +829,9 @@ func (m *model) updateViewportHeight() {
 	}
 	if m.paletteOpen && m.width > 0 {
 		contentH -= lipgloss.Height(m.viewPalette())
+	}
+	if m.pickerOpen && m.width > 0 {
+		contentH -= lipgloss.Height(m.viewPicker())
 	}
 
 	contentH = max(contentH, 5)
@@ -948,6 +1014,42 @@ func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		m.viewport.ScrollUp(wheelStep)
 	case tea.MouseButtonWheelDown:
 		m.viewport.ScrollDown(wheelStep)
+	case tea.MouseButtonLeft:
+		// Gate on press: cell-motion streams MouseActionMotion events with
+		// Button==Left while the button is held, so without this one drag
+		// across the status bar would re-open the picker dozens of times.
+		if msg.Action == tea.MouseActionPress {
+			return m.handleStatusClick(msg.X, msg.Y)
+		}
+	}
+	return m, nil
+}
+
+// handleStatusClick maps a left-click on the top status bar (y==0) to the
+// appropriate picker, recomputing the segment column ranges from statusLayout
+// (they aren't stashed, because View has a value receiver). The "/" cell
+// between context and namespace belongs to neither span, so a click there is
+// a no-op. Clicks are no-ops while a flash is active, the terminal is too
+// narrow to place the segments, or an agent prompt / rename is capturing input.
+func (m *model) handleStatusClick(x, y int) (tea.Model, tea.Cmd) {
+	if y != 0 || m.width <= 0 || m.agent == nil {
+		return m, nil
+	}
+	if m.inChoiceMode || m.sessionRename || m.renaming {
+		return m, nil
+	}
+	session := m.agent.GetSession()
+	if session == nil {
+		return m, nil
+	}
+	_, spans := m.statusLayout(session)
+	switch {
+	case spans.model.contains(x):
+		return m, m.sendQuery("/model")
+	case spans.kubeContext.contains(x):
+		return m, m.openPicker(pickerContext, "Kube context")
+	case spans.kubeNamespace.contains(x):
+		return m, m.openPicker(pickerNamespace, "Namespace")
 	}
 	return m, nil
 }
@@ -994,6 +1096,12 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// While the command palette is open it captures all keys except quit.
 	if m.paletteOpen && msg.Type != tea.KeyCtrlC && msg.Type != tea.KeyCtrlD {
 		return m.handlePaletteKey(msg)
+	}
+
+	// While a click-opened picker (context/namespace) is open it captures keys
+	// except quit, mirroring the palette.
+	if m.pickerOpen && msg.Type != tea.KeyCtrlC && msg.Type != tea.KeyCtrlD {
+		return m.handlePickerKey(msg)
 	}
 
 	// Bracketed paste arrives as a single key message with Paste set.
@@ -1468,6 +1576,21 @@ type paletteItem struct {
 	run   func(m *model) (tea.Model, tea.Cmd)
 }
 
+// pickerKind selects which list a click-opened picker shows.
+type pickerKind int
+
+const (
+	pickerNone pickerKind = iota
+	pickerContext
+	pickerNamespace
+)
+
+// pickerItem is a row in the click-opened context/namespace picker.
+type pickerItem struct {
+	value   string
+	current bool // marks the active context/namespace
+}
+
 // paletteItems returns the current palette actions (some are dynamic).
 func (m *model) paletteItems() []paletteItem {
 	items := []paletteItem{
@@ -1533,6 +1656,9 @@ func (m *model) openPalette() {
 	if m.browserOpen {
 		m.closeBrowser()
 	}
+	if m.pickerOpen {
+		m.closePicker()
+	}
 	m.paletteOpen = true
 	m.paletteIndex = 0
 	m.updateViewportHeight()
@@ -1578,6 +1704,139 @@ func (m *model) handlePaletteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.movePaletteSelection(-1)
 	}
 	return m, nil
+}
+
+// contextListMsg and namespaceListMsg carry the async result of fetching
+// contexts/namespaces for the click-opened picker. The fetch runs as a tea.Cmd
+// (on bubbletea's goroutine) because both list calls can be slow — namespaces
+// shell out to `kubectl get namespaces` — and must not stall the Update loop.
+type contextListMsg struct {
+	names   []string
+	current string
+	err     error
+}
+
+type namespaceListMsg struct {
+	names   []string
+	current string
+	err     error
+}
+
+// openPicker opens the context or namespace picker, fetching its list
+// asynchronously. Mirrors openPalette: closes other overlays, sets state, and
+// returns the fetch command (or nil if a choice prompt is already blocking).
+func (m *model) openPicker(kind pickerKind, title string) tea.Cmd {
+	if m.inChoiceMode || m.sessionRename || m.renaming {
+		return nil // an agent prompt or rename is already capturing input
+	}
+	if m.browserOpen {
+		m.closeBrowser()
+	}
+	if m.paletteOpen {
+		m.closePalette()
+	}
+	m.pickerOpen = true
+	m.pickerKind = kind
+	m.pickerTitle = title
+	m.pickerItems = nil
+	m.pickerIndex = 0
+	m.pickerStatus = "Loading…"
+	m.updateViewportHeight()
+	switch kind {
+	case pickerContext:
+		return m.fetchContexts
+	case pickerNamespace:
+		return m.fetchNamespaces
+	}
+	return nil
+}
+
+func (m *model) closePicker() {
+	m.pickerOpen = false
+	m.pickerKind = pickerNone
+	m.pickerItems = nil
+	m.pickerStatus = ""
+	m.updateViewportHeight()
+}
+
+func (m *model) movePickerSelection(delta int) {
+	n := len(m.pickerItems)
+	if n == 0 {
+		return
+	}
+	m.pickerIndex = (m.pickerIndex + delta + n) % n
+}
+
+// handlePickerKey drives the click-opened picker (Esc/Up/Down/Enter + j/k),
+// mirroring handlePaletteKey. Enter captures the selection and kind before
+// closePicker clears them, then sends the corresponding slash command.
+func (m *model) handlePickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc:
+		m.closePicker()
+		return m, nil
+	case tea.KeyUp:
+		m.movePickerSelection(-1)
+		return m, nil
+	case tea.KeyDown:
+		m.movePickerSelection(1)
+		return m, nil
+	case tea.KeyEnter:
+		if m.pickerIndex < 0 || m.pickerIndex >= len(m.pickerItems) {
+			return m, nil
+		}
+		sel := m.pickerItems[m.pickerIndex].value
+		kind := m.pickerKind
+		m.closePicker()
+		switch kind {
+		case pickerContext:
+			return m, m.sendQuery("/context " + sel)
+		case pickerNamespace:
+			return m, m.sendQuery("/namespace " + sel)
+		}
+		return m, nil
+	}
+	switch msg.String() {
+	case "j":
+		m.movePickerSelection(1)
+	case "k":
+		m.movePickerSelection(-1)
+	}
+	return m, nil
+}
+
+// fetchContexts lists kube contexts (from the base kubeconfig) and marks the
+// active one (from the active/session kubeconfig) so the picker's (current)
+// marker agrees with the status bar after a session-scoped override.
+func (m *model) fetchContexts() tea.Msg {
+	if m.agent == nil {
+		return contextListMsg{err: fmt.Errorf("no agent")}
+	}
+	names, err := kube.ListContexts(m.agent.Kubeconfig)
+	if err != nil {
+		return contextListMsg{err: err}
+	}
+	current, _, _ := kube.CurrentContext(m.agent.ActiveKubeconfig())
+	return contextListMsg{names: names, current: current}
+}
+
+// fetchNamespaces lists namespaces via the agent (which shells out to kubectl,
+// so this is slow on a cold cache — hence the async tea.Msg return).
+func (m *model) fetchNamespaces() tea.Msg {
+	if m.agent == nil {
+		return namespaceListMsg{err: fmt.Errorf("no agent")}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	names, err := m.agent.ListNamespaces(ctx)
+	if err != nil {
+		return namespaceListMsg{err: err}
+	}
+	_, current, _ := kube.CurrentContext(m.agent.ActiveKubeconfig())
+	if current == "" {
+		current = "default"
+	}
+	return namespaceListMsg{names: names, current: current}
 }
 
 // sendQuery sends a query (e.g. a slash command) to the agent, exactly as
@@ -2215,9 +2474,12 @@ func (m *model) handleAgentMsg(msg *api.Message) (tea.Model, tea.Cmd) {
 	// Check if we're entering choice mode - use the incoming message directly
 	// to avoid race conditions where the message isn't yet in AllMessages()
 	if msg.Type == api.MessageTypeUserChoiceRequest {
-		// A permission prompt supersedes the session browser.
+		// A permission prompt supersedes the session browser and the picker.
 		if m.browserOpen {
 			m.closeBrowser()
+		}
+		if m.pickerOpen {
+			m.closePicker()
 		}
 		if req, ok := msg.Payload.(*api.UserChoiceRequest); ok {
 			items := make([]list.Item, len(req.Options))
@@ -2934,6 +3196,9 @@ func (m model) View() string {
 	if m.paletteOpen {
 		sections = append(sections, m.viewPalette())
 	}
+	if m.pickerOpen {
+		sections = append(sections, m.viewPicker())
+	}
 	sections = append(sections,
 		m.viewBottomDivider(),
 		m.viewInput(session.AgentState),
@@ -2981,6 +3246,64 @@ func (m model) viewPalette() string {
 
 	sb.WriteString("\n")
 	sb.WriteString(dimStyle.Render("↑/↓/j/k: navigate • enter: run • esc: close"))
+
+	return lipgloss.NewStyle().Padding(0, 1).Render(
+		inputBox.Width(max(m.width-4, 20)).Render(sb.String()))
+}
+
+// pickerRows is the number of picker rows shown, adapted to the terminal
+// height like browserRows so a long context/namespace list never overflows.
+func (m *model) pickerRows() int {
+	n := len(m.pickerItems)
+	if n == 0 {
+		n = 1 // the "Loading…" / error row
+	}
+	avail := m.height - m.inputBlockHeight() - 5 - 5 - 5
+	if avail < 2 {
+		avail = 2
+	}
+	return min(n, avail)
+}
+
+// viewPicker renders the click-opened context/namespace picker above the
+// input, mirroring viewPalette. Long lists window to fit.
+func (m model) viewPicker() string {
+	var sb strings.Builder
+	sb.WriteString(primaryText.Render(m.pickerTitle))
+	sb.WriteString("\n\n")
+
+	if m.pickerStatus != "" {
+		if strings.Contains(m.pickerStatus, "Loading") {
+			sb.WriteString(m.spinner.View() + " " + m.pickerStatus)
+		} else {
+			sb.WriteString(errorText.Render(m.pickerStatus))
+		}
+		sb.WriteString("\n")
+	} else {
+		rows := m.pickerRows()
+		sel := m.pickerIndex
+		// Window around the selection so a 200-row cluster stays in view.
+		start := max(sel-rows/2, 0)
+		if start+rows > len(m.pickerItems) {
+			start = max(len(m.pickerItems)-rows, 0)
+		}
+		for i := start; i < min(start+rows, len(m.pickerItems)); i++ {
+			it := m.pickerItems[i]
+			mark := ""
+			if it.current {
+				mark = dimStyle.Render(" (current)")
+			}
+			if i == sel {
+				sb.WriteString(primaryText.Render("> "+it.value) + mark)
+			} else {
+				sb.WriteString("  " + textStyle.Render(it.value) + mark)
+			}
+			sb.WriteString("\n")
+		}
+	}
+
+	sb.WriteString("\n")
+	sb.WriteString(dimStyle.Render("↑/↓/j/k: navigate • enter: select • esc: close"))
 
 	return lipgloss.NewStyle().Padding(0, 1).Render(
 		inputBox.Width(max(m.width-4, 20)).Render(sb.String()))
@@ -3077,6 +3400,18 @@ func (m model) viewSessionBrowser() string {
 		inputBox.Width(max(m.width-4, 20)).Render(sb.String()))
 }
 
+// statusSpan is a half-open [start, end) column range within the status bar.
+// A zero value (end <= start) means "no target here", which makes the
+// degenerate cases (flash active, narrow terminal, default namespace, or
+// truncation that ate the segment) fall out for free.
+type statusSpan struct{ start, end int }
+
+func (s statusSpan) contains(x int) bool { return s.end > s.start && x >= s.start && x < s.end }
+
+// statusSpans records the click-target column ranges for the three clickable
+// right-hand status-bar segments, computed alongside the rendered string.
+type statusSpans struct{ model, kubeContext, kubeNamespace statusSpan }
+
 // kubeContextInfo is the resolved current kube context/namespace shown in
 // the status bar.
 type kubeContextInfo struct {
@@ -3084,10 +3419,17 @@ type kubeContextInfo struct {
 	namespace string
 }
 
+// hasNamespace reports whether the namespace is shown alongside the context
+// (i.e. it is non-empty and not the default). Used by both String and the
+// status-bar click-span math so they agree on when a namespace target exists.
+func (k kubeContextInfo) hasNamespace() bool {
+	return k.namespace != "" && k.namespace != "default"
+}
+
 // String renders the info as "context/namespace", or the bare context for
 // the default namespace.
 func (k kubeContextInfo) String() string {
-	if k.namespace == "" || k.namespace == "default" {
+	if !k.hasNamespace() {
 		return k.context
 	}
 	return k.context + "/" + k.namespace
@@ -3125,8 +3467,16 @@ func (m *model) resolveKubeContext() {
 	m.kubeContextLast = time.Now()
 }
 
-func (m model) viewStatus(session *api.Session) string {
+// statusLayout builds the status bar string and, alongside it, the column
+// ranges of the three clickable right-hand segments (model, kube context, kube
+// namespace). The spans are recomputed on each click from this pure layout
+// pass rather than stashed on the model, because View() has a value receiver
+// and renders a throwaway copy — stashed fields would never persist. The span
+// math lives here, adjacent to the final render, so the two can't drift.
+func (m model) statusLayout(session *api.Session) (string, statusSpans) {
+	var spans statusSpans
 	sep := dimStyle.Render(" | ")
+	sepW := lipgloss.Width(sep) // 3 cells
 
 	name := session.Name
 	if name == "" {
@@ -3178,12 +3528,13 @@ func (m model) viewStatus(session *api.Session) string {
 		}
 		kube = "⎈ " + m.kubeContext.String()
 	}
+	budget := m.viewContextBudget(totalTokens)
 	renderRight := func(model string) string {
 		s := lipgloss.NewStyle().Foreground(colorSecondary).Render(model)
 		if kube != "" {
 			s += sep + kubeStyle.Render(kube)
 		}
-		if budget := m.viewContextBudget(totalTokens); budget != "" {
+		if budget != "" {
 			s = budget + " " + s
 		}
 		return s
@@ -3192,8 +3543,9 @@ func (m model) viewStatus(session *api.Session) string {
 
 	// A transient flash (copy/interrupt/toggle feedback) replaces the
 	// right-hand segment while active, so the feedback is visible without
-	// entering the transcript.
-	if m.flash != "" && time.Now().Before(m.flashClear) {
+	// entering the transcript. While it's active there are no click targets.
+	flashActive := m.flash != "" && time.Now().Before(m.flashClear)
+	if flashActive {
 		right = lipgloss.NewStyle().Foreground(colorPrimary).Render(m.flash)
 	} else if m.flash != "" {
 		// Expired but not yet cleared by the tick; blank it now.
@@ -3221,11 +3573,62 @@ func (m model) viewStatus(session *api.Session) string {
 	if gap < 0 {
 		// The content can't be shrunk enough to fit (very narrow terminal).
 		// Truncate the joined string so the status bar stays on one line
-		// instead of wrapping.
+		// instead of wrapping. Offsets are meaningless here — no targets.
 		joined := strings.TrimSpace(left + " " + right)
-		return statusBar.Width(m.width).Render(" " + truncateRunes(joined, max(m.width-2, 1)) + " ")
+		return statusBar.Width(m.width).Render(" " + truncateRunes(joined, max(m.width-2, 1)) + " "), spans
 	}
-	return statusBar.Width(m.width).Render(" " + left + strings.Repeat(" ", gap) + right + " ")
+
+	// Compute click spans for the right-hand segments. Anchor from the right
+	// edge: right ends at col m.width-1 (trailing pad), so it starts at
+	// m.width-1-Width(right). Use lipgloss.Width (ANSI-aware, cell counts),
+	// never rune counts — the segments contain styled text and width-1 glyphs
+	// like ⎈ whose runewidth answer can vary.
+	if !flashActive && m.width > 0 {
+		x := m.width - 1 - lipgloss.Width(right)
+		if budget != "" {
+			x += lipgloss.Width(budget) + 1 // budget + one space
+		}
+		spans.model = statusSpan{x, x + lipgloss.Width(model)}
+		x = spans.model.end
+		if kube != "" {
+			x += sepW
+			kubeEnd := x + lipgloss.Width(kube)
+			ctxStart := x + lipgloss.Width("⎈ ")
+			// Derive the context/namespace split from the structured fields
+			// (NOT by splitting kube on "/" — EKS context names are ARNs
+			// containing a literal slash). Mirror kubeContextInfo.String().
+			ctxEnd := ctxStart + lipgloss.Width(m.kubeContext.context)
+			spans.kubeContext = clampSpan(statusSpan{ctxStart, ctxEnd}, kubeEnd)
+			if m.kubeContext.hasNamespace() {
+				// The "/" separator sits between context and namespace.
+				spans.kubeNamespace = clampSpan(statusSpan{ctxEnd + 1, kubeEnd}, kubeEnd)
+			}
+		}
+	}
+
+	return statusBar.Width(m.width).Render(" " + left + strings.Repeat(" ", gap) + right + " "), spans
+}
+
+// clampSpan returns s clamped to [0, limit) — a zero span if s starts at or
+// beyond limit (the segment was truncated out of the rendered string), or with
+// its end brought back within bounds. Without this, spans can point into the
+// trailing pad and clicks in dead space would open pickers.
+func clampSpan(s statusSpan, limit int) statusSpan {
+	if s.start >= limit {
+		return statusSpan{}
+	}
+	if s.end > limit {
+		s.end = limit
+	}
+	return s
+}
+
+// viewStatus returns the status bar string for rendering. The clickable spans
+// are computed by statusLayout and consumed on mouse click; this wrapper drops
+// them so existing render call sites are untouched.
+func (m model) viewStatus(session *api.Session) string {
+	s, _ := m.statusLayout(session)
+	return s
 }
 
 // truncateRunes shortens s to at most n runes, ending with an ellipsis when
