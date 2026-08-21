@@ -93,6 +93,11 @@ type Agent struct {
 	// (set by /context or /namespace), applied via KUBECONFIG for this
 	// process without mutating the base file.
 	kubeconfigOverride string
+	// pinnedKubeconfig is a snapshot of the effective kubeconfig taken at
+	// session start, so external edits to the global kubeconfig (e.g.
+	// `kubectl config use-context` in another terminal) do not change this
+	// session's context. Empty when no kubeconfig was available to pin.
+	pinnedKubeconfig string
 	// Sandbox indicates whether to execute tools in a sandbox environment
 	Sandbox string
 
@@ -380,6 +385,10 @@ func (s *Agent) Init(ctx context.Context) error {
 	}
 
 	s.workDir = workDir
+
+	// Pin a session-scoped snapshot of the kubeconfig so external edits to
+	// the global config do not leak into this session.
+	s.pinSessionKubeconfig()
 
 	// Register tools with executor if none registered yet
 	// We clone existing tools (e.g. custom tools) to ensure we have a fresh map
@@ -1702,7 +1711,29 @@ func (c *Agent) ActiveKubeconfig() string {
 	if c.kubeconfigOverride != "" {
 		return c.kubeconfigOverride
 	}
+	if c.pinnedKubeconfig != "" {
+		return c.pinnedKubeconfig
+	}
 	return c.Kubeconfig
+}
+
+// pinSessionKubeconfig snapshots the effective kubeconfig into the session
+// working directory and points KUBECONFIG at it for this process, so edits
+// made to the global kubeconfig in another terminal do not change this
+// session's context. No-op when no usable kubeconfig is available.
+func (c *Agent) pinSessionKubeconfig() {
+	if c.workDir == "" {
+		return
+	}
+	pinnedPath := filepath.Join(c.workDir, "kubeconfig-pinned")
+	if err := kube.WriteOverride(c.Kubeconfig, pinnedPath, "", ""); err != nil {
+		klog.V(2).Infof("not pinning session kubeconfig: %v", err)
+		return
+	}
+	c.sessionMu.Lock()
+	c.pinnedKubeconfig = pinnedPath
+	c.sessionMu.Unlock()
+	_ = os.Setenv("KUBECONFIG", pinnedPath)
 }
 
 // ListAllTools returns every registered tool (built-in and MCP), safe to call
@@ -1722,7 +1753,15 @@ func (c *Agent) applyKubeOverride(context, namespace string) error {
 		return fmt.Errorf("no working directory for the override kubeconfig")
 	}
 	outPath := filepath.Join(c.workDir, "kubeconfig-override")
-	if err := kube.WriteOverride(c.Kubeconfig, outPath, context, namespace); err != nil {
+	// Derive from the pinned snapshot when present, so /context never picks
+	// up external edits made to the base file after session start.
+	c.sessionMu.Lock()
+	base := c.pinnedKubeconfig
+	c.sessionMu.Unlock()
+	if base == "" {
+		base = c.Kubeconfig
+	}
+	if err := kube.WriteOverride(base, outPath, context, namespace); err != nil {
 		return err
 	}
 
@@ -1743,8 +1782,10 @@ func (c *Agent) resetKubeOverride() {
 	if path != "" {
 		_ = os.Remove(path)
 	}
-	if c.Kubeconfig != "" {
-		_ = os.Setenv("KUBECONFIG", c.Kubeconfig)
+	// Restore the pinned snapshot (or base) — not whatever the base file
+	// currently says, which may have been edited externally.
+	if active := c.ActiveKubeconfig(); active != "" {
+		_ = os.Setenv("KUBECONFIG", active)
 	} else {
 		_ = os.Unsetenv("KUBECONFIG")
 	}
@@ -1762,7 +1803,7 @@ func (c *Agent) handleContextQuery(name string) (answer string, handled bool, er
 
 	if name == "" {
 		current, _, ok := kube.CurrentContext(c.ActiveKubeconfig())
-		names, err := kube.ListContexts(c.Kubeconfig)
+		names, err := kube.ListContexts(c.ActiveKubeconfig())
 		if err != nil {
 			return "", false, fmt.Errorf("listing contexts: %w", err)
 		}
@@ -1787,7 +1828,7 @@ func (c *Agent) handleContextQuery(name string) (answer string, handled bool, er
 	}
 
 	if err := c.applyKubeOverride(name, ""); err != nil {
-		names, _ := kube.ListContexts(c.Kubeconfig)
+		names, _ := kube.ListContexts(c.ActiveKubeconfig())
 		if len(names) > 0 {
 			return "", false, fmt.Errorf("%v. Available contexts: %s", err, strings.Join(names, ", "))
 		}
