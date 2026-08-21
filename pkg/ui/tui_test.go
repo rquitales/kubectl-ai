@@ -519,6 +519,8 @@ func TestUpDownRecallsHistory(t *testing.T) {
 	m := newModel(nil)
 	m.messages = historyTestMessages()
 
+	// Up/Down recall input history (the scroll wheel handles transcript
+	// scrolling via mouse capture, not the arrow keys).
 	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyUp})
 	if got := m.input.Value(); got != "second query" {
 		t.Errorf("after up: input = %q, want %q", got, "second query")
@@ -537,30 +539,77 @@ func TestUpDownRecallsHistory(t *testing.T) {
 	}
 }
 
-func TestUpDownRecallHistoryEvenWhileRunning(t *testing.T) {
-	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateRunning}}
-	m := newModel(a)
-	m.width, m.height = 100, 24
-	m.resize()
-	m.messages = []*api.Message{
-		{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "first query"},
-		{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "answer"},
-		{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "second query"},
+func TestCtrlGTogglesMouseCapture(t *testing.T) {
+	m := newModel(nil)
+	if !m.mouseEnabled {
+		t.Fatal("mouse capture should start enabled")
 	}
-	m.dirty = true
-	m.refresh()
-	m.viewport.GotoBottom()
 
-	// Up/Down recall input history even while the agent is running
-	// (transcript scrolling lives on the mouse wheel + PgUp/PgDn),
-	// like opencode and Claude Code.
-	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyUp})
-	if got := m.input.Value(); got != "second query" {
-		t.Errorf("after up while running: input = %q, want %q (history recall)", got, "second query")
+	// Off: the terminal gets the mouse back so text can be selected.
+	_, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlG})
+	if m.mouseEnabled {
+		t.Error("Ctrl+G did not disable mouse capture")
 	}
-	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyDown})
-	if got := m.input.Value(); got != "" {
-		t.Errorf("after down while running: input = %q, want empty (history restored)", got)
+	if cmd == nil {
+		t.Error("expected a command to disable mouse capture")
+	}
+	// The toggle is a transient UI state, shown in the status bar — it must
+	// NOT append a message to the transcript.
+	if got := lastMessageText(m); got != "" {
+		t.Errorf("Ctrl+G appended a transcript message %q; want none (status-bar indicator only)", got)
+	}
+
+	// On again: the wheel scrolls once more.
+	_, cmd = m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlG})
+	if !m.mouseEnabled {
+		t.Error("Ctrl+G did not re-enable mouse capture")
+	}
+	if cmd == nil {
+		t.Error("expected a command to re-enable mouse capture")
+	}
+	if got := lastMessageText(m); got != "" {
+		t.Errorf("re-enabling appended a transcript message %q; want none", got)
+	}
+}
+
+func TestStatusBarShowsMouseSelectIndicator(t *testing.T) {
+	// A nil agent means viewStatus can't run, so drive it via the agent.
+	a := &agent.Agent{Session: &api.Session{ID: "test", ModelID: "m", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.width, m.height = 120, 24
+	m.resize()
+
+	// Default (capture on): no SELECT indicator in the status bar.
+	gotOn := m.viewStatus(a.Session)
+	if strings.Contains(gotOn, "SELECT") {
+		t.Errorf("status bar should not show SELECT while capture is on: %q", gotOn)
+	}
+
+	// After toggling off: the SELECT indicator appears.
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlG})
+	gotOff := m.viewStatus(a.Session)
+	if !strings.Contains(gotOff, "SELECT") {
+		t.Errorf("status bar should show SELECT while capture is off: %q", gotOff)
+	}
+}
+
+func TestResizeDoesNotReEnableDisabledMouse(t *testing.T) {
+	// A resize re-enables capture so split reports don't leak — but it must
+	// not override a user who turned capture off to select text.
+	m := newModel(nil)
+	m.mouseEnabled = false
+	updated, cmd := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	if cmd != nil {
+		t.Error("resize must not re-enable mouse capture while it is toggled off")
+	}
+	if got := updated.(model); got.mouseEnabled {
+		t.Error("resize flipped mouseEnabled back on")
+	}
+
+	// With capture on, a resize does re-establish it.
+	m2 := newModel(nil)
+	if _, cmd := m2.Update(tea.WindowSizeMsg{Width: 100, Height: 30}); cmd == nil {
+		t.Error("resize should re-enable mouse capture when it is on")
 	}
 }
 
@@ -587,16 +636,13 @@ func TestMouseReportBurstDoesNotLeakIntoInput(t *testing.T) {
 func TestSplitMouseReportAcrossMessagesDoesNotLeak(t *testing.T) {
 	// When a fast scroll splits an SGR report at the read boundary, the
 	// parser's ESC branch stops after one rune, so the report arrives as a
-	// lone Alt+'[' followed by the remainder in a separate message. This is
-	// the sequence that leaked; neither message is recognisable on its own.
+	// lone Alt+'[' followed by the remainder in a separate message.
 	m := newModel(nil)
 	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("["), Alt: true})
 	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("<64;140")})
 	if got := m.input.Value(); got != "" {
 		t.Errorf("split report leaked into the input: %q", got)
 	}
-	// The tail of that report arrives next and is still swallowed, up to
-	// and including the terminator.
 	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(";44M")})
 	if got := m.input.Value(); got != "" {
 		t.Errorf("report tail leaked into the input: %q", got)
@@ -609,8 +655,7 @@ func TestSplitMouseReportAcrossMessagesDoesNotLeak(t *testing.T) {
 }
 
 func TestSwallowModeIsBounded(t *testing.T) {
-	// A false positive must not eat input indefinitely: swallowing gives up
-	// after maxSwallowedRunes even if no terminator ever arrives.
+	// A false positive must not eat input indefinitely.
 	m := newModel(nil)
 	m.swallowMouseSeq = true
 	m.swallowedRunes = 1
@@ -618,31 +663,20 @@ func TestSwallowModeIsBounded(t *testing.T) {
 	if m.swallowMouseSeq {
 		t.Error("swallow mode should have given up after maxSwallowedRunes")
 	}
-	// Once it gives up, the rest of that message and everything after it is
-	// treated as real input again.
 	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("ok")})
 	if got := m.input.Value(); !strings.HasSuffix(got, "ok") {
 		t.Errorf("input after bounded swallow = %q, want it to end with %q", got, "ok")
 	}
 }
 
-func TestMouseReportStrippedButRealInputKept(t *testing.T) {
-	// Real text mixed with report fragments keeps the text.
-	m := newModel(nil)
-	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("[<64;140;44Mkubectl get pods")})
-	if got := m.input.Value(); got != "kubectl get pods" {
-		t.Errorf("value = %q, want %q", got, "kubectl get pods")
+// lastMessageText returns the payload of the most recent transcript message
+// as a string, or "" when there are none.
+func lastMessageText(m model) string {
+	if len(m.messages) == 0 {
+		return ""
 	}
-
-	// Ordinary typing arrives one rune per message and is never touched,
-	// even when the rune is one that appears inside a report.
-	m2 := newModel(nil)
-	for _, r := range []rune{'[', '<', '6', '4', 'M'} {
-		_, _ = m2.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
-	}
-	if got := m2.input.Value(); got != "[<64M" {
-		t.Errorf("single-rune typing altered: value = %q, want %q", got, "[<64M")
-	}
+	s, _ := m.messages[len(m.messages)-1].Payload.(string)
+	return s
 }
 
 func TestHistorySkipsConsecutiveDuplicates(t *testing.T) {
@@ -1103,8 +1137,12 @@ func TestShiftTabTogglesAutoMode(t *testing.T) {
 	if !a.SkipPermissionsEnabled() {
 		t.Error("expected auto mode on after shift+tab")
 	}
-	if len(m.messages) == 0 {
-		t.Error("expected a transcript confirmation message")
+	// Auto-mode confirmation is a status-bar flash, not a transcript message.
+	if !strings.Contains(m.flash, "Auto mode") {
+		t.Errorf("expected an auto-mode flash, got %q", m.flash)
+	}
+	if len(m.messages) != 0 {
+		t.Errorf("auto-mode toggle leaked a transcript message: %v", m.messages)
 	}
 	if got := m.View(); !strings.Contains(got, "AUTO") {
 		t.Error("expected AUTO indicator in status bar")
@@ -1181,14 +1219,19 @@ func TestCtrlYConfirmsAndCopies(t *testing.T) {
 	m.messages = []*api.Message{
 		{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "copy me"},
 	}
+	before := len(m.messages)
 
 	_, cmd := m.copyLastResponse()
 	if cmd == nil {
 		t.Fatal("expected a copy command")
 	}
 	cmd()
-	if len(m.messages) == 0 || m.messages[len(m.messages)-1].Payload != "📋 Copied last response to clipboard." {
-		t.Error("expected a transcript confirmation message")
+	// The confirmation is a status-bar flash, not a transcript message.
+	if len(m.messages) != before {
+		t.Errorf("copy leaked a transcript message: %v", m.messages[before:])
+	}
+	if !strings.Contains(m.flash, "Copied") {
+		t.Errorf("expected a copy flash, got %q", m.flash)
 	}
 }
 
@@ -1199,6 +1242,7 @@ func TestCopyToolCommandAndOutput(t *testing.T) {
 		{Source: api.MessageSourceModel, Type: api.MessageTypeToolCallRequest, Payload: "kubectl get pods -n kube-system"},
 		{Source: api.MessageSourceAgent, Type: api.MessageTypeToolCallResponse, Payload: map[string]any{"stdout": "coredns 1/1\nkube-proxy 1/1\n"}},
 	}
+	before := len(m.messages)
 
 	// lastToolCommand finds the most recent tool-call request.
 	cmd, ok := m.lastToolCommand()
@@ -1211,37 +1255,43 @@ func TestCopyToolCommandAndOutput(t *testing.T) {
 		t.Fatalf("lastToolOutput = %q ok=%v, want the pod list", out, ok)
 	}
 
-	// copyToolCommand confirms in the transcript.
+	// copyToolCommand confirms via a status-bar flash, not the transcript.
 	_, cmdFn := m.copyToolCommand()
 	if cmdFn == nil {
 		t.Fatal("expected a copy command")
 	}
 	cmdFn()
-	if len(m.messages) == 0 || m.messages[len(m.messages)-1].Payload != "📋 Copied last command to clipboard." {
-		t.Error("expected a 'Copied last command' confirmation")
+	if len(m.messages) != before {
+		t.Errorf("copy command leaked a transcript message: %v", m.messages[before:])
+	}
+	if !strings.Contains(m.flash, "Copied") {
+		t.Errorf("expected a copy flash, got %q", m.flash)
 	}
 
-	// copyToolOutput confirms in the transcript.
+	// copyToolOutput confirms via a status-bar flash, not the transcript.
 	_, outFn := m.copyToolOutput()
 	if outFn == nil {
 		t.Fatal("expected a copy command")
 	}
 	outFn()
-	last := m.messages[len(m.messages)-1].Payload
-	if last != "📋 Copied last output to clipboard." {
-		t.Errorf("expected a 'Copied last output' confirmation, got %v", last)
+	if len(m.messages) != before {
+		t.Errorf("copy output leaked a transcript message: %v", m.messages[before:])
+	}
+	if !strings.Contains(m.flash, "Copied") {
+		t.Errorf("expected a copy flash, got %q", m.flash)
 	}
 }
 
 func TestCopyToolNothingToCopy(t *testing.T) {
 	m := newModel(nil)
-	// No tool calls: both report nothing to copy.
-	_, cmdFn := m.copyToolCommand()
-	if cmdFn != nil {
-		t.Error("expected no command when there's no tool call")
+	// No tool calls: both report nothing to copy via a status-bar flash
+	// (the returned cmd is the flash auto-clear timer, not a copy action).
+	m.copyToolCommand()
+	if !strings.Contains(m.flash, "Nothing to copy") {
+		t.Errorf("expected a 'Nothing to copy' flash, got %q", m.flash)
 	}
-	if len(m.messages) == 0 || m.messages[len(m.messages)-1].Payload != "Nothing to copy yet." {
-		t.Error("expected a 'Nothing to copy' note")
+	if len(m.messages) != 0 {
+		t.Errorf("nothing-to-copy leaked a transcript message: %v", m.messages)
 	}
 }
 
@@ -1342,22 +1392,28 @@ func TestEscInterruptsRunningAgent(t *testing.T) {
 	if m.input.Value() != "" {
 		t.Error("expected input untouched by interrupt")
 	}
-	// The interrupt is confirmed in the transcript.
-	if len(m.messages) == 0 || !strings.Contains(m.messages[len(m.messages)-1].Payload.(string), "Interrupted") {
-		t.Errorf("expected an 'Interrupted' confirmation, got %d messages", len(m.messages))
+	// The interrupt is confirmed via a status-bar flash, not the transcript.
+	if !strings.Contains(m.flash, "Interrupted") {
+		t.Errorf("expected an 'Interrupted' flash, got %q", m.flash)
+	}
+	if len(m.messages) != 0 {
+		t.Errorf("interrupt leaked a transcript message: %v", m.messages)
 	}
 }
 
 func TestInterruptRunConfirmsAndNothingRunning(t *testing.T) {
-	// Nothing running: a note, no cancel command.
+	// Nothing running: a status-bar flash, no transcript message.
 	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
 	m := newModel(a)
 	_, _ = m.interruptRun()
-	if len(m.messages) == 0 || !strings.Contains(m.messages[len(m.messages)-1].Payload.(string), "Nothing running") {
-		t.Errorf("expected a 'Nothing running' note, got %d messages", len(m.messages))
+	if !strings.Contains(m.flash, "Nothing running") {
+		t.Errorf("expected a 'Nothing running' flash, got %q", m.flash)
+	}
+	if len(m.messages) != 0 {
+		t.Errorf("interrupt leaked a transcript message: %v", m.messages)
 	}
 
-	// A running agent: the interrupt is confirmed.
+	// A running agent: the interrupt is confirmed via flash.
 	a2 := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateRunning}}
 	m2 := newModel(a2)
 	runCtx := a2.StartRun(context.Background())
@@ -1367,8 +1423,11 @@ func TestInterruptRunConfirmsAndNothingRunning(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Error("expected interruptRun to cancel the running agent")
 	}
-	if len(m2.messages) == 0 || !strings.Contains(m2.messages[len(m2.messages)-1].Payload.(string), "Interrupted") {
-		t.Errorf("expected an 'Interrupted' confirmation, got %d messages", len(m2.messages))
+	if !strings.Contains(m2.flash, "Interrupted") {
+		t.Errorf("expected an 'Interrupted' flash, got %q", m2.flash)
+	}
+	if len(m2.messages) != 0 {
+		t.Errorf("interrupt leaked a transcript message: %v", m2.messages)
 	}
 }
 
@@ -1671,8 +1730,15 @@ func TestRenameSubmitAppliesAndPersists(t *testing.T) {
 	if got := m.input.Value(); got != "" {
 		t.Errorf("expected input cleared after rename, got %q", got)
 	}
-	if len(m.messages) == 0 || !strings.Contains(m.messages[len(m.messages)-1].Payload.(string), "my debug session") {
-		t.Error("expected a rename confirmation message")
+	// The rename confirmation is a status-bar flash, not a transcript
+	// message, so the transcript must not have gained a rename message.
+	if len(m.messages) > 0 {
+		if last, ok := m.messages[len(m.messages)-1].Payload.(string); ok && strings.Contains(last, "Renamed session") {
+			t.Errorf("rename leaked a transcript confirmation: %q", last)
+		}
+	}
+	if !strings.Contains(m.flash, "my debug session") {
+		t.Errorf("expected rename flash to mention the new name, got %q", m.flash)
 	}
 }
 

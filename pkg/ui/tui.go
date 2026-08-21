@@ -132,12 +132,11 @@ type TUI struct {
 }
 
 func NewTUI(agent *agent.Agent) *TUI {
-	// Mouse cell-motion capture is enabled from Init (via the
-	// EnableMouseCellMotion command) rather than as a program option, so the
-	// mouse-enable escape sequence is written after the first render when
-	// the terminal is in alt-screen mode and ready to consume it —
-	// otherwise some terminals echo the sequence as literal text into the
-	// input box on startup.
+	// Mouse cell-motion capture is toggled on/off by Ctrl+G. When on, the
+	// scroll wheel scrolls the in-app transcript (capture is the only mode
+	// Apple Terminal honors for the wheel — DECSET 1007 is ignored there).
+	// When off, the mouse returns to the terminal so text can be
+	// click-drag-selected and copied. See toggleMouse / Ctrl+G in handleKey.
 	return &TUI{
 		program: tea.NewProgram(newModel(agent), tea.WithAltScreen()),
 		agent:   agent,
@@ -315,15 +314,20 @@ type model struct {
 	// swallowed so it doesn't leave a stray newline in the next draft.
 	justSubmitted bool
 
-	// swallowMouseSeq is set while a mouse report that the input parser
-	// split across reads is still being consumed; swallowedRunes bounds
-	// how long that can last (see filterMouseRunes).
+	// mouseEnabled tracks whether cell-motion capture is on. Capture is the
+	// only wheel mode Apple Terminal honors, so it's on by default — but it
+	// takes click-drag from the terminal, so Ctrl+G toggles it off to select.
+	mouseEnabled bool
+
+	// swallowMouseSeq is set while a mouse report the input parser split
+	// across reads is still being consumed; swallowedRunes bounds how long
+	// that can last (see filterMouseRunes). Guards fast-scroll SGR leaks.
 	swallowMouseSeq bool
 	swallowedRunes  int
-	spinner       spinner.Model
-	list          list.Model
-	cache         *renderCache
-	messages      []*api.Message
+	spinner         spinner.Model
+	list            list.Model
+	cache           *renderCache
+	messages        []*api.Message
 	// clearedAt is the transcript position of the Ctrl+L "cleared"
 	// boundary marker (0 = no marker). Content before it leaves the
 	// current view but is revealed again by scrolling up (revealAll).
@@ -376,12 +380,17 @@ type model struct {
 	choiceType     string // "confirm" or "session"
 	sessionIDs     []string
 	// Session browser state
-	browserOpen     bool
-	browserSessions []api.SessionInfo
+	browserOpen        bool
+	browserSessions    []api.SessionInfo
 	allBrowserSessions []api.SessionInfo // full set; browserSessions is the filtered view
-	browserFilter    string              // substring filter applied to allBrowserSessions
-	browserIndex    int
-	browserStatus   browserStatusMsg // transient info/error shown in the browser footer
+	browserFilter      string            // substring filter applied to allBrowserSessions
+	browserIndex       int
+	browserStatus      browserStatusMsg // transient info/error shown in the browser footer
+	// flash is a brief, single-line status-bar message (e.g. "📋 Copied")
+	// that auto-clears after a couple of seconds. It is never stored in the
+	// transcript, so transient UI feedback doesn't pollute the conversation.
+	flash           string
+	flashClear      time.Time
 	renaming        bool
 	renameInput     textinput.Model
 	pendingDeleteID string // session staged for deletion, awaiting 'y'
@@ -437,16 +446,17 @@ func newModel(agent *agent.Agent) model {
 	ri.Cursor.Style = primaryText
 
 	m := model{
-		agent:       agent,
-		input:       ti,
-		inputHeight: 1,
-		historyIdx:  -1,
-		viewport:    vp,
-		spinner:     sp,
-		list:        l,
-		cache:       newRenderCache(),
-		renameInput: ri,
-		dirty:       true,
+		agent:        agent,
+		input:        ti,
+		inputHeight:  1,
+		historyIdx:   -1,
+		viewport:     vp,
+		spinner:      sp,
+		list:         l,
+		cache:        newRenderCache(),
+		renameInput:  ri,
+		dirty:        true,
+		mouseEnabled: true,
 	}
 	if agent != nil {
 		if s := agent.GetSession(); s != nil {
@@ -458,9 +468,13 @@ func newModel(agent *agent.Agent) model {
 }
 
 func (m model) Init() tea.Cmd {
-	// Enable mouse cell-motion capture so the scroll wheel scrolls the
-	// transcript. Disable it when quitting so the terminal stops sending
-	// mouse reports (which otherwise leak as literal text after exit).
+	// Enable mouse cell-motion capture by default so the scroll wheel
+	// scrolls the in-app transcript. Capture is the only wheel mode Apple
+	// Terminal honors (DECSET 1007 is ignored there), so on that terminal
+	// this is the tradeoff: wheel works, but click-drag selection doesn't
+	// while capture is on — Ctrl+G toggles it off to select, back on to
+	// scroll. The SGR-leak guard in handleKey stops fast-scroll bursts from
+	// typing report fragments into the input box.
 	return tea.Batch(
 		textarea.Blink, m.spinner.Tick, m.tick(),
 		tea.EnableMouseCellMotion,
@@ -477,10 +491,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		m.dirty = true
 		m.resize()
-		// A terminal resize makes the renderer re-enter alt-screen mode and
-		// re-emit the mouse-enable sequence; re-enable mouse cell-motion so
-		// bubbletea keeps consuming mouse events (otherwise the terminal's
-		// SGR mouse reports leak into the input box as literal text).
+		// A resize makes the renderer re-enter alt-screen and re-emit the
+		// mouse-enable sequence; re-enable cell-motion so the wheel keeps
+		// working — unless the user toggled it off to select text.
+		if !m.mouseEnabled {
+			return m, nil
+		}
 		return m, tea.EnableMouseCellMotion
 
 	case tea.KeyMsg:
@@ -496,6 +512,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
 		return m, cmd
+
+	case flashClearMsg:
+		// Clear the status-bar flash only if this is the most recent one
+		// (a later setFlash may have pushed the deadline out).
+		if !m.flashClear.IsZero() && !time.Now().Before(m.flashClear) {
+			m.flash = ""
+			m.flashClear = time.Time{}
+		}
+		return m, nil
 
 	case tickMsg:
 		// Re-resolve the kube context on a TTL so an external
@@ -617,7 +642,10 @@ func (m *model) setBrowserStatus(text string, isErr bool) {
 }
 
 // appendLocalMessage adds a transient agent-styled message to the
-// transcript (for UI-originated events; it is not persisted).
+// transcript (for UI-originated events; it is not persisted). Reserved for
+// content the user explicitly requested (e.g. /help, /mcp output) — NOT for
+// transient UI feedback like copy/interrupt/toggle confirmations, which use
+// setFlash so they appear in the status bar and never enter the transcript.
 func (m *model) appendLocalMessage(text string) {
 	m.messages = append(m.messages, &api.Message{
 		Source:    api.MessageSourceAgent,
@@ -628,6 +656,21 @@ func (m *model) appendLocalMessage(text string) {
 	m.dirty = true
 	m.refresh()
 	m.viewport.GotoBottom()
+}
+
+// flashClearMsg is sent by a timer to clear the status-bar flash.
+type flashClearMsg time.Time
+
+// setFlash shows a brief one-line message in the status bar (replacing the
+// right-hand segment) that auto-clears after flashTTL. Use for transient UI
+// feedback — copy confirmations, interrupts, toggle state — so it never
+// pollutes the conversation transcript.
+const flashTTL = 2500 * time.Millisecond
+
+func (m *model) setFlash(text string) tea.Cmd {
+	m.flash = text
+	m.flashClear = time.Now().Add(flashTTL)
+	return tea.Tick(flashTTL, func(time.Time) tea.Msg { return flashClearMsg{} })
 }
 
 // openBrowser opens the session browser with the given sessions, selecting
@@ -825,17 +868,16 @@ func (m *model) navigateList(keyType tea.KeyType) tea.Cmd {
 	return cmd
 }
 
-// maxSwallowedRunes bounds how far filterMouseRunes will keep dropping
-// input while looking for a mouse report's terminator. A real SGR report
-// is ~13 bytes; this is a safety valve so a false positive can never eat
-// more than a few keystrokes.
+// maxSwallowedRunes bounds how far filterMouseRunes will keep dropping input
+// while looking for a mouse report's terminator. A real SGR report is ~13
+// bytes; this is a safety valve so a false positive can never eat more than a
+// few keystrokes.
 const maxSwallowedRunes = 32
 
 // isMouseSeqStart reports whether a split SGR mouse report begins at
-// runes[i]. A full report looks like "\x1b[<64;140;44M"; a read boundary
-// can cut it anywhere, so the recognizable openings are ESC+"[", "[<",
-// and "<" followed by a digit. None of these occur as a multi-rune burst
-// of genuine typed input.
+// runes[i]. A full report looks like "\x1b[<64;140;44M"; a read boundary can
+// cut it anywhere, so the recognizable openings are ESC+"[", "[<", and "<"
+// followed by a digit. None of these occur as genuine multi-rune typed input.
 func isMouseSeqStart(runes []rune, i int) bool {
 	if i+1 >= len(runes) {
 		return false
@@ -852,15 +894,12 @@ func isMouseSeqStart(runes []rune, i int) bool {
 }
 
 // filterMouseRunes drops SGR mouse-report fragments from a burst of input
-// runes, carrying state across messages.
-//
-// A fast scroll wheel packs many reports into one read. When the input
-// parser's chunk boundary splits a report it emits the pieces as ordinary
-// runes — and because the ESC branch stops after a single rune, the "["
-// arrives in its own message ahead of the "<64;140" remainder. Matching
-// per-message therefore cannot work; swallowing has to span messages,
-// which is what swallowMouseSeq tracks. Swallowing ends at the report's
-// M/m terminator, or at maxSwallowedRunes as a safety valve.
+// runes, carrying state across messages. A fast scroll wheel packs many
+// reports into one read; when the parser's chunk boundary splits a report it
+// emits the pieces as ordinary runes (the ESC branch stops after one rune, so
+// "[" arrives in its own message ahead of the "<64;140" remainder). Matching
+// per-message can't work, so swallowing spans messages via swallowMouseSeq,
+// ending at the M/m terminator or maxSwallowedRunes.
 func (m *model) filterMouseRunes(runes []rune) []rune {
 	out := make([]rune, 0, len(runes))
 	for i := 0; i < len(runes); i++ {
@@ -883,8 +922,25 @@ func (m *model) filterMouseRunes(runes []rune) []rune {
 	return out
 }
 
-// handleMouse routes mouse events: the scroll wheel scrolls the
-// transcript viewport. Other mouse events (clicks, motion) are ignored.
+// toggleMouse turns cell-motion capture on or off. Capture is the only wheel
+// mode Apple Terminal honors, so it's on by default for scrolling — but it
+// takes click-drag from the terminal, so toggling it off restores native text
+// selection (PgUp/PgDn scroll while it's off), and back on restores the wheel.
+// The mode is shown in the status bar (🖱 SELECT when off) rather than the
+// transcript, since it's a transient UI state, not part of the conversation.
+func (m *model) toggleMouse() (tea.Model, tea.Cmd) {
+	m.mouseEnabled = !m.mouseEnabled
+	if m.mouseEnabled {
+		return m, tea.EnableMouseCellMotion
+	}
+	m.swallowMouseSeq = false
+	m.swallowedRunes = 0
+	return m, tea.DisableMouse
+}
+
+// handleMouse routes mouse events: the scroll wheel scrolls the transcript
+// viewport. Other events (clicks, drag) are ignored — drag selection isn't
+// possible while capture is on, which is why Ctrl+G toggles it off.
 func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	const wheelStep = 3
 	switch msg.Button {
@@ -907,22 +963,18 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// A fast scroll wheel packs many SGR mouse reports into a single read,
-	// and a chunk boundary that splits one leaves fragments that reach us
-	// as ordinary runes. Drop them before they can land in the input box.
-	//
-	// The parser emits a split report's leading "\x1b[" as a lone '[' with
-	// Alt set, ahead of the "<64;140" remainder, so that artifact has to be
-	// recognised on its own; from there filterMouseRunes swallows the rest
-	// across however many messages it spans.
+	// A fast scroll wheel packs many SGR mouse reports into one read, and a
+	// chunk boundary that splits one leaves fragments that reach us as
+	// ordinary runes. Drop them before they can land in the input box. The
+	// parser emits a split report's leading "\x1b[" as a lone '[' with Alt
+	// set, ahead of the "<64;140" remainder, so recognise that artifact on
+	// its own; from there filterMouseRunes swallows the rest across messages.
 	if msg.Type == tea.KeyRunes {
 		if !m.swallowMouseSeq && msg.Alt && len(msg.Runes) == 1 && msg.Runes[0] == '[' {
 			m.swallowMouseSeq = true
 			m.swallowedRunes = 1
 			return m, nil
 		}
-		// Ordinary typing arrives one rune at a time, so single-rune
-		// messages are left alone unless a report is already in flight.
 		if m.swallowMouseSeq || len(msg.Runes) > 1 {
 			if cleaned := m.filterMouseRunes(msg.Runes); len(cleaned) != len(msg.Runes) {
 				if len(cleaned) == 0 {
@@ -955,8 +1007,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyCtrlC, tea.KeyCtrlD:
 		m.quitting = true
 		// Disable mouse capture on quit so the terminal stops sending SGR
-		// mouse reports (which would otherwise leak as literal text after
-		// the program exits and the renderer is no longer consuming them).
+		// reports (which would otherwise leak as literal text after exit).
 		return m, tea.Batch(tea.Quit, tea.DisableMouse)
 	case tea.KeyEsc:
 		return m.handleEsc()
@@ -991,6 +1042,11 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.dirty = true
 		m.refresh()
 		return m, nil
+	case tea.KeyCtrlG:
+		// Toggle mouse capture. Capture drives wheel scrolling (the only
+		// wheel mode Apple Terminal honors) but takes click-drag from the
+		// terminal, disabling text selection — Ctrl+G turns it off to select.
+		return m.toggleMouse()
 	case tea.KeyShiftTab:
 		// Toggle auto-accept mode (skip permission prompts), like opencode
 		// and Claude Code.
@@ -1084,10 +1140,10 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.inChoiceMode {
 			return m, m.navigateList(tea.KeyUp)
 		}
-		// Within a multi-line draft, Up moves the cursor until the first
+		// Within a multi-line draft, Up moves the cursor up to the first
 		// line; from there (and for single-line drafts) it recalls older
-		// input history, like opencode and Claude Code. Transcript
-		// scrolling lives on the mouse wheel and PgUp/PgDn.
+		// input history, like opencode and Claude Code. The scroll wheel
+		// (when capture is on) and PgUp/PgDn scroll the transcript.
 		if m.input.LineCount() > 1 && m.input.Line() > 0 {
 			m.input.CursorUp()
 			return m, nil
@@ -1239,14 +1295,13 @@ func (m *model) historyNext() {
 func (m *model) copyLastResponse() (tea.Model, tea.Cmd) {
 	payload, ok := m.lastCopyableText()
 	if !ok {
-		m.appendLocalMessage("Nothing to copy yet.")
-		return m, nil
+		return m, m.setFlash("Nothing to copy yet.")
 	}
-	m.appendLocalMessage("📋 Copied last response to clipboard.")
-	return m, func() tea.Msg {
+	copy := func() tea.Msg {
 		_ = copyToClipboard(payload)
 		return nil
 	}
+	return m, tea.Batch(copy, m.setFlash("📋 Copied last response to clipboard."))
 }
 
 // copyToClipboard puts s on the system clipboard, preferring pbcopy (macOS)
@@ -1317,28 +1372,26 @@ func (m *model) lastToolOutput() (string, bool) {
 func (m *model) copyToolCommand() (tea.Model, tea.Cmd) {
 	payload, ok := m.lastToolCommand()
 	if !ok {
-		m.appendLocalMessage("Nothing to copy yet.")
-		return m, nil
+		return m, m.setFlash("Nothing to copy yet.")
 	}
-	m.appendLocalMessage("📋 Copied last command to clipboard.")
-	return m, func() tea.Msg {
+	copy := func() tea.Msg {
 		_ = copyToClipboard(payload)
 		return nil
 	}
+	return m, tea.Batch(copy, m.setFlash("📋 Copied last command to clipboard."))
 }
 
 // copyToolOutput copies the most recent tool-call output to the clipboard.
 func (m *model) copyToolOutput() (tea.Model, tea.Cmd) {
 	payload, ok := m.lastToolOutput()
 	if !ok {
-		m.appendLocalMessage("Nothing to copy yet.")
-		return m, nil
+		return m, m.setFlash("Nothing to copy yet.")
 	}
-	m.appendLocalMessage("📋 Copied last output to clipboard.")
-	return m, func() tea.Msg {
+	copy := func() tea.Msg {
 		_ = copyToClipboard(payload)
 		return nil
 	}
+	return m, tea.Batch(copy, m.setFlash("📋 Copied last output to clipboard."))
 }
 
 // normalizePasteContent normalizes line endings in pasted runes and drops a
@@ -1385,12 +1438,15 @@ func (m *model) handleEsc() (tea.Model, tea.Cmd) {
 	// Interrupt a running agent.
 	if m.agent != nil {
 		if s := m.agentState(); s == api.AgentStateRunning || s == api.AgentStateInitializing {
-			// Confirm in the transcript immediately so the user sees the
-			// interrupt landed; the actual cancel runs in the returned closure
-			// (CancelRun signals the run to stop asynchronously).
-			m.appendLocalMessage("⏹ Interrupted.")
+			// Flash a status-bar confirmation so the user sees the interrupt
+			// landed; the returned closure both cancels the run (CancelRun
+			// signals it to stop asynchronously) and arms the flash timer.
+			flash := m.setFlash("⏹ Interrupted.")
 			return m, func() tea.Msg {
 				m.agent.CancelRun()
+				if flash != nil {
+					flash()
+				}
 				return nil
 			}
 		}
@@ -1547,11 +1603,9 @@ func (m *model) toggleAutoMode() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if enabled := m.agent.ToggleSkipPermissions(); enabled {
-		m.appendLocalMessage("⚡ Auto mode on — the agent will run tools without asking for permission.")
-	} else {
-		m.appendLocalMessage("Auto mode off — you'll be asked to approve modifying commands.")
+		return m, m.setFlash("⚡ Auto mode on — tools run without asking.")
 	}
-	return m, nil
+	return m, m.setFlash("Auto mode off — modifying commands need approval.")
 }
 
 // toggleExpandToolResults flips tool-result expansion (ctrl+o), exposed via the
@@ -1575,11 +1629,9 @@ func (m *model) toggleExpandThinking() (tea.Model, tea.Cmd) {
 // interruptRun cancels the current agentic run.
 func (m *model) interruptRun() (tea.Model, tea.Cmd) {
 	if m.agent == nil || !m.agent.CancelRun() {
-		m.appendLocalMessage("Nothing running to interrupt.")
-		return m, nil
+		return m, m.setFlash("Nothing running to interrupt.")
 	}
-	m.appendLocalMessage("⏹ Interrupted.")
-	return m, nil
+	return m, m.setFlash("⏹ Interrupted.")
 }
 
 // tokenAtEndOfInput returns the paste placeholder token (if any) that the
@@ -1904,18 +1956,17 @@ func (m *model) submitSessionRename() (tea.Model, tea.Cmd) {
 	return m.renameCurrentSession(name)
 }
 
-// renameCurrentSession renames the current session immediately and confirms.
+// renameCurrentSession renames the current session immediately and confirms
+// via a status-bar flash (the new name is also reflected in the status bar).
 func (m *model) renameCurrentSession(name string) (tea.Model, tea.Cmd) {
 	if m.agent == nil {
 		return m, nil
 	}
 	s := m.agent.GetSession()
 	if err := m.agent.RenameSession(s.ID, name); err != nil {
-		m.appendLocalMessage("Rename failed: " + err.Error())
-		return m, nil
+		return m, m.setFlash("Rename failed: " + err.Error())
 	}
-	m.appendLocalMessage(fmt.Sprintf("Renamed session to %q.", name))
-	return m, nil
+	return m, m.setFlash(fmt.Sprintf("Renamed session to %q.", name))
 }
 
 func (m *model) handleEnter() (tea.Model, tea.Cmd) {
@@ -2534,7 +2585,7 @@ func (m model) renderTextMsg(msg *api.Message, r *glamour.TermRenderer, w int) s
 		if strings.HasPrefix(payload, "!") {
 			label := primaryText.Render("You") + ts + warnText.Render(" ⚡shell")
 			content := textStyle.Width(w).Render(payload)
-			return userMsg.Width(w + 2).Render(label+"\n"+content) + "\n"
+			return userMsg.Width(w+2).Render(label+"\n"+content) + "\n"
 		}
 		label := primaryText.Render("You") + ts
 		content := textStyle.Width(w).Render(payload)
@@ -2598,9 +2649,9 @@ func (m model) renderThinking(msg *api.Message, w int) string {
 	if m.expandThinking {
 		// Show the full reasoning under the summary header, dimmed.
 		body := dimStyle.Width(w).Render(payload)
-		return agentMsg.Width(w + 2).Render(header+"\n"+body) + "\n"
+		return agentMsg.Width(w+2).Render(header+"\n"+body) + "\n"
 	}
-	return agentMsg.Width(w + 2).Render(header) + "\n"
+	return agentMsg.Width(w+2).Render(header) + "\n"
 }
 
 // pluralS returns "s" when n != 1, for compact pluralization.
@@ -3099,6 +3150,12 @@ func (m model) viewStatus(session *api.Session) string {
 	if m.agent != nil && m.agent.SkipPermissionsEnabled() {
 		left += sep + warnText.Render("⚡AUTO")
 	}
+	// When mouse capture is toggled off (for text selection), show a status
+	// indicator so the mode is visible without polluting the transcript. The
+	// default (capture on, wheel scrolling) stays silent.
+	if !m.mouseEnabled {
+		left += sep + warnText.Render("🖱 SELECT")
+	}
 	// MCP server connection status, shown only when MCP is configured so a
 	// failed server is visible (otherwise tools silently go missing). Connected
 	// servers read green; any failure reads yellow.
@@ -3132,6 +3189,17 @@ func (m model) viewStatus(session *api.Session) string {
 		return s
 	}
 	right := renderRight(model)
+
+	// A transient flash (copy/interrupt/toggle feedback) replaces the
+	// right-hand segment while active, so the feedback is visible without
+	// entering the transcript.
+	if m.flash != "" && time.Now().Before(m.flashClear) {
+		right = lipgloss.NewStyle().Foreground(colorPrimary).Render(m.flash)
+	} else if m.flash != "" {
+		// Expired but not yet cleared by the tick; blank it now.
+		m.flash = ""
+		m.flashClear = time.Time{}
+	}
 
 	// The status bar must always be exactly one line, no matter the
 	// terminal width: shrink the name (then the model, then the kube
@@ -3320,7 +3388,9 @@ func helpText() string {
 | **Ctrl+Y** | copy last reply |
 | **Ctrl+O** | expand/collapse tool results |
 | **Ctrl+T** | expand/collapse model reasoning |
+| **Ctrl+G** | toggle mouse capture (off to select text, on to scroll) |
 | **PgUp / PgDn** | scroll transcript |
+| **wheel** | scroll transcript (when mouse capture is on) |
 | **Tab** | autocomplete (commands, @files, /context, /namespace) |
 
 ## Slash commands
@@ -3340,6 +3410,11 @@ func helpText() string {
 | **/exit** | quit |
 
 Type **!command** to run a shell command, or **@path** to attach a file.
+
+**Scrolling & selecting:** the scroll wheel scrolls the transcript while
+mouse capture is on (the default). To select and copy text, press **Ctrl+G**
+to release the mouse, drag to select, copy, then **Ctrl+G** to turn the wheel
+back on. **PgUp/PgDn** scroll while capture is off.
 `
 }
 
