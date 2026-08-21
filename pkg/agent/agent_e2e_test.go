@@ -16,6 +16,8 @@ package agent
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -316,5 +318,112 @@ func TestAgentEndToEndMetaClear(t *testing.T) {
 	}
 	if msgs[0].Payload != "Cleared the conversation." {
 		t.Fatalf("first message after clear = %q, want %q", msgs[0].Payload, "Cleared the conversation.")
+	}
+}
+
+func TestAgentMaxIterationsContinuePrompt(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	store := sessions.NewInMemoryChatStore()
+
+	client := mocks.NewMockClient(ctrl)
+	chat := mocks.NewMockChat(ctrl)
+
+	client.EXPECT().StartChat(gomock.Any(), "test-model").Return(chat)
+	chat.EXPECT().Initialize(gomock.Any()).Return(nil)
+	chat.EXPECT().SetFunctionDefinitions(gomock.Any()).Return(nil)
+	client.EXPECT().GenerateCompletion(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+
+	// The model keeps requesting the same read-only tool call forever,
+	// so the iteration budget is the only thing that can stop the turn.
+	toolCallResp := chatWith(fCalls("mocktool", map[string]any{"command": "get"}))
+	chat.EXPECT().SendStreaming(gomock.Any(), gomock.Any()).Return(
+		gollm.ChatResponseIterator(func(yield func(gollm.ChatResponse, error) bool) {
+			yield(toolCallResp, nil)
+		}), nil).AnyTimes()
+
+	tool := mocks.NewMockTool(ctrl)
+	tool.EXPECT().Name().Return("mocktool").AnyTimes()
+	tool.EXPECT().Description().Return("mock tool").AnyTimes()
+	tool.EXPECT().FunctionDefinition().Return(&gollm.FunctionDefinition{Name: "mocktool"}).AnyTimes()
+	tool.EXPECT().IsInteractive(gomock.Any()).Return(false, nil).AnyTimes()
+	tool.EXPECT().CheckModifiesResource(gomock.Any()).Return("no").AnyTimes()
+	tool.EXPECT().Run(gomock.Any(), gomock.Any()).Return(map[string]any{"result": "ok"}, nil).AnyTimes()
+
+	var toolset tools.Tools
+	toolset.Init()
+	toolset.RegisterTool(tool)
+
+	a := &Agent{
+		ChatMessageStore: store,
+		LLM:              client,
+		Model:            "test-model",
+		Tools:            toolset,
+		MaxIterations:    2,
+		Session: &api.Session{
+			ID:               "test-session",
+			ChatMessageStore: store,
+			AgentState:       api.AgentStateIdle,
+		},
+	}
+
+	if err := a.Init(ctx); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := a.Run(ctx, ""); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if m := recvMsg(t, ctx, a.Output); m.Type != api.MessageTypeUserInputRequest {
+		t.Fatalf("expected user-input-request, got %v", m.Type)
+	}
+	a.Input <- &api.UserInputResponse{Query: "debug it"}
+
+	// After 2 iterations the agent must ask instead of dying.
+	choiceMsg := recvUntil(t, ctx, a.Output, func(m *api.Message) bool {
+		return m.Type == api.MessageTypeUserChoiceRequest
+	})
+	if choiceMsg == nil {
+		t.Fatalf("did not receive the iteration-limit choice request")
+	}
+	req, ok := choiceMsg.Payload.(*api.UserChoiceRequest)
+	if !ok {
+		t.Fatalf("choice payload type = %T, want *api.UserChoiceRequest", choiceMsg.Payload)
+	}
+	if !strings.Contains(req.Prompt, "2 iterations") {
+		t.Errorf("prompt %q does not mention the iteration budget", req.Prompt)
+	}
+	if st := a.AgentState(); st != api.AgentStateWaitingForInput {
+		t.Fatalf("expected waiting-for-input state, got %s", st)
+	}
+
+	// Continue: the budget resets and the turn resumes.
+	a.Input <- &api.UserChoiceResponse{Choice: 1}
+	choiceMsg2 := recvUntil(t, ctx, a.Output, func(m *api.Message) bool {
+		return m.Type == api.MessageTypeUserChoiceRequest
+	})
+	if choiceMsg2 == nil {
+		t.Fatalf("loop did not resume and hit the limit again after continuing")
+	}
+
+	// Stop: the turn ends and the agent returns to the input prompt.
+	a.Input <- &api.UserChoiceResponse{Choice: 2}
+	stopMsg := recvUntil(t, ctx, a.Output, func(m *api.Message) bool {
+		return m.Type == api.MessageTypeText && m.Source == api.MessageSourceAgent &&
+			strings.Contains(fmt.Sprintf("%v", m.Payload), "Stopped at the iteration limit")
+	})
+	if stopMsg == nil {
+		t.Fatalf("did not receive the stop confirmation message")
+	}
+	if st := a.AgentState(); st != api.AgentStateDone {
+		t.Fatalf("expected done state after stop, got %s", st)
+	}
+	m := recvMsg(t, ctx, a.Output)
+	if m.Type != api.MessageTypeUserInputRequest {
+		t.Fatalf("expected user-input-request after stop, got %v", m.Type)
 	}
 }
