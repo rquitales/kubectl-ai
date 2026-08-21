@@ -943,6 +943,7 @@ var slashCommands = map[string]string{
 	"save":     "save-session",
 	"rename":   "rename-session",
 	"resume":   "resume-session",
+	"delete":   "delete-session",
 }
 
 // normalizeSlashCommand translates a slash-prefixed command (e.g. "/rename
@@ -1084,6 +1085,18 @@ func (c *Agent) handleMetaQuery(ctx context.Context, query string) (answer strin
 			return "", false, err
 		}
 		return fmt.Sprintf("Switched to model `%s`.", modelID), true, nil
+	}
+
+	if query == "delete-session" || strings.HasPrefix(query, "delete-session ") {
+		parts := strings.SplitN(query, " ", 2)
+		if len(parts) != 2 || strings.TrimSpace(parts[1]) == "" {
+			return "Invalid command. Usage: delete-session <session_id>", true, nil
+		}
+		sessionID := strings.TrimSpace(parts[1])
+		if err := c.DeleteSession(sessionID); err != nil {
+			return "", false, err
+		}
+		return fmt.Sprintf("Deleted session %s.", sessionID), true, nil
 	}
 
 	if query == "rename-session" || strings.HasPrefix(query, "rename-session ") {
@@ -1307,6 +1320,23 @@ func (c *Agent) setSkipPermissionsEnabled(enabled bool) {
 // sessionMu.
 func (c *Agent) skipPermissions() bool {
 	return c.SkipPermissions
+}
+
+// DeleteSession deletes a session from the store. It refuses to delete the
+// agent's current session. Safe to call from UI goroutines.
+func (c *Agent) DeleteSession(sessionID string) error {
+	manager, err := sessions.NewSessionManager(c.SessionBackend)
+	if err != nil {
+		return fmt.Errorf("failed to create session manager: %w", err)
+	}
+
+	c.sessionMu.Lock()
+	defer c.sessionMu.Unlock()
+	if c.Session != nil && c.Session.ID == sessionID {
+		return fmt.Errorf("cannot delete the current session")
+	}
+
+	return manager.DeleteSession(sessionID)
 }
 
 // openModelPicker presents an interactive picker of the provider's models

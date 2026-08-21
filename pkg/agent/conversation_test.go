@@ -651,3 +651,37 @@ func TestAgentCancelRun(t *testing.T) {
 		t.Error("expected CancelRun false after endRun")
 	}
 }
+
+func TestAgentDeleteSession(t *testing.T) {
+	mgr, err := sessions.NewSessionManager("memory")
+	if err != nil {
+		t.Fatalf("NewSessionManager: %v", err)
+	}
+	current, err := mgr.NewSession(sessions.Metadata{ModelID: "m"})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	other, err := mgr.NewSession(sessions.Metadata{ModelID: "m"})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = mgr.DeleteSession(current.ID)
+		_ = mgr.DeleteSession(other.ID)
+	})
+
+	a := &Agent{
+		Session:        current,
+		SessionBackend: "memory",
+	}
+
+	if err := a.DeleteSession(current.ID); err == nil {
+		t.Error("expected error deleting the current session, got nil")
+	}
+	if err := a.DeleteSession(other.ID); err != nil {
+		t.Errorf("DeleteSession(other) failed: %v", err)
+	}
+	if _, err := mgr.FindSessionByID(other.ID); err == nil {
+		t.Error("expected other session to be deleted")
+	}
+}
