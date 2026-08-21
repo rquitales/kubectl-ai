@@ -1443,3 +1443,91 @@ func TestDispatchToolCallsCapsOversizedOutput(t *testing.T) {
 		t.Errorf("stored stdout = %d bytes, want ~%d (head + marker)", len(stdout), maxToolOutputBytes)
 	}
 }
+
+func writeKubeConfigAt(t *testing.T, path, currentContext string, names ...string) {
+	t.Helper()
+	content := "apiVersion: v1\nkind: Config\ncurrent-context: " + currentContext + "\nclusters: []\ncontexts:\n"
+	for _, n := range names {
+		content += "- context:\n    cluster: c\n    user: u\n  name: " + n + "\n"
+	}
+	content += "users: []\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSessionKubeconfigPinnedAgainstExternalEdits(t *testing.T) {
+	base := writeAgentKubeConfig(t, "prod", "prod", "staging")
+	t.Setenv("KUBECONFIG", base)
+	a := &Agent{
+		Session:    &api.Session{ChatMessageStore: sessions.NewInMemoryChatStore()},
+		Kubeconfig: base,
+		workDir:    t.TempDir(),
+		Output:     make(chan any, 10),
+	}
+	go func() {
+		for range a.Output {
+		}
+	}()
+
+	a.pinSessionKubeconfig()
+	pinned := a.ActiveKubeconfig()
+	if pinned == base {
+		t.Fatal("expected a pinned snapshot, got the live base path")
+	}
+	if current, _, ok := kube.CurrentContext(pinned); !ok || current != "prod" {
+		t.Fatalf("pinned context = %q, want prod", current)
+	}
+
+	// Another terminal switches the global kubeconfig.
+	writeKubeConfigAt(t, base, "staging", "prod", "staging")
+
+	// The session is unaffected: status, dispatch env, and listings all
+	// resolve through the pin.
+	if got := a.ActiveKubeconfig(); got != pinned {
+		t.Fatalf("ActiveKubeconfig changed to %q after external edit", got)
+	}
+	if current, _, _ := kube.CurrentContext(a.ActiveKubeconfig()); current != "prod" {
+		t.Errorf("session context = %q after external edit, want prod", current)
+	}
+
+	tool := &kubeconfigKeyCapturingTool{name: "capturetool"}
+	var toolset tools.Tools
+	toolset.Init()
+	toolset.RegisterTool(tool)
+	a.Tools = toolset
+	parsed, err := a.Tools.ParseToolInvocation(context.Background(), "capturetool", map[string]any{})
+	if err != nil {
+		t.Fatalf("ParseToolInvocation: %v", err)
+	}
+	a.pendingFunctionCalls = []ToolCallAnalysis{
+		{
+			FunctionCall:        gollm.FunctionCall{ID: "1", Name: "capturetool", Arguments: map[string]any{}},
+			ParsedToolCall:      parsed,
+			ModifiesResourceStr: "no",
+		},
+	}
+	if err := a.DispatchToolCalls(context.Background()); err != nil {
+		t.Fatalf("DispatchToolCalls failed: %v", err)
+	}
+	if tool.gotKey != pinned {
+		t.Errorf("tool context kubeconfig = %q, want pinned %q", tool.gotKey, pinned)
+	}
+
+	// /context still works, derived from the snapshot (not the edited base).
+	if err := a.applyKubeOverride("staging", ""); err != nil {
+		t.Fatalf("applyKubeOverride: %v", err)
+	}
+	if current, _, _ := kube.CurrentContext(a.ActiveKubeconfig()); current != "staging" {
+		t.Errorf("override context = %q, want staging", current)
+	}
+
+	// Reset returns to the pin, not the externally-edited base.
+	a.resetKubeOverride()
+	if got := a.ActiveKubeconfig(); got != pinned {
+		t.Errorf("after reset ActiveKubeconfig = %q, want pinned %q", got, pinned)
+	}
+	if current, _, _ := kube.CurrentContext(a.ActiveKubeconfig()); current != "prod" {
+		t.Errorf("after reset context = %q, want prod (the pinned snapshot)", current)
+	}
+}
