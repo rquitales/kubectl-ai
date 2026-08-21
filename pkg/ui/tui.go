@@ -23,6 +23,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,6 +31,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/agent"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
+	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/kube"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/spinner"
@@ -39,7 +41,6 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
-	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 )
 
@@ -317,6 +318,12 @@ type model struct {
 	// becomes a full command name.
 	tabMatches []string
 	tabIndex   int
+	// Kube context names for /context autocomplete, cached briefly.
+	contextNames     []string
+	contextNamesLast time.Time
+	// Cluster namespaces for /namespace autocomplete, cached briefly.
+	namespaceNames     []string
+	namespaceNamesLast time.Time
 	// sessionID tracks the active session so switches are detectable.
 	sessionID string
 	// Kube context/namespace shown in the status bar; resolved once at
@@ -450,6 +457,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// `kubectl config use-context` is reflected in the status bar.
 		if time.Since(m.kubeContextLast) > kubeContextTTL {
 			m.resolveKubeContext()
+		}
+		// Keep the spinner alive while the agent is running, even when no
+		// other messages are arriving (e.g. during quiet stretches between
+		// live text deltas, without spawning per-chunk tick chains).
+		if m.agentState() == api.AgentStateRunning || m.agentState() == api.AgentStateInitializing {
+			m.spinner, _ = m.spinner.Update(msg)
 		}
 		return m, m.tick()
 
@@ -636,8 +649,8 @@ func (m *model) inputBlockHeight() int {
 	if m.sessionRename {
 		h++ // the "Rename session:" label line
 	}
-	if len(slashCompletions(m.input.Value())) > 0 {
-		h++ // the slash-command completion hint line
+	if m.completionHintVisible() {
+		h++ // the completion/shell hint line
 	}
 	for _, p := range m.pastes {
 		if p.token == "" {
@@ -756,10 +769,62 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// and Claude Code.
 		return m.toggleAutoMode()
 	case tea.KeyTab:
-		// Slash-command autocomplete: cycle the input through the matches.
 		if m.inChoiceMode {
 			return m, nil
 		}
+		// Namespace autocomplete: cycle the partial after "/namespace " (or
+		// "/ns ") through live cluster namespaces.
+		if v := m.input.Value(); strings.HasPrefix(v, "/namespace ") || strings.HasPrefix(v, "/ns ") {
+			cmd := "/namespace "
+			if strings.HasPrefix(v, "/ns ") {
+				cmd = "/ns "
+			}
+			if m.tabIndex < len(m.tabMatches) && v == cmd+m.tabMatches[m.tabIndex] {
+				m.tabIndex = (m.tabIndex + 1) % len(m.tabMatches)
+			} else {
+				m.tabMatches = m.namespaceMatches()
+				m.tabIndex = 0
+			}
+			if len(m.tabMatches) > 0 {
+				m.input.SetValue(cmd + m.tabMatches[m.tabIndex])
+				m.input.CursorEnd()
+				m.syncInputHeight()
+			}
+			return m, nil
+		}
+		// Kube context autocomplete: cycle the partial after "/context "
+		// through context names.
+		if v := m.input.Value(); strings.HasPrefix(v, "/context ") {
+			if m.tabIndex < len(m.tabMatches) && v == "/context "+m.tabMatches[m.tabIndex] {
+				m.tabIndex = (m.tabIndex + 1) % len(m.tabMatches)
+			} else {
+				m.tabMatches = m.contextMatches()
+				m.tabIndex = 0
+			}
+			if len(m.tabMatches) > 0 {
+				m.input.SetValue("/context " + m.tabMatches[m.tabIndex])
+				m.input.CursorEnd()
+				m.syncInputHeight()
+			}
+			return m, nil
+		}
+		// File mention autocomplete: cycle the current @token through
+		// filesystem path matches, keeping preceding text intact.
+		if tok := m.lastToken(); strings.HasPrefix(tok, "@") && tok != "@" {
+			if m.tabIndex < len(m.tabMatches) && strings.HasSuffix(m.input.Value(), m.tabMatches[m.tabIndex]) {
+				m.tabIndex = (m.tabIndex + 1) % len(m.tabMatches)
+			} else {
+				m.tabMatches = m.fileMatches()
+				m.tabIndex = 0
+			}
+			if len(m.tabMatches) > 0 {
+				m.input.SetValue(strings.TrimSuffix(m.input.Value(), tok) + "@" + m.tabMatches[m.tabIndex])
+				m.input.CursorEnd()
+				m.syncInputHeight()
+			}
+			return m, nil
+		}
+		// Slash-command autocomplete: cycle the input through the matches.
 		if m.tabIndex < len(m.tabMatches) && m.input.Value() == m.tabMatches[m.tabIndex] {
 			// Mid-cycle: advance to the next captured match.
 			m.tabIndex = (m.tabIndex + 1) % len(m.tabMatches)
@@ -2103,33 +2168,26 @@ func (k kubeContextInfo) isProd() bool {
 }
 
 // loadKubeContext reads the current context and namespace from a kubeconfig
-// file (path, or the KUBECONFIG env / ~/.kube/config default when empty)
-// using client-go — no kubectl subprocess. A missing or unreadable config
-// reports ok=false so the status bar simply omits the indicator.
+// file (path, or the KUBECONFIG env / ~/.kube/config default when empty).
+// A missing or unreadable config reports ok=false so the status bar simply
+// omits the indicator.
 func loadKubeContext(path string) (info kubeContextInfo, ok bool) {
-	rules := clientcmd.NewDefaultClientConfigLoadingRules()
-	if path != "" {
-		rules = &clientcmd.ClientConfigLoadingRules{ExplicitPath: path}
-	}
-	cfg, err := rules.Load()
-	if err != nil || cfg.CurrentContext == "" {
+	context, namespace, ok := kube.CurrentContext(path)
+	if !ok {
 		return kubeContextInfo{}, false
 	}
-	info.context = cfg.CurrentContext
-	info.namespace = "default"
-	if ctx, ok := cfg.Contexts[cfg.CurrentContext]; ok && ctx.Namespace != "" {
-		info.namespace = ctx.Namespace
-	}
+	info.context = context
+	info.namespace = namespace
 	return info, true
 }
 
-// resolveKubeContext (re)loads the status bar's kube context, preferring
-// the agent's explicit kubeconfig path when set. Failures are silent: the
-// indicator simply disappears.
+// resolveKubeContext (re)loads the status bar's kube context from the
+// agent's active kubeconfig (the session override when one is applied, else
+// the base path). Failures are silent: the indicator simply disappears.
 func (m *model) resolveKubeContext() {
 	path := ""
 	if m.agent != nil {
-		path = m.agent.Kubeconfig
+		path = m.agent.ActiveKubeconfig()
 	}
 	m.kubeContext, m.kubeContextOK = loadKubeContext(path)
 	m.kubeContextLast = time.Now()
@@ -2260,7 +2318,7 @@ func (m model) viewDivider() string {
 var slashCommands = []string{
 	"/model", "/models", "/tools", "/sessions", "/session", "/new", "/save",
 	"/rename", "/resume", "/delete", "/delete-session", "/clear", "/exit",
-	"/quit", "/compact",
+	"/quit", "/compact", "/context", "/namespace", "/ns",
 }
 
 // slashCompletions returns the commands matching the input prefix, or nil
@@ -2278,9 +2336,147 @@ func slashCompletions(input string) []string {
 	return matches
 }
 
-// completionHint renders the dim slash-command completion line shown under
-// the input, or "" when there are no matches.
-func (m model) completionHint() string {
+// lastToken returns the input's trailing whitespace-separated token
+// (what an autocomplete would complete).
+func (m model) lastToken() string {
+	v := m.input.Value()
+	if i := strings.LastIndexAny(v, " \t\n"); i >= 0 {
+		return v[i+1:]
+	}
+	return v
+}
+
+// shellMode reports whether the input is a `!` shell escape command.
+func (m model) shellMode() bool {
+	return strings.HasPrefix(m.input.Value(), "!")
+}
+
+// completionHintVisible reports whether a hint line (slash completions,
+// file mentions, context names, namespaces, or the shell marker) is shown
+// under the input.
+func (m *model) completionHintVisible() bool {
+	return m.shellMode() ||
+		len(slashCompletions(m.input.Value())) > 0 ||
+		len(m.fileMatches()) > 0 ||
+		len(m.contextMatches()) > 0 ||
+		len(m.namespaceMatches()) > 0
+}
+
+// namespaceMatches returns cluster namespaces matching the partial after
+// "/namespace " or "/ns " in the input, or nil otherwise. Names come from a
+// live cluster query and are cached briefly.
+func (m *model) namespaceMatches() []string {
+	v := m.input.Value()
+	var prefix string
+	switch {
+	case strings.HasPrefix(v, "/namespace "):
+		prefix = strings.TrimPrefix(v, "/namespace ")
+	case strings.HasPrefix(v, "/ns "):
+		prefix = strings.TrimPrefix(v, "/ns ")
+	default:
+		return nil
+	}
+	if m.agent == nil {
+		return nil
+	}
+	if time.Since(m.namespaceNamesLast) > 30*time.Second || m.namespaceNamesLast.IsZero() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		names, err := m.agent.ListNamespaces(ctx)
+		if err != nil {
+			return nil
+		}
+		m.namespaceNames = names
+		m.namespaceNamesLast = time.Now()
+	}
+	var matches []string
+	for _, n := range m.namespaceNames {
+		if strings.HasPrefix(n, prefix) {
+			matches = append(matches, n)
+		}
+	}
+	return matches
+}
+
+// contextMatches returns kube context names matching the partial after
+// "/context " in the input, or nil when the input isn't a context command.
+// Names are cached briefly to avoid reloading the kubeconfig on every frame.
+func (m *model) contextMatches() []string {
+	v := m.input.Value()
+	const cmd = "/context "
+	if !strings.HasPrefix(v, cmd) {
+		return nil
+	}
+	prefix := strings.TrimPrefix(v, cmd)
+	if time.Since(m.contextNamesLast) > 10*time.Second || m.contextNamesLast.IsZero() {
+		if m.agent == nil {
+			return nil
+		}
+		names, err := kube.ListContexts(m.agent.Kubeconfig)
+		if err != nil {
+			return nil
+		}
+		m.contextNames = names
+		m.contextNamesLast = time.Now()
+	}
+	var matches []string
+	for _, n := range m.contextNames {
+		if strings.HasPrefix(n, prefix) {
+			matches = append(matches, n)
+		}
+	}
+	return matches
+}
+
+// fileMatches returns filesystem path completions for the current `@`
+// mention token (directories get a trailing "/" so completion can continue).
+// Returns nil when the last token isn't a mention prefix.
+func (m model) fileMatches() []string {
+	tok := m.lastToken()
+	if !strings.HasPrefix(tok, "@") || tok == "@" {
+		return nil
+	}
+	prefix := tok[1:]
+	if prefix == "" {
+		return nil
+	}
+	glob, err := filepath.Glob(prefix + "*")
+	if err != nil {
+		return nil
+	}
+	var matches []string
+	for _, g := range glob {
+		if info, err := os.Stat(g); err == nil && info.IsDir() {
+			g += "/"
+		}
+		matches = append(matches, g)
+	}
+	const maxMatches = 8
+	if len(matches) > maxMatches {
+		matches = matches[:maxMatches]
+	}
+	return matches
+}
+
+// completionHint renders the dim hint line shown under the input: the shell
+// marker, context names, namespaces, file mention matches, or slash-command
+// completions.
+func (m *model) completionHint() string {
+	if m.shellMode() {
+		return dimStyle.Render("  shell command")
+	}
+	if matches := m.contextMatches(); len(matches) > 0 {
+		hint := "  " + strings.Join(matches, "  ")
+		return dimStyle.Render(truncateRunes(hint, max(m.input.Width(), 20)))
+	}
+	if matches := m.namespaceMatches(); len(matches) > 0 {
+		hint := "  " + strings.Join(matches, "  ")
+		return dimStyle.Render(truncateRunes(hint, max(m.input.Width(), 20)))
+	}
+	if matches := m.fileMatches(); len(matches) > 0 {
+		hint := "  " + strings.Join(matches, "  ")
+		return dimStyle.Render(truncateRunes(hint, max(m.input.Width(), 20)))
+	}
 	matches := slashCompletions(m.input.Value())
 	if len(matches) == 0 {
 		return ""
@@ -2318,7 +2514,8 @@ func (m model) viewInput(state api.AgentState) string {
 	if m.sessionRename {
 		content = warnText.Render("Rename session:") + "\n" + content
 	}
-	// Slash-command completions are hinted inside the input box.
+	// Slash-command completions, file mentions, or the shell marker are
+	// hinted inside the input box.
 	if hint := m.completionHint(); hint != "" {
 		content += "\n" + hint
 	}
@@ -2337,7 +2534,16 @@ func (m model) viewInput(state api.AgentState) string {
 		}
 	}
 
-	return lipgloss.NewStyle().Padding(0, 1).Render(inputBox.Width(m.width - 4).Render(content))
+	return lipgloss.NewStyle().Padding(0, 1).Render(m.inputBox().Width(m.width - 4).Render(content))
+}
+
+// inputBox returns the input box style: a warning-colored border for `!`
+// shell escape commands, primary otherwise.
+func (m model) inputBox() lipgloss.Style {
+	if m.shellMode() {
+		return inputBox.BorderForeground(colorWarning)
+	}
+	return inputBox
 }
 
 func (m model) viewHelp(state api.AgentState) string {

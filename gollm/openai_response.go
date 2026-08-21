@@ -144,8 +144,41 @@ func (cs *openAIResponseChatSession) IsRetryableError(err error) bool {
 	return DefaultIsRetryableError(err)
 }
 
+// Initialize seeds the chat history from previously persisted messages, so
+// resumed sessions keep their conversation context. Only text messages can
+// be replayed: tool-call requests/responses lack the call IDs needed for
+// tool-call pairing and are skipped (same approach as Anthropic).
 func (cs *openAIResponseChatSession) Initialize(messages []*api.Message) error {
-	klog.Warning("chat history persistence is not supported for provider 'openai', using in-memory chat history")
+	cs.history = make(responses.ResponseInputParam, 0, len(messages))
+
+	for _, msg := range messages {
+		if msg.Type != api.MessageTypeText || msg.Payload == nil {
+			continue
+		}
+
+		var content string
+		if textPayload, ok := msg.Payload.(string); ok {
+			content = textPayload
+		} else {
+			content = fmt.Sprintf("%v", msg.Payload)
+		}
+		if content == "" {
+			continue
+		}
+
+		role := responses.EasyInputMessageRoleUser
+		if msg.Source == api.MessageSourceModel {
+			role = responses.EasyInputMessageRoleAssistant
+		}
+		cs.history = append(cs.history, responses.ResponseInputItemUnionParam{
+			OfMessage: &responses.EasyInputMessageParam{
+				Content: responses.EasyInputMessageContentUnionParam{
+					OfString: openai.String(content),
+				},
+				Role: role,
+			},
+		})
+	}
 	return nil
 }
 

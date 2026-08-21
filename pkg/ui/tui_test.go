@@ -27,6 +27,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/agent"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
+	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/sandbox"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/sessions"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -1724,5 +1725,257 @@ func TestTextDeltaThrottlesViewportRefresh(t *testing.T) {
 	}
 	if !m.dirty {
 		t.Error("expected model to stay dirty so a later refresh picks up the delta")
+	}
+}
+
+func TestShellModeStyling(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.width, m.height = 100, 40
+	m.resize()
+
+	if m.shellMode() {
+		t.Error("expected shellMode=false for normal input")
+	}
+	if m.completionHintVisible() {
+		t.Error("expected no hint for normal input")
+	}
+
+	m.input.SetValue("!kubectl get pods")
+	if !m.shellMode() {
+		t.Error("expected shellMode=true for '!' prefix")
+	}
+	if !m.completionHintVisible() {
+		t.Error("expected the shell hint line to show")
+	}
+	if got := m.completionHint(); !strings.Contains(got, "shell command") {
+		t.Errorf("completionHint = %q, want shell marker", got)
+	}
+	base := m.inputHeight + 2
+	if got := m.inputBlockHeight(); got != base+1 {
+		t.Errorf("inputBlockHeight = %d, want %d with the shell hint", got, base+1)
+	}
+	// The box border switches to the warning color for shell commands.
+	if got := m.inputBox().GetBorderTopForeground(); got != colorWarning {
+		t.Errorf("shell mode border = %v, want colorWarning %v", got, colorWarning)
+	}
+	m.input.SetValue("normal prompt")
+	if got := m.inputBox().GetBorderTopForeground(); got != colorPrimary {
+		t.Errorf("normal mode border = %v, want colorPrimary %v", got, colorPrimary)
+	}
+}
+
+func writeFiles(t *testing.T, dir string, names ...string) {
+	t.Helper()
+	for _, n := range names {
+		p := filepath.Join(dir, n)
+		if strings.HasSuffix(n, "/") {
+			if err := os.MkdirAll(p, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestFileMentionCompletion(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.width, m.height = 100, 40
+	m.resize()
+
+	dir := t.TempDir()
+	writeFiles(t, dir, "deploy.yaml", "deployment.yaml", "service.yaml", "scripts/")
+
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldwd) })
+
+	// Prefix match with directory trailing slash.
+	m.input.SetValue("fix @depl")
+	matches := m.fileMatches()
+	if len(matches) != 2 {
+		t.Fatalf("fileMatches(@depl) = %v, want 2 matches", matches)
+	}
+
+	// Hint shows matches and grows the block.
+	if !m.completionHintVisible() {
+		t.Error("expected hint visible for @ mention")
+	}
+	if got := m.completionHint(); !strings.Contains(got, "deploy") {
+		t.Errorf("completionHint = %q, want file matches", got)
+	}
+	base := m.inputHeight + 2
+	if got := m.inputBlockHeight(); got != base+1 {
+		t.Errorf("inputBlockHeight = %d, want %d with the mention hint", got, base+1)
+	}
+
+	// Tab cycles through matches, keeping preceding text.
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyTab})
+	got := m.input.Value()
+	if !strings.HasPrefix(got, "fix @") || !(strings.Contains(got, "deploy") || strings.Contains(got, "deployment")) {
+		t.Errorf("after tab: input = %q, want completion of @depl", got)
+	}
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyTab})
+	got2 := m.input.Value()
+	if got2 == got {
+		t.Errorf("expected tab to cycle to the next match, got %q", got2)
+	}
+
+	// Directory completion gets a trailing slash.
+	m.input.SetValue("@scr")
+	if matches := m.fileMatches(); len(matches) != 1 || matches[0] != "scripts/" {
+		t.Errorf("fileMatches(@scr) = %v, want [scripts/]", matches)
+	}
+}
+
+func TestFileMentionNonToken(t *testing.T) {
+	m := newModel(nil)
+	m.input.SetValue("plain text")
+	if got := m.fileMatches(); got != nil {
+		t.Errorf("expected no file matches for non-mention token, got %v", got)
+	}
+	m.input.SetValue("user@example.com")
+	if got := m.fileMatches(); got != nil {
+		t.Errorf("expected no file matches inside an email-like token, got %v", got)
+	}
+}
+
+func writeAgentKubeConfig(t *testing.T, currentContext string, names ...string) string {
+	t.Helper()
+	content := "apiVersion: v1\nkind: Config\ncurrent-context: " + currentContext + "\nclusters: []\ncontexts:\n"
+	for _, n := range names {
+		content += "- context:\n    cluster: c\n    user: u\n  name: " + n + "\n"
+	}
+	content += "users: []\n"
+	path := filepath.Join(t.TempDir(), "config")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestContextAutocomplete(t *testing.T) {
+	path := writeAgentKubeConfig(t, "prod", "dev", "prod", "staging")
+	a := &agent.Agent{
+		Session:    &api.Session{ID: "test", AgentState: api.AgentStateIdle},
+		Kubeconfig: path,
+	}
+	m := newModel(a)
+	m.width, m.height = 100, 40
+	m.resize()
+
+	// No matches outside the /context command.
+	m.input.SetValue("hello")
+	if got := m.contextMatches(); got != nil {
+		t.Errorf("expected no matches outside /context, got %v", got)
+	}
+
+	// Prefix matches and hint.
+	m.input.SetValue("/context s")
+	if got := m.contextMatches(); len(got) != 1 || got[0] != "staging" {
+		t.Errorf("contextMatches(/context s) = %v, want [staging]", got)
+	}
+	if !m.completionHintVisible() {
+		t.Error("expected hint visible for /context partial")
+	}
+	if got := m.completionHint(); !strings.Contains(got, "staging") {
+		t.Errorf("completionHint = %q, want staging", got)
+	}
+	base := m.inputHeight + 2
+	if got := m.inputBlockHeight(); got != base+1 {
+		t.Errorf("inputBlockHeight = %d, want %d with the context hint", got, base+1)
+	}
+
+	// Tab cycles through all contexts, keeping the command prefix.
+	m.input.SetValue("/context ")
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyTab})
+	first := m.input.Value()
+	if !strings.HasPrefix(first, "/context ") || first == "/context " {
+		t.Errorf("after tab: input = %q, want a context name", first)
+	}
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyTab})
+	second := m.input.Value()
+	if second == first {
+		t.Errorf("expected tab to cycle to the next context, got %q", second)
+	}
+}
+
+// fakeExecutor returns a canned result for executor calls.
+type fakeExecutor struct {
+	result *sandbox.ExecResult
+	err    error
+}
+
+func (f *fakeExecutor) Execute(ctx context.Context, command string, env []string, workDir string) (*sandbox.ExecResult, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.result, nil
+}
+
+func (f *fakeExecutor) Close(ctx context.Context) error { return nil }
+
+func TestNamespaceAutocomplete(t *testing.T) {
+	path := writeAgentKubeConfig(t, "prod", "prod", "staging")
+	a := &agent.Agent{
+		Session:    &api.Session{ID: "test", AgentState: api.AgentStateIdle},
+		Kubeconfig: path,
+		Executor:   &fakeExecutor{result: &sandbox.ExecResult{Stdout: "default\nkube-system\npayments\n"}},
+	}
+	m := newModel(a)
+	m.width, m.height = 100, 40
+	m.resize()
+
+	// No matches outside the namespace command.
+	m.input.SetValue("hello")
+	if got := m.namespaceMatches(); got != nil {
+		t.Errorf("expected no matches outside /namespace, got %v", got)
+	}
+
+	// Prefix matches and hint.
+	m.input.SetValue("/namespace pay")
+	if got := m.namespaceMatches(); len(got) != 1 || got[0] != "payments" {
+		t.Errorf("namespaceMatches(/namespace pay) = %v, want [payments]", got)
+	}
+	if !m.completionHintVisible() {
+		t.Error("expected hint visible for /namespace partial")
+	}
+	if got := m.completionHint(); !strings.Contains(got, "payments") {
+		t.Errorf("completionHint = %q, want payments", got)
+	}
+	base := m.inputHeight + 2
+	if got := m.inputBlockHeight(); got != base+1 {
+		t.Errorf("inputBlockHeight = %d, want %d with the namespace hint", got, base+1)
+	}
+
+	// /ns alias matches too.
+	m.input.SetValue("/ns kube")
+	if got := m.namespaceMatches(); len(got) != 1 || got[0] != "kube-system" {
+		t.Errorf("namespaceMatches(/ns kube) = %v, want [kube-system]", got)
+	}
+
+	// Tab cycles, keeping the command prefix.
+	m.input.SetValue("/ns ")
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyTab})
+	first := m.input.Value()
+	if !strings.HasPrefix(first, "/ns ") || first == "/ns " {
+		t.Errorf("after tab: input = %q, want a namespace name", first)
+	}
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyTab})
+	second := m.input.Value()
+	if second == first {
+		t.Errorf("expected tab to cycle to the next namespace, got %q", second)
 	}
 }

@@ -16,6 +16,7 @@ package agent
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -52,6 +53,8 @@ func TestAgentStreamsTextDeltas(t *testing.T) {
 	iter := gollm.ChatResponseIterator(func(yield func(gollm.ChatResponse, error) bool) {
 		yield(chatWith(fText("Hello, ")), nil)
 		yield(chatWith(fText("world")), nil)
+		// Space the last chunk beyond the throttle interval so it emits too.
+		time.Sleep(200 * time.Millisecond)
 		yield(chatWith(fText("!")), nil)
 	})
 	chat.EXPECT().SendStreaming(gomock.Any(), gomock.Any()).Return(iter, nil)
@@ -103,21 +106,30 @@ func TestAgentStreamsTextDeltas(t *testing.T) {
 		}
 	}
 
-	// Deltas carry the accumulated text, share one ID, and precede the final.
-	wantPayloads := []string{"Hello, ", "Hello, world", "Hello, world!"}
-	if len(deltas) != len(wantPayloads) {
-		t.Fatalf("expected %d delta messages, got %d", len(wantPayloads), len(deltas))
+	// Deltas are throttled to streamDeltaInterval: with instant chunks only
+	// the first one is emitted; the accumulated text arrives via the final.
+	if len(deltas) == 0 {
+		t.Fatal("expected at least one delta message")
 	}
 	for i, d := range deltas {
 		if d.Source != api.MessageSourceModel {
 			t.Errorf("delta %d source = %v, want model", i, d.Source)
 		}
-		if d.Payload != wantPayloads[i] {
-			t.Errorf("delta %d payload = %q, want %q", i, d.Payload, wantPayloads[i])
-		}
 		if d.ID == "" || d.ID != deltas[0].ID {
 			t.Errorf("delta %d ID = %q, want all deltas to share one ID", i, d.ID)
 		}
+		if p, ok := d.Payload.(string); !ok || !strings.HasPrefix("Hello, world!", p) {
+			t.Errorf("delta %d payload = %q, want a prefix of the full text", i, d.Payload)
+		}
+	}
+	// The first delta is always emitted (zero-time gate is open).
+	if deltas[0].Payload != "Hello, " {
+		t.Errorf("first delta payload = %q, want %q", deltas[0].Payload, "Hello, ")
+	}
+
+	// Chunks spaced beyond the interval each emit their own delta.
+	if len(deltas) != 2 {
+		t.Errorf("expected 2 deltas for spaced chunks, got %d", len(deltas))
 	}
 
 	// The final message reuses the stream ID and holds the complete text.

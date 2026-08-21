@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
 	"github.com/openai/openai-go"
 )
 
@@ -602,5 +603,46 @@ func TestConvertToolCallsToFunctionCalls(t *testing.T) {
 				tt.validateCalls(t, calls)
 			}
 		})
+	}
+}
+
+func TestOpenAIChatSessionInitializeSeedsHistory(t *testing.T) {
+	cs := &openAIChatSession{}
+
+	messages := []*api.Message{
+		{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "why are my pods down?"},
+		{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "Let me check your cluster."},
+		{Source: api.MessageSourceModel, Type: api.MessageTypeToolCallRequest, Payload: "kubectl get pods"},             // skipped: tool-call pairing needs IDs
+		{Source: api.MessageSourceAgent, Type: api.MessageTypeToolCallResponse, Payload: map[string]any{"stdout": "x"}}, // skipped
+
+		{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "and the flux kustomization?"},
+		{Source: api.MessageSourceAgent, Type: api.MessageTypeText, Payload: "note from the agent"},
+		{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: ""}, // skipped: empty
+	}
+
+	if err := cs.Initialize(messages); err != nil {
+		t.Fatalf("Initialize failed: %v", err)
+	}
+
+	if len(cs.history) != 4 {
+		t.Fatalf("expected 4 seeded messages (2 user + model + agent text), got %d", len(cs.history))
+	}
+}
+
+func TestOpenAIResponseChatSessionInitializeSeedsHistory(t *testing.T) {
+	cs := &openAIResponseChatSession{}
+
+	messages := []*api.Message{
+		{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "first question"},
+		{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "first answer"},
+		{Source: api.MessageSourceModel, Type: api.MessageTypeToolCallRequest, Payload: "kubectl get pods"}, // skipped
+	}
+
+	if err := cs.Initialize(messages); err != nil {
+		t.Fatalf("Initialize failed: %v", err)
+	}
+
+	if len(cs.history) != 2 {
+		t.Fatalf("expected 2 seeded messages, got %d", len(cs.history))
 	}
 }
