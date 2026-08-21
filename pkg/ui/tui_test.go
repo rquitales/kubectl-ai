@@ -15,9 +15,11 @@
 package ui
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -292,27 +294,27 @@ func TestHistoryNavigation(t *testing.T) {
 	m := newModel(nil)
 	m.messages = historyTestMessages()
 
-	press := func(k tea.KeyType) {
-		_, _ = m.handleKey(tea.KeyMsg{Type: k})
+	altKey := func(r rune) {
+		_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}, Alt: true})
 	}
 
-	press(tea.KeyCtrlP)
+	altKey('p')
 	if got := m.input.Value(); got != "second query" {
-		t.Errorf("after 1st ctrl+p: input = %q, want %q", got, "second query")
+		t.Errorf("after 1st alt+p: input = %q, want %q", got, "second query")
 	}
-	press(tea.KeyCtrlP)
+	altKey('p')
 	if got := m.input.Value(); got != "first query" {
-		t.Errorf("after 2nd ctrl+p: input = %q, want %q", got, "first query")
+		t.Errorf("after 2nd alt+p: input = %q, want %q", got, "first query")
 	}
-	press(tea.KeyCtrlP) // at oldest: stays
+	altKey('p') // at oldest: stays
 	if got := m.input.Value(); got != "first query" {
 		t.Errorf("at oldest: input = %q, want %q", got, "first query")
 	}
-	press(tea.KeyCtrlN)
+	altKey('n')
 	if got := m.input.Value(); got != "second query" {
-		t.Errorf("after ctrl+n: input = %q, want %q", got, "second query")
+		t.Errorf("after alt+n: input = %q, want %q", got, "second query")
 	}
-	press(tea.KeyCtrlN) // past newest: restores (empty) draft
+	altKey('n') // past newest: restores (empty) draft
 	if got := m.input.Value(); got != "" {
 		t.Errorf("past newest: input = %q, want %q", got, "")
 	}
@@ -326,11 +328,11 @@ func TestHistoryRestoresDraft(t *testing.T) {
 	m.messages = historyTestMessages()
 
 	m.input.SetValue("my draft")
-	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlP})
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p"), Alt: true})
 	if got := m.input.Value(); got != "second query" {
 		t.Fatalf("after ctrl+p: input = %q, want %q", got, "second query")
 	}
-	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlN})
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n"), Alt: true})
 	if got := m.input.Value(); got != "my draft" {
 		t.Errorf("after ctrl+n: input = %q, want draft %q", got, "my draft")
 	}
@@ -351,7 +353,7 @@ func TestUpMovesCursorWithinMultiLineDraft(t *testing.T) {
 	}
 }
 
-func TestUpDownScrollsViewportOnSingleLineDraft(t *testing.T) {
+func TestPgUpPgDownScrollsViewport(t *testing.T) {
 	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
 	m := newModel(a)
 	m.width, m.height = 100, 24
@@ -371,17 +373,35 @@ func TestUpDownScrollsViewportOnSingleLineDraft(t *testing.T) {
 		t.Fatal("precondition: viewport should be scrolled to the bottom with tall content")
 	}
 
-	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyUp})
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyPgUp})
 	if m.viewport.YOffset >= atBottom {
-		t.Error("expected KeyUp to scroll the viewport up (away from bottom)")
+		t.Error("expected PgUp to scroll the viewport up (away from bottom)")
+	}
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyPgDown})
+	if m.viewport.YOffset != atBottom {
+		t.Errorf("expected PgDown to scroll back to bottom: YOffset = %d, want %d", m.viewport.YOffset, atBottom)
+	}
+}
+
+func TestUpDownRecallsHistory(t *testing.T) {
+	m := newModel(nil)
+	m.messages = historyTestMessages()
+
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyUp})
+	if got := m.input.Value(); got != "second query" {
+		t.Errorf("after up: input = %q, want %q", got, "second query")
+	}
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyUp})
+	if got := m.input.Value(); got != "first query" {
+		t.Errorf("after 2nd up: input = %q, want %q", got, "first query")
 	}
 	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyDown})
-	if m.viewport.YOffset != atBottom {
-		t.Errorf("expected KeyDown to scroll back to bottom: YOffset = %d, want %d", m.viewport.YOffset, atBottom)
+	if got := m.input.Value(); got != "second query" {
+		t.Errorf("after down: input = %q, want %q", got, "second query")
 	}
-	// History must NOT be triggered by plain Up/Down.
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyDown})
 	if got := m.input.Value(); got != "" {
-		t.Errorf("expected input to stay empty on Up/Down scroll, got %q", got)
+		t.Errorf("past newest: input = %q, want empty", got)
 	}
 }
 
@@ -745,25 +765,14 @@ func TestLastCopyableText(t *testing.T) {
 	}
 }
 
-func TestCtrlYWritesOSC52(t *testing.T) {
-	m := newModel(nil)
-	m.messages = []*api.Message{
-		{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "copy me"},
-	}
-
+func TestOsc52Write(t *testing.T) {
 	r, w, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
 	orig := os.Stdout
 	os.Stdout = w
-	defer func() { os.Stdout = orig }()
-
-	_, cmd := m.copyLastResponse()
-	if cmd == nil {
-		t.Fatal("expected a command writing the OSC52 sequence")
-	}
-	cmd()
+	osc52Write("copy me")
 	w.Close()
 	os.Stdout = orig
 
@@ -774,6 +783,38 @@ func TestCtrlYWritesOSC52(t *testing.T) {
 	if out != want {
 		t.Errorf("OSC52 output = %q, want %q", out, want)
 	}
+}
+
+func TestCopyToClipboard(t *testing.T) {
+	if _, err := exec.LookPath("pbcopy"); err != nil {
+		t.Skip("pbcopy not available on this platform")
+	}
+	if _, err := exec.LookPath("pbpaste"); err != nil {
+		t.Skip("pbpaste not available on this platform")
+	}
+	if err := copyToClipboard("kubectl-ai clipboard test"); err != nil {
+		t.Fatalf("copyToClipboard failed: %v", err)
+	}
+	out, err := exec.Command("pbpaste").Output()
+	if err != nil {
+		t.Fatalf("pbpaste failed: %v", err)
+	}
+	if string(out) != "kubectl-ai clipboard test" {
+		t.Errorf("clipboard = %q, want %q", string(out), "kubectl-ai clipboard test")
+	}
+}
+
+func TestCtrlYConfirmsAndCopies(t *testing.T) {
+	m := newModel(nil)
+	m.messages = []*api.Message{
+		{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "copy me"},
+	}
+
+	_, cmd := m.copyLastResponse()
+	if cmd == nil {
+		t.Fatal("expected a copy command")
+	}
+	cmd()
 	if len(m.messages) == 0 || m.messages[len(m.messages)-1].Payload != "📋 Copied last response to clipboard." {
 		t.Error("expected a transcript confirmation message")
 	}
@@ -840,5 +881,136 @@ func TestMultipleSameSizePastesExpandInInsertionOrder(t *testing.T) {
 	want := "first\npaste\nhere\n\nand\n\nsecond\npaste\nhere"
 	if query != want {
 		t.Errorf("query = %q, want %q", query, want)
+	}
+}
+
+func TestEscInterruptsRunningAgent(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateRunning}}
+	m := newModel(a)
+
+	runCtx := a.StartRun(context.Background())
+	_, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyEsc})
+	if cmd == nil {
+		t.Fatal("expected an interrupt command")
+	}
+	go cmd()
+	select {
+	case <-runCtx.Done():
+	case <-time.After(time.Second):
+		t.Error("expected esc to cancel the running agent")
+	}
+	// The input must NOT be cleared by an interrupt.
+	if m.input.Value() != "" {
+		t.Error("expected input untouched by interrupt")
+	}
+}
+
+func TestEscClearsInputWhenIdle(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.input.SetValue("draft")
+
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyEsc})
+	if got := m.input.Value(); got != "" {
+		t.Errorf("expected esc to clear input when idle, got %q", got)
+	}
+}
+
+func TestEscDeclinesPermissionPrompt(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateWaitingForInput}, Input: make(chan any, 1)}
+	m := newModel(a)
+	m.inChoiceMode = true
+	m.choiceType = "confirm"
+
+	_, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyEsc})
+	if m.inChoiceMode {
+		t.Error("expected choice mode to close on esc")
+	}
+	if cmd == nil {
+		t.Fatal("expected a decline command")
+	}
+	go cmd()
+	got := <-a.Input
+	resp, ok := got.(*api.UserChoiceResponse)
+	if !ok {
+		t.Fatalf("expected *api.UserChoiceResponse, got %T", got)
+	}
+	if resp.Choice != 3 {
+		t.Errorf("expected decline (choice 3), got %d", resp.Choice)
+	}
+}
+
+func TestPaletteOpenNavigateClose(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.width, m.height = 100, 40
+	m.resize()
+
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlP})
+	if !m.paletteOpen {
+		t.Fatal("expected palette to open on ctrl+p")
+	}
+	if got := m.View(); !strings.Contains(got, "Commands") {
+		t.Error("expected palette to render in the view")
+	}
+
+	n := len(m.paletteItems())
+	if n == 0 {
+		t.Fatal("expected palette items")
+	}
+	_, _ = m.handlePaletteKey(tea.KeyMsg{Type: tea.KeyDown})
+	if m.paletteIndex != 1 {
+		t.Errorf("paletteIndex = %d, want 1", m.paletteIndex)
+	}
+	_, _ = m.handlePaletteKey(tea.KeyMsg{Type: tea.KeyUp})
+	if m.paletteIndex != 0 {
+		t.Errorf("paletteIndex = %d, want 0", m.paletteIndex)
+	}
+	// Wrap around.
+	_, _ = m.handlePaletteKey(tea.KeyMsg{Type: tea.KeyUp})
+	if m.paletteIndex != n-1 {
+		t.Errorf("paletteIndex = %d, want %d (wrapped)", m.paletteIndex, n-1)
+	}
+
+	_, _ = m.handlePaletteKey(tea.KeyMsg{Type: tea.KeyEsc})
+	if m.paletteOpen {
+		t.Error("expected palette to close on esc")
+	}
+}
+
+func TestPaletteModelSendsSlashQuery(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}, Input: make(chan any, 1)}
+	m := newModel(a)
+
+	// Find the Switch model action and run it.
+	var item *paletteItem
+	for i, it := range m.paletteItems() {
+		if it.label == "Switch model" {
+			item = &m.paletteItems()[i]
+			break
+		}
+	}
+	if item == nil {
+		t.Fatal("expected a Switch model action")
+	}
+	_, cmd := item.run(&m)
+	if cmd == nil {
+		t.Fatal("expected a command")
+	}
+	go cmd()
+	got := <-a.Input
+	resp, ok := got.(*api.UserInputResponse)
+	if !ok || resp.Query != "/model" {
+		t.Errorf("expected /model query, got %v", got)
+	}
+}
+
+func TestPaletteAutoModeToggleInstant(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+
+	_, _ = m.toggleAutoMode()
+	if !a.SkipPermissionsEnabled() {
+		t.Error("expected auto mode on after palette toggle")
 	}
 }

@@ -18,6 +18,7 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io"
@@ -137,8 +138,60 @@ type Agent struct {
 	// open /model picker; the next UserChoiceResponse selects among them.
 	pendingModelChoice []string
 
+	// runCtx is the context of the current agentic run (a fresh one is
+	// created per user query); runCancel interrupts it. The parent ctx
+	// governs the agent's whole lifetime; runCtx governs a single run so
+	// the user can interrupt a run without killing the agent.
+	runCtx    context.Context
+	runCancel context.CancelFunc
+
 	// cancel is the function to cancel the agent's context
 	cancel context.CancelFunc
+}
+
+// startRun begins a new interruptible run context derived from ctx.
+func (c *Agent) StartRun(ctx context.Context) context.Context {
+	c.sessionMu.Lock()
+	defer c.sessionMu.Unlock()
+	if c.runCancel != nil {
+		c.runCancel()
+	}
+	c.runCtx, c.runCancel = context.WithCancel(ctx)
+	return c.runCtx
+}
+
+// endRun cancels and clears the current run context.
+func (c *Agent) endRun() {
+	c.sessionMu.Lock()
+	defer c.sessionMu.Unlock()
+	if c.runCancel != nil {
+		c.runCancel()
+		c.runCancel = nil
+	}
+}
+
+// CancelRun interrupts the currently running agentic run (e.g. the user
+// pressed Esc). It returns false when no run is in progress. Safe to call
+// from UI goroutines.
+func (c *Agent) CancelRun() bool {
+	c.sessionMu.Lock()
+	defer c.sessionMu.Unlock()
+	if c.runCancel == nil {
+		return false
+	}
+	c.runCancel()
+	return true
+}
+
+// interruptRequested reports whether err results from a CancelRun interrupt
+// (as opposed to the parent context being done or a real failure).
+func (c *Agent) interruptRequested(err error) bool {
+	if !errors.Is(err, context.Canceled) {
+		return false
+	}
+	c.sessionMu.Lock()
+	defer c.sessionMu.Unlock()
+	return c.runCtx != nil && c.runCtx.Err() != nil
 }
 
 // Assert InMemoryChatStore implements ChatMessageStore
@@ -406,6 +459,7 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 	// Save unexpected error and return it in for RunOnce mode
 	log.Info("Starting agent loop", "initialQuery", initialQuery, "runOnce", c.RunOnce)
 	go func() {
+		runCtx := ctx
 		// If initialQuery is empty, try to use the one from the struct
 		if initialQuery == "" {
 			initialQuery = c.InitialQuery
@@ -433,6 +487,7 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 			} else {
 				// Start the agentic loop with the initial query
 				c.setAgentState(api.AgentStateRunning)
+				runCtx = c.StartRun(ctx)
 				c.currIteration = 0
 				c.currChatContent = []any{initialQuery}
 				c.pendingFunctionCalls = []ToolCallAnalysis{}
@@ -529,6 +584,7 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 					}
 
 					c.setAgentState(api.AgentStateRunning)
+					runCtx = c.StartRun(ctx)
 					c.currIteration = 0
 					c.currChatContent = []any{query.Query}
 					c.pendingFunctionCalls = []ToolCallAnalysis{}
@@ -582,14 +638,18 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 							c.handleModelChoice(ctx, response)
 							continue
 						}
-						dispatchToolCalls := c.handleChoice(ctx, response)
+						dispatchToolCalls := c.handleChoice(runCtx, response)
 						if dispatchToolCalls {
-							if err := c.DispatchToolCalls(ctx); err != nil {
+							if err := c.DispatchToolCalls(runCtx); err != nil {
 								log.Error(err, "error dispatching tool calls")
 								c.setAgentState(api.AgentStateDone)
 								c.pendingFunctionCalls = []ToolCallAnalysis{}
 								c.Session.LastModified = time.Now()
-								c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
+								if c.interruptRequested(err) {
+									c.addMessage(api.MessageSourceAgent, api.MessageTypeText, "⚠ Interrupted.")
+								} else {
+									c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
+								}
 								// In RunOnce mode, exit on tool execution error
 								if c.RunOnce {
 									c.setAgentState(api.AgentStateExited)
@@ -632,16 +692,22 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 					c.setAgentState(api.AgentStateDone)
 					c.pendingFunctionCalls = []ToolCallAnalysis{}
 					c.addMessage(api.MessageSourceAgent, api.MessageTypeText, "Maximum number of iterations reached.")
+					c.endRun()
 					continue
 				}
 
 				// we run the agentic loop for one iteration
-				stream, err := c.llmChat.SendStreaming(ctx, c.currChatContent...)
+				stream, err := c.llmChat.SendStreaming(runCtx, c.currChatContent...)
 				if err != nil {
 					log.Error(err, "error sending streaming LLM response")
 					c.setAgentState(api.AgentStateDone)
 					c.pendingFunctionCalls = []ToolCallAnalysis{}
-					c.lastErr = err
+					if c.interruptRequested(err) {
+						c.addMessage(api.MessageSourceAgent, api.MessageTypeText, "⚠ Interrupted.")
+					} else {
+						c.lastErr = err
+						c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
+					}
 					continue
 				}
 
@@ -714,8 +780,12 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 					log.Error(llmError, "error streaming LLM response")
 					c.setAgentState(api.AgentStateDone)
 					c.pendingFunctionCalls = []ToolCallAnalysis{}
-					c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+llmError.Error())
-					c.lastErr = llmError
+					if c.interruptRequested(llmError) {
+						c.addMessage(api.MessageSourceAgent, api.MessageTypeText, "⚠ Interrupted.")
+					} else {
+						c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+llmError.Error())
+						c.lastErr = llmError
+					}
 					continue
 				}
 
@@ -728,6 +798,7 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 				if len(functionCalls) == 0 {
 					log.Info("No function calls to be made, so most likely the task is completed, so we're done.")
 					c.setAgentState(api.AgentStateDone)
+					c.endRun()
 					c.currChatContent = []any{}
 					c.currIteration = 0
 					c.pendingFunctionCalls = []ToolCallAnalysis{}
@@ -833,13 +904,17 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 				}
 
 				// we are here means we are in the clear to dispatch the tool calls
-				if err := c.DispatchToolCalls(ctx); err != nil {
+				if err := c.DispatchToolCalls(runCtx); err != nil {
 					log.Error(err, "error dispatching tool calls")
 					c.setAgentState(api.AgentStateDone)
 					c.pendingFunctionCalls = []ToolCallAnalysis{}
 					c.Session.LastModified = time.Now()
-					c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
-					c.lastErr = err
+					if c.interruptRequested(err) {
+						c.addMessage(api.MessageSourceAgent, api.MessageTypeText, "⚠ Interrupted.")
+					} else {
+						c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
+						c.lastErr = err
+					}
 					continue
 				}
 				c.currIteration = c.currIteration + 1

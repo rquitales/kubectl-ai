@@ -21,6 +21,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -300,6 +301,9 @@ type model struct {
 	browserStatus   browserStatusMsg // transient info/error shown in the browser footer
 	renaming        bool
 	renameInput     textinput.Model
+	// Command palette state
+	paletteOpen  bool
+	paletteIndex int
 }
 
 func newModel(agent *agent.Agent) model {
@@ -545,6 +549,9 @@ func (m *model) updateViewportHeight() {
 	if m.browserOpen && m.width > 0 {
 		contentH -= lipgloss.Height(m.viewSessionBrowser())
 	}
+	if m.paletteOpen && m.width > 0 {
+		contentH -= lipgloss.Height(m.viewPalette())
+	}
 
 	contentH = max(contentH, 5)
 	m.viewport.Height = contentH
@@ -628,6 +635,11 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleBrowserKey(msg)
 	}
 
+	// While the command palette is open it captures all keys except quit.
+	if m.paletteOpen && msg.Type != tea.KeyCtrlC && msg.Type != tea.KeyCtrlD {
+		return m.handlePaletteKey(msg)
+	}
+
 	// Bracketed paste arrives as a single key message with Paste set.
 	// Handle it before anything else so pasted text never triggers shortcuts.
 	if msg.Paste {
@@ -639,24 +651,14 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.quitting = true
 		return m, tea.Quit
 	case tea.KeyEsc:
-		m.input.Reset()
-		m.pastes = nil
-		m.historyIdx = -1
-		m.historyDraft = ""
-		m.syncInputHeight()
+		return m.handleEsc()
+	case tea.KeyCtrlP:
+		m.openPalette()
 		return m, nil
 	case tea.KeyShiftTab:
 		// Toggle auto-accept mode (skip permission prompts), like opencode
 		// and Claude Code.
-		if m.agent != nil {
-			enabled := m.agent.ToggleSkipPermissions()
-			if enabled {
-				m.appendLocalMessage("⚡ Auto mode on — the agent will run tools without asking for permission.")
-			} else {
-				m.appendLocalMessage("Auto mode off — you'll be asked to approve modifying commands.")
-			}
-		}
-		return m, nil
+		return m.toggleAutoMode()
 	case tea.KeyEnter:
 		if msg.Alt {
 			// Alt+Enter inserts a newline (bound in the textarea keymap).
@@ -671,14 +673,14 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.navigateList(tea.KeyUp)
 		}
 		// Within a multi-line draft, Up moves the cursor until the first
-		// line. Otherwise it scrolls the transcript — importantly, this is
-		// also what the mouse wheel does, since terminals translate the
-		// wheel to arrow keys in alt-screen mode.
+		// line; from there (and for single-line drafts) it recalls older
+		// input history, like opencode and Claude Code. Transcript
+		// scrolling lives on PgUp/PgDn.
 		if m.input.LineCount() > 1 && m.input.Line() > 0 {
 			m.input.CursorUp()
 			return m, nil
 		}
-		m.viewport.ScrollUp(1)
+		m.historyPrev()
 	case tea.KeyDown:
 		if m.inChoiceMode {
 			return m, m.navigateList(tea.KeyDown)
@@ -687,16 +689,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.input.CursorDown()
 			return m, nil
 		}
-		m.viewport.ScrollDown(1)
-	case tea.KeyCtrlP:
-		// Input history navigation (readline-style; plain Up/Down scroll).
-		if !m.inChoiceMode {
-			m.historyPrev()
-		}
-	case tea.KeyCtrlN:
-		if !m.inChoiceMode {
-			m.historyNext()
-		}
+		m.historyNext()
 	case tea.KeyCtrlY:
 		return m.copyLastResponse()
 	case tea.KeyPgUp:
@@ -738,6 +731,17 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			// Don't let keystrokes accumulate invisibly in the input
 			// while a choice picker is active.
+			return m, nil
+		}
+		switch msg.String() {
+		case "alt+p":
+			// Alt+P recalls older input history (emacs M-p style; works on
+			// macOS terminals where Alt+arrows aren't delivered).
+			m.historyPrev()
+			return m, nil
+		case "alt+n":
+			// Alt+N recalls newer input history.
+			m.historyNext()
 			return m, nil
 		}
 		// Default: send to text input
@@ -805,8 +809,9 @@ func (m *model) historyNext() {
 }
 
 // copyLastResponse copies the most recent agent/model text message to the
-// system clipboard via the OSC 52 escape sequence (supported by iTerm2,
-// kitty, WezTerm, foot and Windows Terminal), and confirms in the transcript.
+// system clipboard, and confirms in the transcript. On macOS it uses pbcopy
+// (always works, no terminal support needed); elsewhere it falls back to the
+// OSC 52 escape sequence (iTerm2, kitty, WezTerm, foot, Windows Terminal).
 func (m *model) copyLastResponse() (tea.Model, tea.Cmd) {
 	payload, ok := m.lastCopyableText()
 	if !ok {
@@ -815,11 +820,30 @@ func (m *model) copyLastResponse() (tea.Model, tea.Cmd) {
 	}
 	m.appendLocalMessage("📋 Copied last response to clipboard.")
 	return m, func() tea.Msg {
-		// Written directly (zero visual output, so the renderer's cursor
-		// accounting is unaffected; tea.Println is a no-op in alt-screen).
-		fmt.Fprintf(os.Stdout, "\x1b]52;c;%s\a", base64.StdEncoding.EncodeToString([]byte(payload)))
+		_ = copyToClipboard(payload)
 		return nil
 	}
+}
+
+// copyToClipboard puts s on the system clipboard, preferring pbcopy (macOS)
+// and falling back to OSC 52.
+func copyToClipboard(s string) error {
+	if path, err := exec.LookPath("pbcopy"); err == nil {
+		cmd := exec.Command(path)
+		cmd.Stdin = strings.NewReader(s)
+		if err := cmd.Run(); err == nil {
+			return nil
+		}
+	}
+	// Fallback: OSC 52 (zero visual output, so the renderer's cursor
+	// accounting is unaffected; tea.Println is a no-op in alt-screen).
+	osc52Write(s)
+	return nil
+}
+
+// osc52Write emits the OSC 52 clipboard sequence to the terminal.
+func osc52Write(s string) {
+	fmt.Fprintf(os.Stdout, "\x1b]52;c;%s\a", base64.StdEncoding.EncodeToString([]byte(s)))
 }
 
 // lastCopyableText returns the payload of the most recent agent/model text
@@ -844,6 +868,183 @@ func normalizePasteContent(runes []rune) string {
 	content := strings.ReplaceAll(string(runes), "\r\n", "\n")
 	content = strings.ReplaceAll(content, "\r", "\n")
 	return strings.TrimSuffix(content, "\n")
+}
+
+// handleEsc routes the Esc key by priority: close panels, decline/stop a
+// pending prompt, interrupt a running agent, then fall back to clearing
+// the input.
+func (m *model) handleEsc() (tea.Model, tea.Cmd) {
+	// Decline/stop a pending permission prompt or session picker.
+	if m.inChoiceMode {
+		if m.choiceType == "session" {
+			m.inChoiceMode = false
+			m.choicePrompt = ""
+			m.choiceOptionID = ""
+			return m, func() tea.Msg {
+				m.agent.Input <- &api.SessionPickerResponse{Cancelled: true}
+				return nil
+			}
+		}
+		// Permission prompt: decline and interrupt the run.
+		m.inChoiceMode = false
+		m.choicePrompt = ""
+		m.choiceOptionID = ""
+		return m, func() tea.Msg {
+			m.agent.Input <- &api.UserChoiceResponse{Choice: 3} // 3 == No/decline
+			m.agent.CancelRun()
+			return nil
+		}
+	}
+
+	// Interrupt a running agent.
+	if m.agent != nil {
+		if s := m.agentState(); s == api.AgentStateRunning || s == api.AgentStateInitializing {
+			return m, func() tea.Msg {
+				m.agent.CancelRun()
+				return nil
+			}
+		}
+	}
+
+	// Idle: clear the input and attachments as before.
+	m.input.Reset()
+	m.pastes = nil
+	m.historyIdx = -1
+	m.historyDraft = ""
+	m.syncInputHeight()
+	return m, nil
+}
+
+// paletteItem is a single action in the command palette.
+type paletteItem struct {
+	label string
+	hint  string
+	run   func(m *model) (tea.Model, tea.Cmd)
+}
+
+// paletteItems returns the current palette actions (some are dynamic).
+func (m *model) paletteItems() []paletteItem {
+	items := []paletteItem{
+		{label: "Switch model", hint: "/model", run: func(m *model) (tea.Model, tea.Cmd) {
+			return m, m.sendQuery("/model")
+		}},
+		{label: "Browse sessions", hint: "/sessions", run: func(m *model) (tea.Model, tea.Cmd) {
+			return m, m.fetchSessions
+		}},
+		{label: "New session", hint: "", run: func(m *model) (tea.Model, tea.Cmd) {
+			return m, m.sendMsg(&api.NewSessionRequest{})
+		}},
+	}
+	if m.agent != nil && m.agent.SkipPermissionsEnabled() {
+		items = append(items, paletteItem{label: "Auto mode: on (shift+tab to disable)", hint: "shift+tab", run: (*model).toggleAutoMode})
+	} else {
+		items = append(items, paletteItem{label: "Auto mode: off (shift+tab to enable)", hint: "shift+tab", run: (*model).toggleAutoMode})
+	}
+	items = append(items,
+		paletteItem{label: "Copy last response", hint: "ctrl+y", run: (*model).copyLastResponse},
+	)
+	if s := m.agentState(); s == api.AgentStateRunning || s == api.AgentStateInitializing || m.inChoiceMode {
+		items = append(items, paletteItem{label: "Interrupt agent", hint: "esc", run: (*model).interruptRun})
+	}
+	items = append(items,
+		paletteItem{label: "Clear conversation", hint: "/clear", run: func(m *model) (tea.Model, tea.Cmd) {
+			return m, m.sendQuery("/clear")
+		}},
+		paletteItem{label: "Quit", hint: "/exit", run: func(m *model) (tea.Model, tea.Cmd) {
+			return m, m.sendQuery("/exit")
+		}},
+	)
+	return items
+}
+
+func (m *model) openPalette() {
+	if m.browserOpen {
+		m.closeBrowser()
+	}
+	m.paletteOpen = true
+	m.paletteIndex = 0
+	m.updateViewportHeight()
+}
+
+func (m *model) closePalette() {
+	m.paletteOpen = false
+	m.updateViewportHeight()
+}
+
+func (m *model) movePaletteSelection(delta int) {
+	n := len(m.paletteItems())
+	if n == 0 {
+		return
+	}
+	m.paletteIndex = (m.paletteIndex + delta + n) % n
+}
+
+func (m *model) handlePaletteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc:
+		m.closePalette()
+		return m, nil
+	case tea.KeyUp:
+		m.movePaletteSelection(-1)
+		return m, nil
+	case tea.KeyDown:
+		m.movePaletteSelection(1)
+		return m, nil
+	case tea.KeyEnter:
+		items := m.paletteItems()
+		if m.paletteIndex < 0 || m.paletteIndex >= len(items) {
+			return m, nil
+		}
+		item := items[m.paletteIndex]
+		m.closePalette()
+		return item.run(m)
+	}
+	switch msg.String() {
+	case "j":
+		m.movePaletteSelection(1)
+	case "k":
+		m.movePaletteSelection(-1)
+	}
+	return m, nil
+}
+
+// sendQuery sends a query (e.g. a slash command) to the agent, exactly as
+// if the user had typed and submitted it.
+func (m *model) sendQuery(query string) tea.Cmd {
+	return func() tea.Msg {
+		m.agent.Input <- &api.UserInputResponse{Query: query}
+		return nil
+	}
+}
+
+// sendMsg sends an arbitrary input message to the agent.
+func (m *model) sendMsg(v any) tea.Cmd {
+	return func() tea.Msg {
+		m.agent.Input <- v
+		return nil
+	}
+}
+
+// toggleAutoMode flips auto-accept mode with a transcript confirmation.
+func (m *model) toggleAutoMode() (tea.Model, tea.Cmd) {
+	if m.agent == nil {
+		return m, nil
+	}
+	if enabled := m.agent.ToggleSkipPermissions(); enabled {
+		m.appendLocalMessage("⚡ Auto mode on — the agent will run tools without asking for permission.")
+	} else {
+		m.appendLocalMessage("Auto mode off — you'll be asked to approve modifying commands.")
+	}
+	return m, nil
+}
+
+// interruptRun cancels the current agentic run.
+func (m *model) interruptRun() (tea.Model, tea.Cmd) {
+	if m.agent == nil || !m.agent.CancelRun() {
+		m.appendLocalMessage("Nothing running to interrupt.")
+		return m, nil
+	}
+	return m, nil
 }
 
 // tokenAtEndOfInput returns the paste placeholder token (if any) that the
@@ -1355,6 +1556,9 @@ func (m model) View() string {
 	if m.browserOpen {
 		sections = append(sections, m.viewSessionBrowser())
 	}
+	if m.paletteOpen {
+		sections = append(sections, m.viewPalette())
+	}
 	sections = append(sections,
 		m.viewDivider(),
 		m.viewInput(session.AgentState),
@@ -1377,6 +1581,34 @@ func (m *model) browserRows() int {
 		avail = 2
 	}
 	return min(min(n, maxBrowserRows), avail)
+}
+
+// viewPalette renders the command palette panel shown above the input.
+func (m model) viewPalette() string {
+	var sb strings.Builder
+	sb.WriteString(primaryText.Render("Commands"))
+	sb.WriteString("\n\n")
+
+	items := m.paletteItems()
+	if len(items) == 0 {
+		sb.WriteString(mutedStyle.Render("  No actions available."))
+		sb.WriteString("\n")
+	}
+	for i, item := range items {
+		hint := dimStyle.Render("  " + item.hint)
+		if i == m.paletteIndex {
+			sb.WriteString(primaryText.Render("> "+item.label) + hint)
+		} else {
+			sb.WriteString("  " + textStyle.Render(item.label) + hint)
+		}
+		sb.WriteString("\n")
+	}
+
+	sb.WriteString("\n")
+	sb.WriteString(dimStyle.Render("↑/↓/j/k: navigate • enter: run • esc: close"))
+
+	return lipgloss.NewStyle().Padding(0, 1).Render(
+		inputBox.Width(max(m.width-4, 20)).Render(sb.String()))
 }
 
 // viewSessionBrowser renders the session browser panel shown above the input.
@@ -1585,7 +1817,7 @@ func (m model) viewHelp(state api.AgentState) string {
 	case state == api.AgentStateRunning:
 		hints = []string{"Ctrl+C: cancel"}
 	default:
-		hints = []string{"Enter: send", "Ctrl+J: newline", "Ctrl+P/N: history", "Ctrl+Y: copy", "Shift+Tab: auto", "Esc: clear", "Ctrl+C: quit"}
+		hints = []string{"Enter: send", "Ctrl+J: newline", "Ctrl+P: commands", "↑/↓: history", "Ctrl+Y: copy", "Shift+Tab: auto", "Esc: clear/stop", "Ctrl+C: quit"}
 		if m.viewport.TotalLineCount() > m.viewport.Height {
 			hints = append(hints, "PgUp/PgDn: scroll")
 		}
