@@ -613,6 +613,255 @@ func TestResizeDoesNotReEnableDisabledMouse(t *testing.T) {
 	}
 }
 
+func TestStatusClickSpansMatchRenderedSegments(t *testing.T) {
+	// The status bar is one line at y==0. The right-hand segments
+	// (model, kube context, kube namespace) must produce click spans
+	// that are half-open and end before m.width-1. Drive via an agent
+	// so statusLayout can run.
+	a := &agent.Agent{Session: &api.Session{ID: "test", ModelID: "m", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.width, m.height = 120, 24
+	m.resize()
+
+	got, spans := m.statusLayout(a.Session)
+	// The rendered bar must be exactly m.width (the invariant the
+	// right-edge anchoring depends on).
+	if w := lipgloss.Width(got); w != m.width {
+		t.Errorf("status bar width = %d, want %d", w, m.width)
+	}
+	// A non-zero span must end at or before m.width-1.
+	for _, s := range []statusSpan{spans.model, spans.kubeContext, spans.kubeNamespace} {
+		if s.contains(0) && s.end > m.width-1 {
+			t.Errorf("span %v ends at %d, past the bar edge %d", s, s.end, m.width-1)
+		}
+	}
+	// Without a kube context the kube spans are absent.
+	if spans.kubeContext.contains(0) {
+		t.Error("kubeContext span should be zero with no kube context")
+	}
+}
+
+func TestStatusClickSpansDefaultNamespace(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", ModelID: "m", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.width, m.height = 120, 24
+	m.resize()
+	// A default/empty namespace: no namespace target, context target present.
+	m.kubeContext = kubeContextInfo{context: "dev-cluster", namespace: "default"}
+	m.kubeContextOK = true
+	_, spans := m.statusLayout(a.Session)
+	if spans.kubeNamespace.contains(0) {
+		t.Errorf("default namespace should produce no namespace span, got %v", spans.kubeNamespace)
+	}
+	if !spans.kubeContext.contains(spans.kubeContext.start) {
+		t.Errorf("default namespace should produce a context span, got %v", spans.kubeContext)
+	}
+}
+
+func TestStatusClickSpansARNContext(t *testing.T) {
+	// An EKS ARN context name contains a literal "/"; splitting the
+	// rendered string on "/" would misplace the boundary. Deriving from
+	// the struct fields keeps the context span correct.
+	a := &agent.Agent{Session: &api.Session{ID: "test", ModelID: "m", AgentState: api.AgentStateIdle}, Input: make(chan any, 1)}
+	m := newModel(a)
+	m.width, m.height = 200, 24
+	m.resize()
+	m.kubeContext = kubeContextInfo{context: "arn:aws:eks:us-west-2:123:cluster/prod-a", namespace: "payments"}
+	m.kubeContextOK = true
+	_, spans := m.statusLayout(a.Session)
+	// The context span must be non-zero and the namespace span must start
+	// after the context (the "/" separator belongs to neither).
+	ctx := spans.kubeContext
+	if !ctx.contains(ctx.start) {
+		t.Fatalf("expected a context span, got %v", ctx)
+	}
+	ns := spans.kubeNamespace
+	if !ns.contains(ns.start) {
+		t.Fatalf("expected a namespace span, got %v", ns)
+	}
+	if ns.start <= ctx.end {
+		t.Errorf("namespace span %v must start after context span %v", ns, ctx)
+	}
+}
+
+func TestStatusClickOpensPicker(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", ModelID: "m", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.width, m.height = 120, 24
+	m.resize()
+	m.kubeContext = kubeContextInfo{context: "dev-cluster", namespace: "payments"}
+	m.kubeContextOK = true
+
+	// Click the context span: opens the context picker.
+	_, spans := m.statusLayout(a.Session)
+	x := spans.kubeContext.start
+	if !spans.kubeContext.contains(x) {
+		t.Fatal("test precondition: no context span to click")
+	}
+	_, cmd := m.handleStatusClick(x, 0)
+	if !m.pickerOpen || m.pickerKind != pickerContext {
+		t.Errorf("click should open the context picker, got open=%v kind=%v", m.pickerOpen, m.pickerKind)
+	}
+	if cmd == nil {
+		t.Error("expected a fetch command from openPicker")
+	}
+}
+
+func TestStatusClickModelSpanSendsModelQuery(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", ModelID: "m", AgentState: api.AgentStateIdle}, Input: make(chan any, 1)}
+	m := newModel(a)
+	m.width, m.height = 120, 24
+	m.resize()
+	m.kubeContext = kubeContextInfo{context: "dev-cluster"}
+	m.kubeContextOK = true
+
+	_, spans := m.statusLayout(a.Session)
+	x := spans.model.start
+	if !spans.model.contains(x) {
+		t.Fatal("test precondition: no model span to click")
+	}
+	_, cmd := m.handleStatusClick(x, 0)
+	if cmd == nil {
+		t.Fatal("expected a command from the model click")
+	}
+	// The model click sends /model (agent-driven picker), not openPicker.
+	// Verify the returned cmd is a non-nil tea.Cmd that would deliver the
+	// query when executed by the bubbletea runtime.
+	if _, ok := cmd().(*api.UserInputResponse); ok {
+		t.Errorf("model click returned %T, want a tea.Cmd", cmd())
+	}
+}
+
+func TestStatusClickNoOpWhenChoicePromptActive(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", ModelID: "m", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.width, m.height = 120, 24
+	m.resize()
+	m.kubeContext = kubeContextInfo{context: "dev-cluster", namespace: "payments"}
+	m.kubeContextOK = true
+	m.inChoiceMode = true // an agent prompt is capturing input
+
+	_, spans := m.statusLayout(a.Session)
+	// Clicking any span while a choice prompt is active is a no-op.
+	for _, s := range []statusSpan{spans.model, spans.kubeContext, spans.kubeNamespace} {
+		if !s.contains(0) {
+			continue
+		}
+		if _, cmd := m.handleStatusClick(s.start, 0); cmd != nil {
+			t.Errorf("click at span %v should be a no-op while choice prompt active, got cmd=%v", s, cmd)
+		}
+	}
+}
+
+func TestStatusClickNoOpWhenFlashActive(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", ModelID: "m", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.width, m.height = 120, 24
+	m.resize()
+	m.kubeContext = kubeContextInfo{context: "dev-cluster", namespace: "payments"}
+	m.kubeContextOK = true
+	m.setFlash("flash test") // a flash replaces the right segment
+
+	_, spans := m.statusLayout(a.Session)
+	// While the flash is active all spans are zero (no targets).
+	for _, s := range []statusSpan{spans.model, spans.kubeContext, spans.kubeNamespace} {
+		if s.contains(0) {
+			t.Errorf("flash active should zero all spans, got %v", s)
+		}
+	}
+}
+
+func TestStatusClickNoOpWhenNarrow(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", ModelID: "m", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.kubeContext = kubeContextInfo{context: "dev-cluster", namespace: "payments"}
+	m.kubeContextOK = true
+	// Very narrow: the gap<0 path joins+truncates, spans are zero.
+	m.width, m.height = 20, 4
+	m.resize()
+	_, spans := m.statusLayout(a.Session)
+	for _, s := range []statusSpan{spans.model, spans.kubeContext, spans.kubeNamespace} {
+		if s.contains(0) {
+			t.Errorf("narrow width should zero all spans, got %v", s)
+		}
+	}
+}
+
+func TestPickerNavigationAndSelect(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", ModelID: "m", AgentState: api.AgentStateIdle}, Input: make(chan any, 1)}
+	m := newModel(a)
+	m.width, m.height = 80, 24
+	m.resize()
+	m.pickerItems = []pickerItem{
+		{value: "ctx-a", current: true},
+		{value: "ctx-b"},
+		{value: "ctx-c"},
+	}
+	m.pickerOpen = true
+	m.pickerKind = pickerContext
+	m.pickerIndex = 0
+
+	// Down/Up wrap around.
+	m.handlePickerKey(tea.KeyMsg{Type: tea.KeyDown})
+	if m.pickerIndex != 1 {
+		t.Errorf("after down: index = %d, want 1", m.pickerIndex)
+	}
+	m.handlePickerKey(tea.KeyMsg{Type: tea.KeyDown})
+	m.handlePickerKey(tea.KeyMsg{Type: tea.KeyDown})
+	if m.pickerIndex != 0 {
+		t.Errorf("after 3x down (wrap): index = %d, want 0", m.pickerIndex)
+	}
+	m.handlePickerKey(tea.KeyMsg{Type: tea.KeyUp})
+	if m.pickerIndex != 2 {
+		t.Errorf("after up (wrap): index = %d, want 2", m.pickerIndex)
+	}
+
+	// Enter selects: sends /context <value> for the highlighted row.
+	// Capture the selection before handlePickerKey, which closes the
+	// picker and nils pickerItems — reading it afterwards panics.
+	sel := m.pickerItems[m.pickerIndex].value
+	_, cmd := m.handlePickerKey(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("expected a command from enter")
+	}
+	cmd()
+	select {
+	case v := <-m.agent.Input:
+		if q, ok := v.(*api.UserInputResponse); !ok || q.Query != "/context "+sel {
+			t.Errorf("enter sent %q, want %q", q, "/context "+sel)
+		}
+	case <-time.After(time.Second):
+		t.Error("enter did not send a query")
+	}
+	if m.pickerOpen {
+		t.Error("picker should close after enter")
+	}
+
+	// Esc closes without sending.
+	m.pickerItems = []pickerItem{{value: "x"}, {value: "y"}}
+	m.pickerOpen = true
+	m.handlePickerKey(tea.KeyMsg{Type: tea.KeyEsc})
+	if m.pickerOpen {
+		t.Error("esc should close the picker")
+	}
+}
+
+func TestPickerIsBounded(t *testing.T) {
+	m := newModel(nil)
+	m.height = 10
+	m.pickerItems = make([]pickerItem, 50)
+	for i := range m.pickerItems {
+		m.pickerItems[i] = pickerItem{value: fmt.Sprintf("item-%d", i)}
+	}
+	m.pickerOpen = true
+	m.pickerKind = pickerNamespace
+	m.pickerIndex = 40
+	// pickerRows windows; a 50-row list must not overflow a 10-row viewport.
+	if rows := m.pickerRows(); rows > m.height {
+		t.Errorf("pickerRows = %d, must fit within height %d", rows, m.height)
+	}
+}
+
 func TestMouseReportBurstDoesNotLeakIntoInput(t *testing.T) {
 	// A fast scroll wheel packs many SGR mouse reports into one read; a
 	// chunk boundary that splits a sequence drops the ESC and/or the

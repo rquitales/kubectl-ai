@@ -1380,15 +1380,15 @@ func TestToolDispatchUsesActiveKubeconfig(t *testing.T) {
 // caps oversized tool output before storing it in the session history.
 type bigOutputTool struct{}
 
-func (t *bigOutputTool) Name() string                          { return "bigoutput" }
-func (t *bigOutputTool) Description() string                   { return "returns a big output" }
+func (t *bigOutputTool) Name() string        { return "bigoutput" }
+func (t *bigOutputTool) Description() string { return "returns a big output" }
 func (t *bigOutputTool) FunctionDefinition() *gollm.FunctionDefinition {
 	return &gollm.FunctionDefinition{Name: "bigoutput", Description: "returns a big output"}
 }
 func (t *bigOutputTool) Run(context.Context, map[string]any) (any, error) {
 	return map[string]any{"stdout": strings.Repeat("x", 32*1024)}, nil
 }
-func (t *bigOutputTool) IsInteractive(map[string]any) (bool, error) { return false, nil }
+func (t *bigOutputTool) IsInteractive(map[string]any) (bool, error)  { return false, nil }
 func (t *bigOutputTool) CheckModifiesResource(map[string]any) string { return "no" }
 
 func TestDispatchToolCallsCapsOversizedOutput(t *testing.T) {
