@@ -59,7 +59,7 @@ func (sm *SessionManager) NewSession(meta Metadata) (*api.Session, error) {
 		now := time.Now()
 		session := &api.Session{
 			ID:           sessionID,
-			Name:         "Session " + sessionID,
+			Name:         "", // unnamed until content-derived naming on exit
 			ProviderID:   meta.ProviderID,
 			ModelID:      meta.ModelID,
 			AgentState:   api.AgentStateIdle,
@@ -93,7 +93,8 @@ func (sm *SessionManager) DeleteSession(id string) error {
 }
 
 // RenameSession sets a new display name for the session with the given ID.
-// The name is sanitized before being stored.
+// The name is sanitized before being stored. It does not change the
+// ManuallyNamed flag (used by content-derived auto-naming).
 func (sm *SessionManager) RenameSession(id, name string) error {
 	name = SanitizeSessionName(name)
 	if name == "" {
@@ -104,6 +105,22 @@ func (sm *SessionManager) RenameSession(id, name string) error {
 		return err
 	}
 	session.Name = name
+	return sm.store.UpdateSession(session)
+}
+
+// SetSessionName sets a display name and records whether the name was
+// chosen manually (true) or derived automatically from content (false).
+func (sm *SessionManager) SetSessionName(id, name string, manuallyNamed bool) error {
+	name = SanitizeSessionName(name)
+	if name == "" {
+		return errors.New("session name cannot be empty")
+	}
+	session, err := sm.store.GetSession(id)
+	if err != nil {
+		return err
+	}
+	session.Name = name
+	session.ManuallyNamed = manuallyNamed
 	return sm.store.UpdateSession(session)
 }
 
@@ -130,4 +147,37 @@ func (sm *SessionManager) GetLatestSession() (*api.Session, error) {
 func (sm *SessionManager) UpdateLastAccessed(session *api.Session) error {
 	session.LastModified = time.Now()
 	return sm.store.UpdateSession(session)
+}
+
+// HasConversationMessages reports whether the messages contain any real
+// conversation (at least one model-sourced message). Sessions with only
+// meta/slash commands (or nothing) are considered empty.
+func HasConversationMessages(messages []*api.Message) bool {
+	for _, m := range messages {
+		if m.Source == api.MessageSourceModel {
+			return true
+		}
+	}
+	return false
+}
+
+// PruneEmptySessions deletes every session that has no real conversation
+// (no model-sourced messages), returning the number deleted. Used to sweep
+// accumulated empty sessions on startup.
+func (sm *SessionManager) PruneEmptySessions() (int, error) {
+	sessionList, err := sm.store.ListSessions()
+	if err != nil {
+		return 0, err
+	}
+	pruned := 0
+	for _, s := range sessionList {
+		if HasConversationMessages(s.ChatMessageStore.ChatMessages()) {
+			continue
+		}
+		if err := sm.store.DeleteSession(s.ID); err != nil {
+			return pruned, fmt.Errorf("failed to delete session %s: %w", s.ID, err)
+		}
+		pruned++
+	}
+	return pruned, nil
 }

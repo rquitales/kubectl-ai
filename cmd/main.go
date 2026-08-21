@@ -440,6 +440,16 @@ func RunRootCommand(ctx context.Context, opt Options, args []string) error {
 		return fmt.Errorf("failed to create session manager: %w", err)
 	}
 
+	// Sweep accumulated empty sessions (no real conversation) so the
+	// session list only contains sessions worth keeping.
+	if opt.SessionBackend == "filesystem" {
+		if pruned, err := sessionManager.PruneEmptySessions(); err != nil {
+			klog.Warningf("Failed to prune empty sessions: %v", err)
+		} else if pruned > 0 {
+			klog.Infof("Pruned %d empty session(s)", pruned)
+		}
+	}
+
 	// Build agentFactory for new agents
 	agentFactory := func(ctx context.Context) (*agent.Agent, error) {
 		var client gollm.Client

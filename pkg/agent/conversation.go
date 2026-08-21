@@ -408,7 +408,64 @@ func (s *Agent) rebuildChat(ctx context.Context) error {
 	return nil
 }
 
+// deriveSessionName builds a short session name from the first real user
+// message (skipping slash commands and bare meta commands), so the name
+// says what the session is actually about. Returns "" when there's nothing
+// to derive from.
+func deriveSessionName(messages []*api.Message) string {
+	metaWords := map[string]bool{
+		"clear": true, "reset": true, "exit": true, "quit": true,
+		"session": true, "sessions": true, "tools": true, "model": true,
+		"models": true, "new-session": true, "save-session": true,
+	}
+	for _, msg := range messages {
+		if msg.Source != api.MessageSourceUser || msg.Type != api.MessageTypeText {
+			continue
+		}
+		p, ok := msg.Payload.(string)
+		if !ok {
+			continue
+		}
+		p = strings.Join(strings.Fields(p), " ") // collapse whitespace/newlines
+		if p == "" || strings.HasPrefix(p, "/") || metaWords[strings.ToLower(p)] {
+			continue
+		}
+		p = sessions.SanitizeSessionName(p)
+		const maxLen = 48
+		if r := []rune(p); len(r) > maxLen {
+			p = string(r[:maxLen]) + "…"
+		}
+		return p
+	}
+	return ""
+}
+
 func (c *Agent) Close() error {
+	// Exit checks for the session: delete it if empty, otherwise give it a
+	// content-derived name (unless the user named it manually).
+	if c.Session != nil {
+		messages := c.Session.AllMessages()
+		if !sessions.HasConversationMessages(messages) {
+			if manager, err := sessions.NewSessionManager(c.SessionBackend); err == nil {
+				if err := manager.DeleteSession(c.Session.ID); err != nil {
+					klog.Warningf("failed to delete empty session %s: %v", c.Session.ID, err)
+				} else {
+					klog.Infof("Deleted empty session %s on exit", c.Session.ID)
+				}
+			}
+		} else if !c.Session.ManuallyNamed {
+			if name := deriveSessionName(messages); name != "" && name != c.Session.Name {
+				if manager, err := sessions.NewSessionManager(c.SessionBackend); err == nil {
+					if err := manager.SetSessionName(c.Session.ID, name, false); err != nil {
+						klog.Warningf("failed to auto-name session %s: %v", c.Session.ID, err)
+					} else {
+						klog.Infof("Named session %s as %q on exit", c.Session.ID, name)
+					}
+				}
+			}
+		}
+	}
+
 	if c.workDir != "" {
 		if c.RemoveWorkDir {
 			if err := os.RemoveAll(c.workDir); err != nil {
@@ -1446,12 +1503,13 @@ func (c *Agent) RenameSession(sessionID, name string) error {
 	c.sessionMu.Lock()
 	defer c.sessionMu.Unlock()
 
-	if err := manager.RenameSession(sessionID, name); err != nil {
+	if err := manager.SetSessionName(sessionID, name, true); err != nil {
 		return fmt.Errorf("failed to rename session %q: %w", sessionID, err)
 	}
 
 	if c.Session != nil && c.Session.ID == sessionID {
 		c.Session.Name = sessions.SanitizeSessionName(name)
+		c.Session.ManuallyNamed = true
 	}
 
 	return nil

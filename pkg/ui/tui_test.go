@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -1259,5 +1260,308 @@ func TestCtrlLClearsViewButScrollUpReveals(t *testing.T) {
 	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlL})
 	if got := m.renderMessages(); !strings.Contains(got, "secret") || strings.Contains(got, "transcript cleared") {
 		t.Error("expected second ctrl+l to fully restore the transcript")
+	}
+}
+
+func TestRenderToolResultCollapsed(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+
+	msg := &api.Message{
+		Type:    api.MessageTypeToolCallResponse,
+		Payload: map[string]any{"stdout": "NAME   READY\ncoredns   1/1\nmetrics-server   1/1\nkube-proxy   1/1\n"},
+	}
+	got := m.renderMessage(msg, nil, 90)
+	if !strings.Contains(got, "⎿") {
+		t.Error("expected a collapsed result block")
+	}
+	if !strings.Contains(got, "coredns") {
+		t.Error("expected first output line shown")
+	}
+	if !strings.Contains(got, "+1 more lines") {
+		t.Errorf("expected '+1 more lines', got:\n%s", got)
+	}
+}
+
+func TestRenderToolResultShimStringAndEmpty(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+
+	if got := m.renderMessage(&api.Message{Type: api.MessageTypeToolCallResponse, Payload: "Result of running \"x\":\nok"}, nil, 90); !strings.Contains(got, "⎿") {
+		t.Error("expected shim string payloads to render")
+	}
+	if got := m.renderMessage(&api.Message{Type: api.MessageTypeToolCallResponse, Payload: map[string]any{}}, nil, 90); got != "" {
+		t.Errorf("expected empty result to render nothing, got %q", got)
+	}
+}
+
+func TestToolResultText(t *testing.T) {
+	cases := []struct {
+		in   any
+		want string
+	}{
+		{"plain string", "plain string"},
+		{map[string]any{"stdout": "out", "stderr": "err"}, "out"},
+		{map[string]any{"stderr": "err only"}, "err only"},
+		{map[string]any{"content": "mcp content"}, "mcp content"},
+		{42, "42"},
+	}
+	for _, c := range cases {
+		if got := toolResultText(c.in); got != c.want {
+			t.Errorf("toolResultText(%v) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func writeKubeConfig(t *testing.T, currentContext string, withNamespace bool) string {
+	t.Helper()
+	ns := ""
+	if withNamespace {
+		ns = "\n    namespace: dev-ns"
+	}
+	content := fmt.Sprintf(`apiVersion: v1
+kind: Config
+current-context: %s
+clusters:
+- cluster:
+    server: https://dev.example.com
+  name: dev-cluster
+contexts:
+- context:
+    cluster: dev-cluster
+    user: dev-user%s
+  name: dev-context
+users:
+- name: dev-user
+  user: {}
+`, currentContext, ns)
+	path := filepath.Join(t.TempDir(), "config")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestLoadKubeContext(t *testing.T) {
+	info, ok := loadKubeContext(writeKubeConfig(t, "dev-context", true))
+	if !ok {
+		t.Fatal("expected kubeconfig to load")
+	}
+	if info.context != "dev-context" {
+		t.Errorf("context = %q, want %q", info.context, "dev-context")
+	}
+	if info.namespace != "dev-ns" {
+		t.Errorf("namespace = %q, want %q", info.namespace, "dev-ns")
+	}
+
+	// A context without a namespace falls back to "default".
+	info, ok = loadKubeContext(writeKubeConfig(t, "dev-context", false))
+	if !ok {
+		t.Fatal("expected kubeconfig to load")
+	}
+	if info.namespace != "default" {
+		t.Errorf("namespace = %q, want %q", info.namespace, "default")
+	}
+
+	// A missing file fails silently.
+	if _, ok := loadKubeContext(filepath.Join(t.TempDir(), "missing")); ok {
+		t.Error("expected ok=false for a missing kubeconfig")
+	}
+}
+
+func TestKubeContextInfoStringAndProd(t *testing.T) {
+	cases := []struct {
+		info kubeContextInfo
+		want string
+		prod bool
+	}{
+		{kubeContextInfo{context: "minikube", namespace: "default"}, "minikube", false},
+		{kubeContextInfo{context: "minikube", namespace: ""}, "minikube", false},
+		{kubeContextInfo{context: "staging", namespace: "qa"}, "staging/qa", false},
+		{kubeContextInfo{context: "gke-acme-eu-prod", namespace: "default"}, "gke-acme-eu-prod", true},
+		{kubeContextInfo{context: "prod-cluster", namespace: "payments"}, "prod-cluster/payments", true},
+	}
+	for _, c := range cases {
+		if got := c.info.String(); got != c.want {
+			t.Errorf("%+v: String() = %q, want %q", c.info, got, c.want)
+		}
+		if got := c.info.isProd(); got != c.prod {
+			t.Errorf("%+v: isProd() = %v, want %v", c.info, got, c.prod)
+		}
+	}
+}
+
+func TestResolveKubeContextPrefersAgentPath(t *testing.T) {
+	path := writeKubeConfig(t, "agent-context", true)
+	a := &agent.Agent{
+		Session:    &api.Session{ID: "test", AgentState: api.AgentStateIdle},
+		Kubeconfig: path,
+	}
+	m := newModel(a)
+	if !m.kubeContextOK {
+		t.Fatal("expected the kube context to resolve at startup")
+	}
+	if m.kubeContext.context != "agent-context" {
+		t.Errorf("context = %q, want %q (from the agent's kubeconfig)", m.kubeContext.context, "agent-context")
+	}
+}
+
+func TestViewStatusShowsKubeContext(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", ModelID: "m", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.width = 100
+	m.kubeContext = kubeContextInfo{context: "dev-context", namespace: "dev-ns"}
+	m.kubeContextOK = true
+
+	if got := m.viewStatus(a.Session); !strings.Contains(got, "⎈ dev-context/dev-ns") {
+		t.Errorf("expected kube context in the status bar, got %q", got)
+	}
+
+	// The default namespace renders as the bare context.
+	m.kubeContext.namespace = "default"
+	if got := m.viewStatus(a.Session); !strings.Contains(got, "⎈ dev-context") || strings.Contains(got, "dev-context/") {
+		t.Errorf("expected bare context for the default namespace, got %q", got)
+	}
+}
+
+func TestCtrlOTogglesToolResultExpansion(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+
+	msg := &api.Message{
+		Type:    api.MessageTypeToolCallResponse,
+		Payload: map[string]any{"stdout": "one\ntwo\nthree\nfour\nfive\n"},
+	}
+
+	collapsed := m.renderToolResult(msg)
+	if !strings.Contains(collapsed, "+2 more lines (ctrl+o to expand)") {
+		t.Errorf("expected the collapsed expand hint, got:\n%s", collapsed)
+	}
+	if strings.Contains(collapsed, "four") {
+		t.Error("expected the collapsed result to hide lines past the first 3")
+	}
+
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlO})
+	if !m.expandToolResults {
+		t.Fatal("expected ctrl+o to expand tool results")
+	}
+	expanded := m.renderToolResult(msg)
+	if !strings.Contains(expanded, "five") {
+		t.Error("expected the expanded result to show all lines")
+	}
+	if !strings.Contains(expanded, "(ctrl+o to collapse)") {
+		t.Errorf("expected the collapse hint on the last line, got:\n%s", expanded)
+	}
+	if strings.Contains(expanded, "more lines") {
+		t.Error("expected no '+N more lines' tail when everything fits expanded")
+	}
+
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlO})
+	if m.expandToolResults {
+		t.Error("expected a second ctrl+o to collapse again")
+	}
+}
+
+func TestRenderToolResultExpandedCapsAt200Lines(t *testing.T) {
+	m := newModel(nil)
+	m.expandToolResults = true
+
+	var sb strings.Builder
+	for i := 0; i < 210; i++ {
+		fmt.Fprintf(&sb, "line-%d\n", i)
+	}
+	msg := &api.Message{Type: api.MessageTypeToolCallResponse, Payload: sb.String()}
+	got := m.renderToolResult(msg)
+	if !strings.Contains(got, "line-199") {
+		t.Error("expected the first 200 lines to be shown")
+	}
+	if strings.Contains(got, "line-209") {
+		t.Error("expected lines beyond 200 to stay hidden")
+	}
+	if !strings.Contains(got, "+10 more lines (ctrl+o to collapse)") {
+		t.Errorf("expected the capped tail with the collapse hint, got:\n%s", got)
+	}
+}
+
+func TestSlashCompletions(t *testing.T) {
+	cases := []struct {
+		input string
+		want  []string
+	}{
+		{"/mo", []string{"/model", "/models"}},
+		{"/models", []string{"/models"}},
+		{"/s", []string{"/sessions", "/session", "/save"}},
+		{"hello", nil},
+		{"", nil},
+		{"/nope", nil},
+	}
+	for _, c := range cases {
+		got := slashCompletions(c.input)
+		if len(got) != len(c.want) {
+			t.Errorf("slashCompletions(%q) = %v, want %v", c.input, got, c.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Errorf("slashCompletions(%q) = %v, want %v", c.input, got, c.want)
+				break
+			}
+		}
+	}
+	if got := slashCompletions("/"); len(got) != len(slashCommands) {
+		t.Errorf("slashCompletions(\"/\") returned %d matches, want all %d commands", len(got), len(slashCommands))
+	}
+}
+
+func TestTabCyclesSlashCompletions(t *testing.T) {
+	m := newModel(nil)
+	m.input.SetValue("/mo")
+
+	tab := tea.KeyMsg{Type: tea.KeyTab}
+	_, _ = m.handleKey(tab)
+	if got := m.input.Value(); got != "/model" {
+		t.Errorf("after 1st tab: input = %q, want %q", got, "/model")
+	}
+	_, _ = m.handleKey(tab)
+	if got := m.input.Value(); got != "/models" {
+		t.Errorf("after 2nd tab: input = %q, want %q", got, "/models")
+	}
+	_, _ = m.handleKey(tab)
+	if got := m.input.Value(); got != "/model" {
+		t.Errorf("after 3rd tab: input = %q, want %q (wrapped)", got, "/model")
+	}
+}
+
+func TestTabWithoutSlashLeavesInputAlone(t *testing.T) {
+	m := newModel(nil)
+	m.input.SetValue("hello")
+
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyTab})
+	if got := m.input.Value(); got != "hello" {
+		t.Errorf("tab without a slash prefix changed the input to %q", got)
+	}
+}
+
+func TestCompletionHintGrowsInputBlock(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.width, m.height = 100, 40
+	m.resize()
+
+	base := m.inputBlockHeight()
+	m.input.SetValue("/mo")
+	if got := m.inputBlockHeight(); got != base+1 {
+		t.Errorf("inputBlockHeight = %d, want %d with the hint visible", got, base+1)
+	}
+	if hint := m.completionHint(); !strings.Contains(hint, "/model") || !strings.Contains(hint, "/models") {
+		t.Errorf("completion hint = %q, want the matching commands", hint)
+	}
+	if view := m.viewInput(api.AgentStateIdle); !strings.Contains(view, "/models") {
+		t.Error("expected the completion hint rendered inside the input box")
+	}
+
+	m.input.SetValue("hello")
+	if got := m.inputBlockHeight(); got != base {
+		t.Errorf("inputBlockHeight = %d, want %d without a slash prefix", got, base)
 	}
 }
