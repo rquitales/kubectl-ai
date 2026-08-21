@@ -29,6 +29,9 @@ func TestAgentParallelToolCallsNotDuplicated(t *testing.T) {
 	chat.EXPECT().Initialize(gomock.Any()).Return(nil)
 	chat.EXPECT().SetFunctionDefinitions(gomock.Any()).Return(nil)
 
+	// The first model text reply triggers an async session-title request.
+	client.EXPECT().GenerateCompletion(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+
 	// Iteration 1: text + two parallel calls. Iteration 2: text only.
 	firstResp := chatWith(
 		fText("Let me check the available contexts and switch if needed."),

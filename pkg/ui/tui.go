@@ -23,6 +23,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1769,6 +1770,9 @@ func (m model) renderTextMsg(msg *api.Message, r *glamour.TermRenderer, w int) s
 		return userMsg.Width(w+2).Render(label+"\n"+content) + "\n"
 	case api.MessageSourceModel, api.MessageSourceAgent:
 		label := successText.Render("kubectl-ai") + ts
+		if msg.Tokens > 0 {
+			label += dimStyle.Italic(true).Render(" · " + formatTokens(msg.Tokens))
+		}
 		rendered, _ := r.Render(payload)
 		return agentMsg.Width(w+2).Render(label+"\n"+strings.TrimSpace(rendered)) + "\n"
 	}
@@ -2083,6 +2087,12 @@ func (m model) viewStatus(session *api.Session) string {
 	}
 	model = truncateRunes(model, 30)
 
+	// Running session token total, hidden until the provider reports usage.
+	totalTokens := 0
+	for _, msg := range session.AllMessages() {
+		totalTokens += msg.Tokens
+	}
+
 	left := primaryText.Render("kubectl-ai") + sep + mutedStyle.Render(name) + sep + m.viewState(session.AgentState)
 	if m.agent != nil && m.agent.SkipPermissionsEnabled() {
 		left += sep + warnText.Render("⚡AUTO")
@@ -2098,14 +2108,17 @@ func (m model) viewStatus(session *api.Session) string {
 		}
 		kube = "⎈ " + m.kubeContext.String()
 	}
-	renderRight := func() string {
+	renderRight := func(model string) string {
 		s := lipgloss.NewStyle().Foreground(colorSecondary).Render(model)
 		if kube != "" {
 			s += sep + kubeStyle.Render(kube)
 		}
+		if totalTokens > 0 {
+			s = dimStyle.Render("Σ "+formatTokens(totalTokens)) + " " + s
+		}
 		return s
 	}
-	right := renderRight()
+	right := renderRight(model)
 
 	// The status bar must always be exactly one line, no matter the
 	// terminal width: shrink the name (then the model, then the kube
@@ -2116,11 +2129,11 @@ func (m model) viewStatus(session *api.Session) string {
 	}
 	for lipgloss.Width(left)+lipgloss.Width(right) > m.width-2 && len([]rune(model)) > 7 {
 		model = truncateRunes(model, len([]rune(model))-4)
-		right = renderRight()
+		right = renderRight(model)
 	}
 	for lipgloss.Width(left)+lipgloss.Width(right) > m.width-2 && len([]rune(kube)) > 8 {
 		kube = truncateRunes(kube, len([]rune(kube))-4)
-		right = renderRight()
+		right = renderRight(model)
 	}
 
 	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right) - 2
@@ -2141,6 +2154,15 @@ func truncateRunes(s string, n int) string {
 		return "…"
 	}
 	return string(r[:n-1]) + "…"
+}
+
+// formatTokens renders a token count compactly: plain below 1000 ("42"),
+// one-decimal thousands above ("1.2k").
+func formatTokens(n int) string {
+	if n < 1000 {
+		return strconv.Itoa(n)
+	}
+	return fmt.Sprintf("%.1fk", float64(n)/1000)
 }
 
 func (m model) viewState(state api.AgentState) string {

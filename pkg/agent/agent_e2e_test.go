@@ -117,6 +117,9 @@ func TestAgentEndToEndToolExecution(t *testing.T) {
 	chat.EXPECT().Initialize(gomock.Any()).Return(nil)
 	chat.EXPECT().SetFunctionDefinitions(gomock.Any()).Return(nil)
 
+	// The first model text reply triggers an async session-title request.
+	client.EXPECT().GenerateCompletion(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+
 	firstResp := chatWith(fCalls("mocktool", map[string]any{"command": "do"}))
 	secondResp := chatWith(fText("all done"))
 
@@ -221,7 +224,7 @@ func TestAgentEndToEndToolExecution(t *testing.T) {
 				t.Fatalf("unexpected message after final model text: type=%v", m.Type)
 			}
 		}
-	default:
+	case <-time.After(2 * time.Second):
 		if st := a.AgentState(); st != api.AgentStateDone && st != api.AgentStateWaitingForInput {
 			t.Fatalf("unexpected state after tool run: %s (want Done or WaitingForInput)", st)
 		}

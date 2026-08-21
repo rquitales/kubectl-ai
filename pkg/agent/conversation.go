@@ -143,6 +143,14 @@ type Agent struct {
 	// open /model picker; the next UserChoiceResponse selects among them.
 	pendingModelChoice []string
 
+	// titleAttempted ensures an LLM-generated session title is requested at
+	// most once per agent lifetime.
+	titleAttempted bool
+
+	// titleGenerated is set once an LLM-generated title was applied to the
+	// session; exit-time content-derived naming must not override it.
+	titleGenerated bool
+
 	// runCtx is the context of the current agentic run (a fresh one is
 	// created per user query); runCancel interrupts it. The parent ctx
 	// governs the agent's whole lifetime; runCtx governs a single run so
@@ -216,18 +224,36 @@ func (s *Agent) GetSession() *api.Session {
 
 // addMessage creates a new message, adds it to the session, and sends it to the output channel
 func (c *Agent) addMessage(source api.MessageSource, messageType api.MessageType, payload any) *api.Message {
-	c.sessionMu.Lock()
-	defer c.sessionMu.Unlock()
-	message := &api.Message{
+	return c.sendMessage(&api.Message{
 		ID:        uuid.New().String(),
 		Source:    source,
 		Type:      messageType,
 		Payload:   payload,
 		Timestamp: time.Now(),
-	}
+	})
+}
+
+// addModelTextMessage adds a model text message to the session, recording the
+// token usage reported by the provider (0 when none was reported).
+func (c *Agent) addModelTextMessage(text string, tokens int) *api.Message {
+	return c.sendMessage(&api.Message{
+		ID:        uuid.New().String(),
+		Source:    api.MessageSourceModel,
+		Type:      api.MessageTypeText,
+		Payload:   text,
+		Timestamp: time.Now(),
+		Tokens:    tokens,
+	})
+}
+
+// sendMessage adds a fully-formed message to the session and sends it to the
+// output channel.
+func (c *Agent) sendMessage(message *api.Message) *api.Message {
+	c.sessionMu.Lock()
+	defer c.sessionMu.Unlock()
 
 	// Don't store UI control signals - they're not part of the conversation
-	if messageType != api.MessageTypeUserInputRequest {
+	if message.Type != api.MessageTypeUserInputRequest {
 		c.Session.ChatMessageStore.AddChatMessage(message)
 		c.Session.LastModified = time.Now()
 	}
@@ -447,6 +473,14 @@ func deriveSessionName(messages []*api.Message) string {
 	return ""
 }
 
+// llmTitleGenerated reports whether an LLM-generated title was applied to
+// the session. Safe to call from any goroutine.
+func (c *Agent) llmTitleGenerated() bool {
+	c.sessionMu.Lock()
+	defer c.sessionMu.Unlock()
+	return c.titleGenerated
+}
+
 func (c *Agent) Close() error {
 	// Exit checks for the session: delete it if empty, otherwise give it a
 	// content-derived name (unless the user named it manually).
@@ -460,7 +494,7 @@ func (c *Agent) Close() error {
 					klog.Infof("Deleted empty session %s on exit", c.Session.ID)
 				}
 			}
-		} else if !c.Session.ManuallyNamed {
+		} else if !c.Session.ManuallyNamed && !c.llmTitleGenerated() {
 			if name := deriveSessionName(messages); name != "" && name != c.Session.Name {
 				if manager, err := sessions.NewSessionManager(c.SessionBackend); err == nil {
 					if err := manager.SetSessionName(c.Session.ID, name, false); err != nil {
@@ -813,6 +847,11 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 				var streamedText string
 				var llmError error
 
+				// lastUsage holds the usage metadata of the most recent chunk
+				// that reported any (providers report cumulative totals, so the
+				// last one wins).
+				var lastUsage any
+
 				for response, err := range stream {
 					if err != nil {
 						log.Error(err, "error reading streaming LLM response")
@@ -827,6 +866,10 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 						break
 					}
 					// klog.Infof("response: %+v", response)
+
+					if metadata := response.UsageMetadata(); metadata != nil {
+						lastUsage = metadata
+					}
 
 					if len(response.Candidates()) == 0 {
 						llmError = fmt.Errorf("no candidates in response")
@@ -868,7 +911,8 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 				log.Info("streamedText", "streamedText", streamedText)
 
 				if streamedText != "" {
-					c.addMessage(api.MessageSourceModel, api.MessageTypeText, streamedText)
+					c.addModelTextMessage(streamedText, usageTotalTokens(lastUsage))
+					c.maybeGenerateSessionTitle()
 				}
 				// If no function calls to be made, we're done
 				if len(functionCalls) == 0 {

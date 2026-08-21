@@ -68,6 +68,10 @@ type Message struct {
 	Type      MessageType
 	Payload   any
 	Timestamp time.Time
+	// Tokens is the total (prompt + completion) token count reported by the
+	// provider for the LLM response that produced this message; 0 when the
+	// provider reported none. Only set on model text messages.
+	Tokens int
 }
 
 type MessageSource string

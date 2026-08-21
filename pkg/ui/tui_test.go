@@ -1391,6 +1391,25 @@ func TestKubeContextInfoStringAndProd(t *testing.T) {
 	}
 }
 
+func TestFormatTokens(t *testing.T) {
+	cases := []struct {
+		in   int
+		want string
+	}{
+		{0, "0"},
+		{42, "42"},
+		{999, "999"},
+		{1000, "1.0k"},
+		{1234, "1.2k"},
+		{45200, "45.2k"},
+	}
+	for _, c := range cases {
+		if got := formatTokens(c.in); got != c.want {
+			t.Errorf("formatTokens(%d) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 func TestResolveKubeContextPrefersAgentPath(t *testing.T) {
 	path := writeKubeConfig(t, "agent-context", true)
 	a := &agent.Agent{
@@ -1563,5 +1582,50 @@ func TestCompletionHintGrowsInputBlock(t *testing.T) {
 	m.input.SetValue("hello")
 	if got := m.inputBlockHeight(); got != base {
 		t.Errorf("inputBlockHeight = %d, want %d without a slash prefix", got, base)
+	}
+}
+
+func TestRenderTextMsgShowsTokenCount(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	r, err := m.cache.getRenderer(80)
+	if err != nil {
+		t.Fatalf("getRenderer: %v", err)
+	}
+
+	msg := &api.Message{
+		Source: api.MessageSourceModel, Type: api.MessageTypeText,
+		Payload: "answer", Timestamp: time.Now(), Tokens: 1234,
+	}
+	if got := m.renderTextMsg(msg, r, 80); !strings.Contains(got, "· 1.2k") {
+		t.Errorf("expected a dim token count in the label, got:\n%s", got)
+	}
+
+	// No token count when the provider reported none.
+	msg.Tokens = 0
+	if got := m.renderTextMsg(msg, r, 80); strings.Contains(got, "·") {
+		t.Errorf("expected no token count for Tokens=0, got:\n%s", got)
+	}
+}
+
+func TestViewStatusShowsTokenTotal(t *testing.T) {
+	store := sessions.NewInMemoryChatStore()
+	_ = store.AddChatMessage(&api.Message{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "a", Tokens: 40000})
+	_ = store.AddChatMessage(&api.Message{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "b", Tokens: 5200})
+
+	a := &agent.Agent{Session: &api.Session{
+		ID: "test", AgentState: api.AgentStateIdle, ModelID: "m", ChatMessageStore: store,
+	}}
+	m := newModel(a)
+	m.width = 100
+
+	if got := m.viewStatus(a.GetSession()); !strings.Contains(got, "Σ 45.2k") {
+		t.Errorf("expected session token total in status bar, got:\n%s", got)
+	}
+
+	// Hidden when no usage was reported.
+	empty := &api.Session{ID: "test", AgentState: api.AgentStateIdle}
+	if got := m.viewStatus(empty); strings.Contains(got, "Σ") {
+		t.Errorf("expected no token total for an empty session, got:\n%s", got)
 	}
 }
