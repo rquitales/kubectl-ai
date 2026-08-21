@@ -124,13 +124,35 @@ func TestHandleMetaQuery(t *testing.T) {
 			},
 		},
 		{
-			name:   "model",
-			query:  "model",
-			expect: "Current model is `test-model`",
+			name:  "model",
+			query: "model",
+			// Bare "model" opens the interactive picker instead of printing.
 			expectations: func(t *testing.T) *Agent {
-				a := &Agent{Model: "test-model"}
-				a.Session = &api.Session{}
+				ctrl := gomock.NewController(t)
+				t.Cleanup(ctrl.Finish)
+				llm := mocks.NewMockClient(ctrl)
+				llm.EXPECT().ListModels(ctx).Return([]string{"test-model", "other-model"}, nil)
+
+				a := &Agent{Model: "test-model", LLM: llm, Output: make(chan any, 1)}
+				a.Session = &api.Session{ChatMessageStore: sessions.NewInMemoryChatStore()}
 				return a
+			},
+			verify: func(t *testing.T, a *Agent, ans string) {
+				if a.AgentState() != api.AgentStateWaitingForInput {
+					t.Errorf("expected state waiting-for-input, got %v", a.AgentState())
+				}
+				if len(a.pendingModelChoice) != 2 {
+					t.Errorf("expected 2 pending model choices, got %v", a.pendingModelChoice)
+				}
+				select {
+				case m := <-a.Output:
+					msg, ok := m.(*api.Message)
+					if !ok || msg.Type != api.MessageTypeUserChoiceRequest {
+						t.Errorf("expected user-choice-request, got %T", m)
+					}
+				default:
+					t.Error("expected a user-choice-request message on output")
+				}
 			},
 		},
 		{
@@ -484,5 +506,109 @@ func TestUnknownCommandMessageListsCommands(t *testing.T) {
 	msg := unknownCommandMessage("/nonsense")
 	if !strings.Contains(msg, "/nonsense") || !strings.Contains(msg, "/sessions") || !strings.Contains(msg, "/rename") {
 		t.Errorf("unexpected unknown-command message: %q", msg)
+	}
+}
+
+func TestAgentSwitchModel(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockClient := mocks.NewMockClient(ctrl)
+	mockChat := mocks.NewMockChat(ctrl)
+	newChat := mocks.NewMockChat(ctrl)
+
+	mockClient.EXPECT().ListModels(gomock.Any()).Return([]string{"old-model", "new-model"}, nil).AnyTimes()
+	mockClient.EXPECT().StartChat(gomock.Any(), "old-model").Return(mockChat)
+	mockClient.EXPECT().StartChat(gomock.Any(), "new-model").Return(newChat)
+	mockChat.EXPECT().Initialize(gomock.Any()).Return(nil)
+	mockChat.EXPECT().SetFunctionDefinitions(gomock.Any()).Return(nil)
+	newChat.EXPECT().Initialize(gomock.Any()).Return(nil)
+	newChat.EXPECT().SetFunctionDefinitions(gomock.Any()).Return(nil)
+
+	a := &Agent{
+		SessionBackend: "memory",
+		Input:          make(chan any),
+		Output:         make(chan any),
+		LLM:            mockClient,
+		Model:          "old-model",
+		Session: &api.Session{
+			ID:               "test-session",
+			ModelID:          "old-model",
+			AgentState:       api.AgentStateIdle,
+			ChatMessageStore: sessions.NewInMemoryChatStore(),
+		},
+	}
+
+	if err := a.Init(context.Background()); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	if err := a.switchModel(context.Background(), "new-model"); err != nil {
+		t.Fatalf("switchModel failed: %v", err)
+	}
+
+	if a.Model != "new-model" {
+		t.Errorf("Model = %q, want %q", a.Model, "new-model")
+	}
+	if a.Session.ModelID != "new-model" {
+		t.Errorf("Session.ModelID = %q, want %q", a.Session.ModelID, "new-model")
+	}
+
+	if err := a.switchModel(context.Background(), "does-not-exist"); err == nil {
+		t.Error("expected error for unknown model, got nil")
+	}
+	// State must be unchanged after a failed switch.
+	if a.Model != "new-model" {
+		t.Errorf("Model changed after failed switch: %q", a.Model)
+	}
+}
+
+func TestAgentHandleModelChoice(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockClient := mocks.NewMockClient(ctrl)
+	mockChat := mocks.NewMockChat(ctrl)
+
+	mockClient.EXPECT().ListModels(gomock.Any()).Return([]string{"a", "b"}, nil).AnyTimes()
+	mockClient.EXPECT().StartChat(gomock.Any(), gomock.Any()).Return(mockChat).AnyTimes()
+	mockChat.EXPECT().Initialize(gomock.Any()).Return(nil).AnyTimes()
+	mockChat.EXPECT().SetFunctionDefinitions(gomock.Any()).Return(nil).AnyTimes()
+
+	a := &Agent{
+		SessionBackend: "memory",
+		Input:          make(chan any),
+		Output:         make(chan any, 2),
+		LLM:            mockClient,
+		Model:          "a",
+		Session: &api.Session{
+			ID:               "test-session",
+			ModelID:          "a",
+			AgentState:       api.AgentStateIdle,
+			ChatMessageStore: sessions.NewInMemoryChatStore(),
+		},
+	}
+	if err := a.Init(context.Background()); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	a.pendingModelChoice = []string{"a", "b"}
+	a.handleModelChoice(context.Background(), &api.UserChoiceResponse{Choice: 2})
+
+	if a.pendingModelChoice != nil {
+		t.Error("expected pendingModelChoice to be cleared")
+	}
+	if a.Model != "b" {
+		t.Errorf("Model = %q, want %q", a.Model, "b")
+	}
+	if a.AgentState() != api.AgentStateDone {
+		t.Errorf("expected state done, got %v", a.AgentState())
+	}
+
+	// Invalid index is rejected gracefully.
+	a.pendingModelChoice = []string{"a", "b"}
+	a.handleModelChoice(context.Background(), &api.UserChoiceResponse{Choice: 9})
+	if a.Model != "b" {
+		t.Errorf("Model changed on invalid selection: %q", a.Model)
 	}
 }
