@@ -15,7 +15,9 @@
 package ui
 
 import (
+	"encoding/base64"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -291,23 +293,23 @@ func TestHistoryNavigation(t *testing.T) {
 		_, _ = m.handleKey(tea.KeyMsg{Type: k})
 	}
 
-	press(tea.KeyUp)
+	press(tea.KeyCtrlP)
 	if got := m.input.Value(); got != "second query" {
-		t.Errorf("after 1st up: input = %q, want %q", got, "second query")
+		t.Errorf("after 1st ctrl+p: input = %q, want %q", got, "second query")
 	}
-	press(tea.KeyUp)
+	press(tea.KeyCtrlP)
 	if got := m.input.Value(); got != "first query" {
-		t.Errorf("after 2nd up: input = %q, want %q", got, "first query")
+		t.Errorf("after 2nd ctrl+p: input = %q, want %q", got, "first query")
 	}
-	press(tea.KeyUp) // at oldest: stays
+	press(tea.KeyCtrlP) // at oldest: stays
 	if got := m.input.Value(); got != "first query" {
 		t.Errorf("at oldest: input = %q, want %q", got, "first query")
 	}
-	press(tea.KeyDown)
+	press(tea.KeyCtrlN)
 	if got := m.input.Value(); got != "second query" {
-		t.Errorf("after down: input = %q, want %q", got, "second query")
+		t.Errorf("after ctrl+n: input = %q, want %q", got, "second query")
 	}
-	press(tea.KeyDown) // past newest: restores (empty) draft
+	press(tea.KeyCtrlN) // past newest: restores (empty) draft
 	if got := m.input.Value(); got != "" {
 		t.Errorf("past newest: input = %q, want %q", got, "")
 	}
@@ -321,13 +323,13 @@ func TestHistoryRestoresDraft(t *testing.T) {
 	m.messages = historyTestMessages()
 
 	m.input.SetValue("my draft")
-	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyUp})
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlP})
 	if got := m.input.Value(); got != "second query" {
-		t.Fatalf("after up: input = %q, want %q", got, "second query")
+		t.Fatalf("after ctrl+p: input = %q, want %q", got, "second query")
 	}
-	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyDown})
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlN})
 	if got := m.input.Value(); got != "my draft" {
-		t.Errorf("after down: input = %q, want draft %q", got, "my draft")
+		t.Errorf("after ctrl+n: input = %q, want draft %q", got, "my draft")
 	}
 }
 
@@ -336,7 +338,7 @@ func TestUpMovesCursorWithinMultiLineDraft(t *testing.T) {
 	m.messages = historyTestMessages()
 
 	m.input.SetValue("line one\nline two")
-	// Cursor is at the end (line 2). Up must move the cursor, not recall history.
+	// Cursor is at the end (line 2). Up must move the cursor.
 	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyUp})
 	if got := m.input.Line(); got != 0 {
 		t.Errorf("cursor line = %d, want 0", got)
@@ -344,10 +346,39 @@ func TestUpMovesCursorWithinMultiLineDraft(t *testing.T) {
 	if got := m.input.Value(); got != "line one\nline two" {
 		t.Errorf("draft changed during cursor movement: %q", got)
 	}
-	// On the first line now: Up recalls history.
+}
+
+func TestUpDownScrollsViewportOnSingleLineDraft(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.width, m.height = 100, 24
+	m.resize()
+	// Fill the transcript so it scrolls.
+	for i := 0; i < 50; i++ {
+		m.messages = append(m.messages, &api.Message{
+			Source: api.MessageSourceModel, Type: api.MessageTypeText,
+			Payload: fmt.Sprintf("line %d", i), Timestamp: time.Now(),
+		})
+	}
+	m.dirty = true
+	m.refresh()
+	m.viewport.GotoBottom()
+	atBottom := m.viewport.YOffset
+	if atBottom == 0 {
+		t.Fatal("precondition: viewport should be scrolled to the bottom with tall content")
+	}
+
 	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyUp})
-	if got := m.input.Value(); got != "second query" {
-		t.Errorf("after up on first line: input = %q, want %q", got, "second query")
+	if m.viewport.YOffset >= atBottom {
+		t.Error("expected KeyUp to scroll the viewport up (away from bottom)")
+	}
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyDown})
+	if m.viewport.YOffset != atBottom {
+		t.Errorf("expected KeyDown to scroll back to bottom: YOffset = %d, want %d", m.viewport.YOffset, atBottom)
+	}
+	// History must NOT be triggered by plain Up/Down.
+	if got := m.input.Value(); got != "" {
+		t.Errorf("expected input to stay empty on Up/Down scroll, got %q", got)
 	}
 }
 
@@ -687,5 +718,60 @@ func TestShiftTabTogglesAutoMode(t *testing.T) {
 	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyShiftTab})
 	if a.SkipPermissionsEnabled() {
 		t.Error("expected auto mode off after second shift+tab")
+	}
+}
+
+func TestLastCopyableText(t *testing.T) {
+	m := newModel(nil)
+	if _, ok := m.lastCopyableText(); ok {
+		t.Error("expected nothing copyable with no messages")
+	}
+
+	m.messages = []*api.Message{
+		{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "question"},
+		{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "first answer"},
+		{Source: api.MessageSourceModel, Type: api.MessageTypeToolCallRequest, Payload: "kubectl get pods"},
+		{Source: api.MessageSourceAgent, Type: api.MessageTypeText, Payload: "final answer"},
+	}
+	got, ok := m.lastCopyableText()
+	if !ok {
+		t.Fatal("expected something copyable")
+	}
+	if got != "final answer" {
+		t.Errorf("lastCopyableText = %q, want %q", got, "final answer")
+	}
+}
+
+func TestCtrlYWritesOSC52(t *testing.T) {
+	m := newModel(nil)
+	m.messages = []*api.Message{
+		{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "copy me"},
+	}
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := os.Stdout
+	os.Stdout = w
+	defer func() { os.Stdout = orig }()
+
+	_, cmd := m.copyLastResponse()
+	if cmd == nil {
+		t.Fatal("expected a command writing the OSC52 sequence")
+	}
+	cmd()
+	w.Close()
+	os.Stdout = orig
+
+	buf := make([]byte, 4096)
+	n, _ := r.Read(buf)
+	out := string(buf[:n])
+	want := "\x1b]52;c;" + base64.StdEncoding.EncodeToString([]byte("copy me")) + "\a"
+	if out != want {
+		t.Errorf("OSC52 output = %q, want %q", out, want)
+	}
+	if len(m.messages) == 0 || m.messages[len(m.messages)-1].Payload != "📋 Copied last response to clipboard." {
+		t.Error("expected a transcript confirmation message")
 	}
 }
