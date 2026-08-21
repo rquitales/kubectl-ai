@@ -386,9 +386,14 @@ type model struct {
 	browserFilter      string            // substring filter applied to allBrowserSessions
 	browserIndex       int
 	browserStatus      browserStatusMsg // transient info/error shown in the browser footer
-	renaming           bool
-	renameInput        textinput.Model
-	pendingDeleteID    string // session staged for deletion, awaiting 'y'
+	// flash is a brief, single-line status-bar message (e.g. "📋 Copied")
+	// that auto-clears after a couple of seconds. It is never stored in the
+	// transcript, so transient UI feedback doesn't pollute the conversation.
+	flash           string
+	flashClear      time.Time
+	renaming        bool
+	renameInput     textinput.Model
+	pendingDeleteID string // session staged for deletion, awaiting 'y'
 	// Command palette state
 	paletteOpen  bool
 	paletteIndex int
@@ -507,6 +512,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
 		return m, cmd
+
+	case flashClearMsg:
+		// Clear the status-bar flash only if this is the most recent one
+		// (a later setFlash may have pushed the deadline out).
+		if !m.flashClear.IsZero() && !time.Now().Before(m.flashClear) {
+			m.flash = ""
+			m.flashClear = time.Time{}
+		}
+		return m, nil
 
 	case tickMsg:
 		// Re-resolve the kube context on a TTL so an external
@@ -628,7 +642,10 @@ func (m *model) setBrowserStatus(text string, isErr bool) {
 }
 
 // appendLocalMessage adds a transient agent-styled message to the
-// transcript (for UI-originated events; it is not persisted).
+// transcript (for UI-originated events; it is not persisted). Reserved for
+// content the user explicitly requested (e.g. /help, /mcp output) — NOT for
+// transient UI feedback like copy/interrupt/toggle confirmations, which use
+// setFlash so they appear in the status bar and never enter the transcript.
 func (m *model) appendLocalMessage(text string) {
 	m.messages = append(m.messages, &api.Message{
 		Source:    api.MessageSourceAgent,
@@ -639,6 +656,21 @@ func (m *model) appendLocalMessage(text string) {
 	m.dirty = true
 	m.refresh()
 	m.viewport.GotoBottom()
+}
+
+// flashClearMsg is sent by a timer to clear the status-bar flash.
+type flashClearMsg time.Time
+
+// setFlash shows a brief one-line message in the status bar (replacing the
+// right-hand segment) that auto-clears after flashTTL. Use for transient UI
+// feedback — copy confirmations, interrupts, toggle state — so it never
+// pollutes the conversation transcript.
+const flashTTL = 2500 * time.Millisecond
+
+func (m *model) setFlash(text string) tea.Cmd {
+	m.flash = text
+	m.flashClear = time.Now().Add(flashTTL)
+	return tea.Tick(flashTTL, func(time.Time) tea.Msg { return flashClearMsg{} })
 }
 
 // openBrowser opens the session browser with the given sessions, selecting
@@ -894,15 +926,15 @@ func (m *model) filterMouseRunes(runes []rune) []rune {
 // mode Apple Terminal honors, so it's on by default for scrolling — but it
 // takes click-drag from the terminal, so toggling it off restores native text
 // selection (PgUp/PgDn scroll while it's off), and back on restores the wheel.
+// The mode is shown in the status bar (🖱 SELECT when off) rather than the
+// transcript, since it's a transient UI state, not part of the conversation.
 func (m *model) toggleMouse() (tea.Model, tea.Cmd) {
 	m.mouseEnabled = !m.mouseEnabled
 	if m.mouseEnabled {
-		m.appendLocalMessage("🖱  Mouse capture on — wheel scrolls the transcript. Ctrl+G to turn it off for text selection.")
 		return m, tea.EnableMouseCellMotion
 	}
 	m.swallowMouseSeq = false
 	m.swallowedRunes = 0
-	m.appendLocalMessage("🖱  Mouse capture off — drag to select and copy text. PgUp/PgDn scroll; Ctrl+G to turn the wheel back on.")
 	return m, tea.DisableMouse
 }
 
@@ -1263,14 +1295,13 @@ func (m *model) historyNext() {
 func (m *model) copyLastResponse() (tea.Model, tea.Cmd) {
 	payload, ok := m.lastCopyableText()
 	if !ok {
-		m.appendLocalMessage("Nothing to copy yet.")
-		return m, nil
+		return m, m.setFlash("Nothing to copy yet.")
 	}
-	m.appendLocalMessage("📋 Copied last response to clipboard.")
-	return m, func() tea.Msg {
+	copy := func() tea.Msg {
 		_ = copyToClipboard(payload)
 		return nil
 	}
+	return m, tea.Batch(copy, m.setFlash("📋 Copied last response to clipboard."))
 }
 
 // copyToClipboard puts s on the system clipboard, preferring pbcopy (macOS)
@@ -1341,28 +1372,26 @@ func (m *model) lastToolOutput() (string, bool) {
 func (m *model) copyToolCommand() (tea.Model, tea.Cmd) {
 	payload, ok := m.lastToolCommand()
 	if !ok {
-		m.appendLocalMessage("Nothing to copy yet.")
-		return m, nil
+		return m, m.setFlash("Nothing to copy yet.")
 	}
-	m.appendLocalMessage("📋 Copied last command to clipboard.")
-	return m, func() tea.Msg {
+	copy := func() tea.Msg {
 		_ = copyToClipboard(payload)
 		return nil
 	}
+	return m, tea.Batch(copy, m.setFlash("📋 Copied last command to clipboard."))
 }
 
 // copyToolOutput copies the most recent tool-call output to the clipboard.
 func (m *model) copyToolOutput() (tea.Model, tea.Cmd) {
 	payload, ok := m.lastToolOutput()
 	if !ok {
-		m.appendLocalMessage("Nothing to copy yet.")
-		return m, nil
+		return m, m.setFlash("Nothing to copy yet.")
 	}
-	m.appendLocalMessage("📋 Copied last output to clipboard.")
-	return m, func() tea.Msg {
+	copy := func() tea.Msg {
 		_ = copyToClipboard(payload)
 		return nil
 	}
+	return m, tea.Batch(copy, m.setFlash("📋 Copied last output to clipboard."))
 }
 
 // normalizePasteContent normalizes line endings in pasted runes and drops a
@@ -1409,12 +1438,15 @@ func (m *model) handleEsc() (tea.Model, tea.Cmd) {
 	// Interrupt a running agent.
 	if m.agent != nil {
 		if s := m.agentState(); s == api.AgentStateRunning || s == api.AgentStateInitializing {
-			// Confirm in the transcript immediately so the user sees the
-			// interrupt landed; the actual cancel runs in the returned closure
-			// (CancelRun signals the run to stop asynchronously).
-			m.appendLocalMessage("⏹ Interrupted.")
+			// Flash a status-bar confirmation so the user sees the interrupt
+			// landed; the returned closure both cancels the run (CancelRun
+			// signals it to stop asynchronously) and arms the flash timer.
+			flash := m.setFlash("⏹ Interrupted.")
 			return m, func() tea.Msg {
 				m.agent.CancelRun()
+				if flash != nil {
+					flash()
+				}
 				return nil
 			}
 		}
@@ -1571,11 +1603,9 @@ func (m *model) toggleAutoMode() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if enabled := m.agent.ToggleSkipPermissions(); enabled {
-		m.appendLocalMessage("⚡ Auto mode on — the agent will run tools without asking for permission.")
-	} else {
-		m.appendLocalMessage("Auto mode off — you'll be asked to approve modifying commands.")
+		return m, m.setFlash("⚡ Auto mode on — tools run without asking.")
 	}
-	return m, nil
+	return m, m.setFlash("Auto mode off — modifying commands need approval.")
 }
 
 // toggleExpandToolResults flips tool-result expansion (ctrl+o), exposed via the
@@ -1599,11 +1629,9 @@ func (m *model) toggleExpandThinking() (tea.Model, tea.Cmd) {
 // interruptRun cancels the current agentic run.
 func (m *model) interruptRun() (tea.Model, tea.Cmd) {
 	if m.agent == nil || !m.agent.CancelRun() {
-		m.appendLocalMessage("Nothing running to interrupt.")
-		return m, nil
+		return m, m.setFlash("Nothing running to interrupt.")
 	}
-	m.appendLocalMessage("⏹ Interrupted.")
-	return m, nil
+	return m, m.setFlash("⏹ Interrupted.")
 }
 
 // tokenAtEndOfInput returns the paste placeholder token (if any) that the
@@ -1928,18 +1956,17 @@ func (m *model) submitSessionRename() (tea.Model, tea.Cmd) {
 	return m.renameCurrentSession(name)
 }
 
-// renameCurrentSession renames the current session immediately and confirms.
+// renameCurrentSession renames the current session immediately and confirms
+// via a status-bar flash (the new name is also reflected in the status bar).
 func (m *model) renameCurrentSession(name string) (tea.Model, tea.Cmd) {
 	if m.agent == nil {
 		return m, nil
 	}
 	s := m.agent.GetSession()
 	if err := m.agent.RenameSession(s.ID, name); err != nil {
-		m.appendLocalMessage("Rename failed: " + err.Error())
-		return m, nil
+		return m, m.setFlash("Rename failed: " + err.Error())
 	}
-	m.appendLocalMessage(fmt.Sprintf("Renamed session to %q.", name))
-	return m, nil
+	return m, m.setFlash(fmt.Sprintf("Renamed session to %q.", name))
 }
 
 func (m *model) handleEnter() (tea.Model, tea.Cmd) {
@@ -3123,6 +3150,12 @@ func (m model) viewStatus(session *api.Session) string {
 	if m.agent != nil && m.agent.SkipPermissionsEnabled() {
 		left += sep + warnText.Render("⚡AUTO")
 	}
+	// When mouse capture is toggled off (for text selection), show a status
+	// indicator so the mode is visible without polluting the transcript. The
+	// default (capture on, wheel scrolling) stays silent.
+	if !m.mouseEnabled {
+		left += sep + warnText.Render("🖱 SELECT")
+	}
 	// MCP server connection status, shown only when MCP is configured so a
 	// failed server is visible (otherwise tools silently go missing). Connected
 	// servers read green; any failure reads yellow.
@@ -3156,6 +3189,17 @@ func (m model) viewStatus(session *api.Session) string {
 		return s
 	}
 	right := renderRight(model)
+
+	// A transient flash (copy/interrupt/toggle feedback) replaces the
+	// right-hand segment while active, so the feedback is visible without
+	// entering the transcript.
+	if m.flash != "" && time.Now().Before(m.flashClear) {
+		right = lipgloss.NewStyle().Foreground(colorPrimary).Render(m.flash)
+	} else if m.flash != "" {
+		// Expired but not yet cleared by the tick; blank it now.
+		m.flash = ""
+		m.flashClear = time.Time{}
+	}
 
 	// The status bar must always be exactly one line, no matter the
 	// terminal width: shrink the name (then the model, then the kube

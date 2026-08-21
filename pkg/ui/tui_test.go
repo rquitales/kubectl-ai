@@ -553,8 +553,10 @@ func TestCtrlGTogglesMouseCapture(t *testing.T) {
 	if cmd == nil {
 		t.Error("expected a command to disable mouse capture")
 	}
-	if got := lastMessageText(m); !strings.Contains(got, "off") {
-		t.Errorf("expected a note that capture is off, got %q", got)
+	// The toggle is a transient UI state, shown in the status bar — it must
+	// NOT append a message to the transcript.
+	if got := lastMessageText(m); got != "" {
+		t.Errorf("Ctrl+G appended a transcript message %q; want none (status-bar indicator only)", got)
 	}
 
 	// On again: the wheel scrolls once more.
@@ -564,6 +566,30 @@ func TestCtrlGTogglesMouseCapture(t *testing.T) {
 	}
 	if cmd == nil {
 		t.Error("expected a command to re-enable mouse capture")
+	}
+	if got := lastMessageText(m); got != "" {
+		t.Errorf("re-enabling appended a transcript message %q; want none", got)
+	}
+}
+
+func TestStatusBarShowsMouseSelectIndicator(t *testing.T) {
+	// A nil agent means viewStatus can't run, so drive it via the agent.
+	a := &agent.Agent{Session: &api.Session{ID: "test", ModelID: "m", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.width, m.height = 120, 24
+	m.resize()
+
+	// Default (capture on): no SELECT indicator in the status bar.
+	gotOn := m.viewStatus(a.Session)
+	if strings.Contains(gotOn, "SELECT") {
+		t.Errorf("status bar should not show SELECT while capture is on: %q", gotOn)
+	}
+
+	// After toggling off: the SELECT indicator appears.
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlG})
+	gotOff := m.viewStatus(a.Session)
+	if !strings.Contains(gotOff, "SELECT") {
+		t.Errorf("status bar should show SELECT while capture is off: %q", gotOff)
 	}
 }
 
@@ -1111,8 +1137,12 @@ func TestShiftTabTogglesAutoMode(t *testing.T) {
 	if !a.SkipPermissionsEnabled() {
 		t.Error("expected auto mode on after shift+tab")
 	}
-	if len(m.messages) == 0 {
-		t.Error("expected a transcript confirmation message")
+	// Auto-mode confirmation is a status-bar flash, not a transcript message.
+	if !strings.Contains(m.flash, "Auto mode") {
+		t.Errorf("expected an auto-mode flash, got %q", m.flash)
+	}
+	if len(m.messages) != 0 {
+		t.Errorf("auto-mode toggle leaked a transcript message: %v", m.messages)
 	}
 	if got := m.View(); !strings.Contains(got, "AUTO") {
 		t.Error("expected AUTO indicator in status bar")
@@ -1189,14 +1219,19 @@ func TestCtrlYConfirmsAndCopies(t *testing.T) {
 	m.messages = []*api.Message{
 		{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "copy me"},
 	}
+	before := len(m.messages)
 
 	_, cmd := m.copyLastResponse()
 	if cmd == nil {
 		t.Fatal("expected a copy command")
 	}
 	cmd()
-	if len(m.messages) == 0 || m.messages[len(m.messages)-1].Payload != "📋 Copied last response to clipboard." {
-		t.Error("expected a transcript confirmation message")
+	// The confirmation is a status-bar flash, not a transcript message.
+	if len(m.messages) != before {
+		t.Errorf("copy leaked a transcript message: %v", m.messages[before:])
+	}
+	if !strings.Contains(m.flash, "Copied") {
+		t.Errorf("expected a copy flash, got %q", m.flash)
 	}
 }
 
@@ -1207,6 +1242,7 @@ func TestCopyToolCommandAndOutput(t *testing.T) {
 		{Source: api.MessageSourceModel, Type: api.MessageTypeToolCallRequest, Payload: "kubectl get pods -n kube-system"},
 		{Source: api.MessageSourceAgent, Type: api.MessageTypeToolCallResponse, Payload: map[string]any{"stdout": "coredns 1/1\nkube-proxy 1/1\n"}},
 	}
+	before := len(m.messages)
 
 	// lastToolCommand finds the most recent tool-call request.
 	cmd, ok := m.lastToolCommand()
@@ -1219,37 +1255,43 @@ func TestCopyToolCommandAndOutput(t *testing.T) {
 		t.Fatalf("lastToolOutput = %q ok=%v, want the pod list", out, ok)
 	}
 
-	// copyToolCommand confirms in the transcript.
+	// copyToolCommand confirms via a status-bar flash, not the transcript.
 	_, cmdFn := m.copyToolCommand()
 	if cmdFn == nil {
 		t.Fatal("expected a copy command")
 	}
 	cmdFn()
-	if len(m.messages) == 0 || m.messages[len(m.messages)-1].Payload != "📋 Copied last command to clipboard." {
-		t.Error("expected a 'Copied last command' confirmation")
+	if len(m.messages) != before {
+		t.Errorf("copy command leaked a transcript message: %v", m.messages[before:])
+	}
+	if !strings.Contains(m.flash, "Copied") {
+		t.Errorf("expected a copy flash, got %q", m.flash)
 	}
 
-	// copyToolOutput confirms in the transcript.
+	// copyToolOutput confirms via a status-bar flash, not the transcript.
 	_, outFn := m.copyToolOutput()
 	if outFn == nil {
 		t.Fatal("expected a copy command")
 	}
 	outFn()
-	last := m.messages[len(m.messages)-1].Payload
-	if last != "📋 Copied last output to clipboard." {
-		t.Errorf("expected a 'Copied last output' confirmation, got %v", last)
+	if len(m.messages) != before {
+		t.Errorf("copy output leaked a transcript message: %v", m.messages[before:])
+	}
+	if !strings.Contains(m.flash, "Copied") {
+		t.Errorf("expected a copy flash, got %q", m.flash)
 	}
 }
 
 func TestCopyToolNothingToCopy(t *testing.T) {
 	m := newModel(nil)
-	// No tool calls: both report nothing to copy.
-	_, cmdFn := m.copyToolCommand()
-	if cmdFn != nil {
-		t.Error("expected no command when there's no tool call")
+	// No tool calls: both report nothing to copy via a status-bar flash
+	// (the returned cmd is the flash auto-clear timer, not a copy action).
+	m.copyToolCommand()
+	if !strings.Contains(m.flash, "Nothing to copy") {
+		t.Errorf("expected a 'Nothing to copy' flash, got %q", m.flash)
 	}
-	if len(m.messages) == 0 || m.messages[len(m.messages)-1].Payload != "Nothing to copy yet." {
-		t.Error("expected a 'Nothing to copy' note")
+	if len(m.messages) != 0 {
+		t.Errorf("nothing-to-copy leaked a transcript message: %v", m.messages)
 	}
 }
 
@@ -1350,22 +1392,28 @@ func TestEscInterruptsRunningAgent(t *testing.T) {
 	if m.input.Value() != "" {
 		t.Error("expected input untouched by interrupt")
 	}
-	// The interrupt is confirmed in the transcript.
-	if len(m.messages) == 0 || !strings.Contains(m.messages[len(m.messages)-1].Payload.(string), "Interrupted") {
-		t.Errorf("expected an 'Interrupted' confirmation, got %d messages", len(m.messages))
+	// The interrupt is confirmed via a status-bar flash, not the transcript.
+	if !strings.Contains(m.flash, "Interrupted") {
+		t.Errorf("expected an 'Interrupted' flash, got %q", m.flash)
+	}
+	if len(m.messages) != 0 {
+		t.Errorf("interrupt leaked a transcript message: %v", m.messages)
 	}
 }
 
 func TestInterruptRunConfirmsAndNothingRunning(t *testing.T) {
-	// Nothing running: a note, no cancel command.
+	// Nothing running: a status-bar flash, no transcript message.
 	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
 	m := newModel(a)
 	_, _ = m.interruptRun()
-	if len(m.messages) == 0 || !strings.Contains(m.messages[len(m.messages)-1].Payload.(string), "Nothing running") {
-		t.Errorf("expected a 'Nothing running' note, got %d messages", len(m.messages))
+	if !strings.Contains(m.flash, "Nothing running") {
+		t.Errorf("expected a 'Nothing running' flash, got %q", m.flash)
+	}
+	if len(m.messages) != 0 {
+		t.Errorf("interrupt leaked a transcript message: %v", m.messages)
 	}
 
-	// A running agent: the interrupt is confirmed.
+	// A running agent: the interrupt is confirmed via flash.
 	a2 := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateRunning}}
 	m2 := newModel(a2)
 	runCtx := a2.StartRun(context.Background())
@@ -1375,8 +1423,11 @@ func TestInterruptRunConfirmsAndNothingRunning(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Error("expected interruptRun to cancel the running agent")
 	}
-	if len(m2.messages) == 0 || !strings.Contains(m2.messages[len(m2.messages)-1].Payload.(string), "Interrupted") {
-		t.Errorf("expected an 'Interrupted' confirmation, got %d messages", len(m2.messages))
+	if !strings.Contains(m2.flash, "Interrupted") {
+		t.Errorf("expected an 'Interrupted' flash, got %q", m2.flash)
+	}
+	if len(m2.messages) != 0 {
+		t.Errorf("interrupt leaked a transcript message: %v", m2.messages)
 	}
 }
 
@@ -1679,8 +1730,15 @@ func TestRenameSubmitAppliesAndPersists(t *testing.T) {
 	if got := m.input.Value(); got != "" {
 		t.Errorf("expected input cleared after rename, got %q", got)
 	}
-	if len(m.messages) == 0 || !strings.Contains(m.messages[len(m.messages)-1].Payload.(string), "my debug session") {
-		t.Error("expected a rename confirmation message")
+	// The rename confirmation is a status-bar flash, not a transcript
+	// message, so the transcript must not have gained a rename message.
+	if len(m.messages) > 0 {
+		if last, ok := m.messages[len(m.messages)-1].Payload.(string); ok && strings.Contains(last, "Renamed session") {
+			t.Errorf("rename leaked a transcript confirmation: %q", last)
+		}
+	}
+	if !strings.Contains(m.flash, "my debug session") {
+		t.Errorf("expected rename flash to mention the new name, got %q", m.flash)
 	}
 }
 
