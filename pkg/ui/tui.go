@@ -460,14 +460,31 @@ func newModel(agent *agent.Agent) model {
 // leaves button presses and drags with the terminal, so native
 // click-and-drag text selection keeps working. This is the approach Claude
 // Code uses: the wheel scrolls, and you can still select text.
+//
+// The DECSET sequence is written directly to os.Stdout from the command —
+// not via tea.Printf, which is suppressed while the altscreen is active
+// (we always run in altscreen) and which wraps the payload as a printed
+// line rather than a raw control sequence. Writing to os.Stdout is the
+// same pattern the clipboard copy (OSC 52) already uses in this file.
 type enableAltScrollMsg struct{}
 type disableAltScrollMsg struct{}
 
+const (
+	decSetAltScroll   = "\x1b[?1007h"
+	decResetAltScroll = "\x1b[?1007l"
+)
+
 func enableAltScroll() tea.Cmd {
-	return func() tea.Msg { return enableAltScrollMsg{} }
+	return func() tea.Msg {
+		_, _ = os.Stdout.WriteString(decSetAltScroll)
+		return enableAltScrollMsg{}
+	}
 }
 func disableAltScroll() tea.Cmd {
-	return func() tea.Msg { return disableAltScrollMsg{} }
+	return func() tea.Msg {
+		_, _ = os.Stdout.WriteString(decResetAltScroll)
+		return disableAltScrollMsg{}
+	}
 }
 
 func (m model) Init() tea.Cmd {
@@ -493,10 +510,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// re-request it; otherwise the wheel stops scrolling after resizing.
 		return m, enableAltScroll()
 
-	case enableAltScrollMsg:
-		return m, tea.Printf("\x1b[?1007h")
-	case disableAltScrollMsg:
-		return m, tea.Printf("\x1b[?1007l")
+	case enableAltScrollMsg, disableAltScrollMsg:
+		// The DECSET sequence was already written to os.Stdout by the
+		// command; nothing more to do here.
+		return m, nil
 
 	case tea.KeyMsg:
 		return m.handleKey(msg)
