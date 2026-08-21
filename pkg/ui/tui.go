@@ -192,6 +192,11 @@ const (
 	// kubeContextTTL is how often the status bar's kube context is
 	// re-resolved from the kubeconfig file (driven by the 1s tick).
 	kubeContextTTL = 10 * time.Second
+	// deltaRefreshInterval is the minimum time between viewport refreshes
+	// for live-streaming text deltas: chunks arrive far faster than is
+	// worth re-rendering the transcript, so refreshes are gated (the final
+	// text message always refreshes, so the tail is never lost).
+	deltaRefreshInterval = 150 * time.Millisecond
 )
 
 // pastedBlock holds the contents of a large paste. Instead of flooding the
@@ -324,6 +329,9 @@ type model struct {
 	dirty           bool
 	quitting        bool
 	thinkStart      time.Time
+	// lastDeltaRefresh is when the viewport last refreshed for a live
+	// text-delta; used to throttle re-renders while streaming.
+	lastDeltaRefresh time.Time
 	// Choice mode tracking
 	inChoiceMode   bool
 	choicePrompt   string
@@ -1572,7 +1580,55 @@ func (m *model) handleEnter() (tea.Model, tea.Cmd) {
 	}
 }
 
+// handleTextDelta folds a live-streaming text delta into the transcript:
+// the entry matching the delta's ID is updated in place, or appended on the
+// first chunk. The final text message (same ID) arrives via handleAgentMsg
+// and replaces the delta entry through the store snapshot.
+func (m *model) handleTextDelta(msg *api.Message) (tea.Model, tea.Cmd) {
+	updated := false
+	for i := len(m.messages) - 1; i >= 0; i-- {
+		if m.messages[i].ID == msg.ID {
+			m.messages[i].Payload = msg.Payload
+			m.messages[i].Timestamp = msg.Timestamp
+			updated = true
+			break
+		}
+	}
+	if !updated {
+		m.messages = append(m.messages, msg)
+	}
+	m.dirty = true
+
+	// Throttle viewport refreshes while streaming (see deltaRefreshInterval);
+	// note we don't restart the spinner tick here to avoid spawning extra
+	// tick chains per chunk.
+	if time.Since(m.lastDeltaRefresh) < deltaRefreshInterval {
+		return m, nil
+	}
+	m.lastDeltaRefresh = time.Now()
+
+	// Mirror the follow-bottom behavior of handleAgentMsg.
+	if m.clearedAt > 0 && m.revealAll {
+		m.revealAll = false
+		m.refresh()
+		m.viewport.GotoBottom()
+	} else {
+		atBottom := m.viewport.AtBottom()
+		m.refresh()
+		if atBottom {
+			m.viewport.GotoBottom()
+		}
+	}
+	return m, nil
+}
+
 func (m *model) handleAgentMsg(msg *api.Message) (tea.Model, tea.Cmd) {
+	// Live-streamed model text arrives as ephemeral deltas that are not in
+	// the session store; fold them into the transcript separately.
+	if msg.Type == api.MessageTypeTextDelta {
+		return m.handleTextDelta(msg)
+	}
+
 	session := m.agent.GetSession()
 	// A session switch resets the cleared boundary so the resumed
 	// session's transcript shows in full.
@@ -1580,6 +1636,10 @@ func (m *model) handleAgentMsg(msg *api.Message) (tea.Model, tea.Cmd) {
 		m.clearedAt = 0
 		m.sessionID = session.ID
 	}
+	// Re-snapshot from the store. When this is the final text message of a
+	// streamed iteration, the snapshot contains it (with the stream ID) and
+	// drops the ephemeral delta entry: the streaming entry is replaced in
+	// place by the final stored message.
 	m.messages = session.AllMessages()
 	m.dirty = true
 
@@ -1728,8 +1788,11 @@ func (m model) renderMessage(msg *api.Message, r *glamour.TermRenderer, w int) s
 		return ""
 	}
 
-	// Check cache (except tool calls which show status)
-	if msg.ID != "" && msg.Type != api.MessageTypeToolCallRequest {
+	// Check cache (except tool calls which show status, and text deltas
+	// whose content changes per chunk; the final text message shares the
+	// delta's ID and must render fresh).
+	cacheable := msg.ID != "" && msg.Type != api.MessageTypeToolCallRequest && msg.Type != api.MessageTypeTextDelta
+	if cacheable {
 		if cached, ok := m.cache.get(msg.ID); ok {
 			return cached
 		}
@@ -1746,7 +1809,7 @@ func (m model) renderMessage(msg *api.Message, r *glamour.TermRenderer, w int) s
 	}
 
 	// Cache result
-	if msg.ID != "" && result != "" && msg.Type != api.MessageTypeToolCallRequest {
+	if cacheable && result != "" {
 		m.cache.set(msg.ID, result)
 	}
 	return result

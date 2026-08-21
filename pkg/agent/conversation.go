@@ -224,8 +224,16 @@ func (s *Agent) GetSession() *api.Session {
 
 // addMessage creates a new message, adds it to the session, and sends it to the output channel
 func (c *Agent) addMessage(source api.MessageSource, messageType api.MessageType, payload any) *api.Message {
+	return c.addMessageWithID(uuid.New().String(), source, messageType, payload)
+}
+
+// addMessageWithID is addMessage with a caller-chosen message ID. It is used
+// for the final text of a streamed iteration so it carries the same ID as the
+// live text-delta messages that preceded it (UIs then replace the streaming
+// entry in place).
+func (c *Agent) addMessageWithID(id string, source api.MessageSource, messageType api.MessageType, payload any) *api.Message {
 	return c.sendMessage(&api.Message{
-		ID:        uuid.New().String(),
+		ID:        id,
 		Source:    source,
 		Type:      messageType,
 		Payload:   payload,
@@ -852,6 +860,11 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 				// last one wins).
 				var lastUsage any
 
+				// All live text-delta messages of this iteration and the final
+				// text message share one ID, so UIs can update the streaming
+				// entry in place and finally replace it with the stored message.
+				streamID := uuid.New().String()
+
 				for response, err := range stream {
 					if err != nil {
 						log.Error(err, "error reading streaming LLM response")
@@ -886,6 +899,16 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 						if text, ok := part.AsText(); ok {
 							log.Info("text response", "text", text)
 							streamedText += text
+							// Stream the accumulated text live. Deltas are
+							// ephemeral: they go straight to the output channel
+							// and are never stored in the session.
+							c.Output <- &api.Message{
+								ID:        streamID,
+								Source:    api.MessageSourceModel,
+								Type:      api.MessageTypeTextDelta,
+								Payload:   streamedText,
+								Timestamp: time.Now(),
+							}
 						}
 
 						// Check if it's a function call
@@ -911,7 +934,16 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 				log.Info("streamedText", "streamedText", streamedText)
 
 				if streamedText != "" {
-					c.addModelTextMessage(streamedText, usageTotalTokens(lastUsage))
+					// The final text message reuses the stream ID so it replaces
+					// the live delta entry in UIs, and carries token usage.
+					c.sendMessage(&api.Message{
+						ID:        streamID,
+						Source:    api.MessageSourceModel,
+						Type:      api.MessageTypeText,
+						Payload:   streamedText,
+						Timestamp: time.Now(),
+						Tokens:    usageTotalTokens(lastUsage),
+					})
 					c.maybeGenerateSessionTitle()
 				}
 				// If no function calls to be made, we're done
