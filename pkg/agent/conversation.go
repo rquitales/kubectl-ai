@@ -154,6 +154,10 @@ type Agent struct {
 	// open /model picker; the next UserChoiceResponse selects among them.
 	pendingModelChoice []string
 
+	// pendingIterationContinue is true while a max-iterations continue/stop
+	// choice request is outstanding; the next UserChoiceResponse resolves it.
+	pendingIterationContinue bool
+
 	// titleAttempted ensures an LLM-generated session title is requested at
 	// most once per agent lifetime.
 	titleAttempted bool
@@ -773,6 +777,24 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 						continue
 
 					case *api.UserChoiceResponse:
+						if c.pendingIterationContinue {
+							c.pendingIterationContinue = false
+							if response.Choice == 1 {
+								// Continue: reset the budget and resume the
+								// turn; tool results already in
+								// currChatContent carry the context forward.
+								c.currIteration = 0
+								c.addMessage(api.MessageSourceAgent, api.MessageTypeText, "Continuing (iteration budget reset).")
+								c.setAgentState(api.AgentStateRunning)
+							} else {
+								// Stop (2), Esc/decline (3), or anything else.
+								c.setAgentState(api.AgentStateDone)
+								c.pendingFunctionCalls = []ToolCallAnalysis{}
+								c.addMessage(api.MessageSourceAgent, api.MessageTypeText, "Stopped at the iteration limit.")
+								c.endRun()
+							}
+							continue
+						}
 						if c.pendingModelChoice != nil {
 							c.handleModelChoice(ctx, response)
 							continue
@@ -828,10 +850,27 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 				log.Info("Processing agentic loop", "currIteration", c.currIteration, "maxIterations", c.MaxIterations, "currChatContentLen", len(c.currChatContent))
 
 				if c.currIteration >= c.MaxIterations {
-					c.setAgentState(api.AgentStateDone)
-					c.pendingFunctionCalls = []ToolCallAnalysis{}
-					c.addMessage(api.MessageSourceAgent, api.MessageTypeText, "Maximum number of iterations reached.")
-					c.endRun()
+					if c.RunOnce {
+						// No interactive prompt is available in RunOnce mode.
+						c.setAgentState(api.AgentStateDone)
+						c.pendingFunctionCalls = []ToolCallAnalysis{}
+						c.addMessage(api.MessageSourceAgent, api.MessageTypeText, "Maximum number of iterations reached.")
+						c.endRun()
+						continue
+					}
+					// Ask instead of dying: long debug sessions legitimately
+					// need more iterations, while the prompt still catches
+					// runaway loops. The run context stays alive so the turn
+					// can resume exactly where it hit the limit.
+					c.pendingIterationContinue = true
+					c.setAgentState(api.AgentStateWaitingForInput)
+					c.addMessage(api.MessageSourceAgent, api.MessageTypeUserChoiceRequest, &api.UserChoiceRequest{
+						Prompt: fmt.Sprintf("Reached the maximum of %d iterations for this turn.\n\nContinue working on it?", c.MaxIterations),
+						Options: []api.UserChoiceOption{
+							{Value: "continue", Label: "Continue"},
+							{Value: "stop", Label: "Stop"},
+						},
+					})
 					continue
 				}
 
