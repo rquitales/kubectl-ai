@@ -304,6 +304,9 @@ type model struct {
 	// Command palette state
 	paletteOpen  bool
 	paletteIndex int
+	// Session rename mode: the input captures a new session name instead
+	// of a chat message.
+	sessionRename bool
 }
 
 func newModel(agent *agent.Agent) model {
@@ -564,6 +567,9 @@ func (m *model) inputBlockHeight() int {
 		return 3 // one-line hint/spinner box + 2 borders
 	}
 	h := m.inputHeight + 2 // +2 for the box borders
+	if m.sessionRename {
+		h++ // the "Rename session:" label line
+	}
 	for _, p := range m.pastes {
 		if p.token == "" {
 			h++ // chip-fallback pastes line
@@ -874,6 +880,12 @@ func normalizePasteContent(runes []rune) string {
 // pending prompt, interrupt a running agent, then fall back to clearing
 // the input.
 func (m *model) handleEsc() (tea.Model, tea.Cmd) {
+	// Cancel an in-progress rename first, restoring the draft.
+	if m.sessionRename {
+		m.exitSessionRename()
+		return m, nil
+	}
+
 	// Decline/stop a pending permission prompt or session picker.
 	if m.inChoiceMode {
 		if m.choiceType == "session" {
@@ -930,6 +942,10 @@ func (m *model) paletteItems() []paletteItem {
 		}},
 		{label: "Browse sessions", hint: "/sessions", run: func(m *model) (tea.Model, tea.Cmd) {
 			return m, m.fetchSessions
+		}},
+		{label: "Rename session", hint: "/rename", run: func(m *model) (tea.Model, tea.Cmd) {
+			m.enterSessionRename()
+			return m, nil
 		}},
 		{label: "New session", hint: "", run: func(m *model) (tea.Model, tea.Cmd) {
 			return m, m.sendMsg(&api.NewSessionRequest{})
@@ -1256,7 +1272,58 @@ func (m *model) moveBrowserSelection(delta int) {
 	m.browserIndex = (m.browserIndex + delta + len(m.browserSessions)) % len(m.browserSessions)
 }
 
+// enterSessionRename switches the input into rename mode for the current
+// session, prefilling the current name.
+func (m *model) enterSessionRename() {
+	m.sessionRename = true
+	name := ""
+	if s := m.agent.GetSession(); s != nil {
+		name = s.Name
+	}
+	m.input.SetValue(name)
+	m.input.Placeholder = "New session name..."
+	m.input.CursorEnd()
+	m.syncInputHeight()
+}
+
+// exitSessionRename leaves rename mode, clearing the input.
+func (m *model) exitSessionRename() {
+	m.sessionRename = false
+	m.input.Placeholder = "Ask kubectl-ai anything..."
+	m.input.Reset()
+	m.syncInputHeight()
+}
+
+// submitSessionRename applies the typed name to the current session.
+func (m *model) submitSessionRename() (tea.Model, tea.Cmd) {
+	name := strings.TrimSpace(m.input.Value())
+	if name == "" {
+		return m, nil
+	}
+	m.exitSessionRename()
+	return m.renameCurrentSession(name)
+}
+
+// renameCurrentSession renames the current session immediately and confirms.
+func (m *model) renameCurrentSession(name string) (tea.Model, tea.Cmd) {
+	if m.agent == nil {
+		return m, nil
+	}
+	s := m.agent.GetSession()
+	if err := m.agent.RenameSession(s.ID, name); err != nil {
+		m.appendLocalMessage("Rename failed: " + err.Error())
+		return m, nil
+	}
+	m.appendLocalMessage(fmt.Sprintf("Renamed session to %q.", name))
+	return m, nil
+}
+
 func (m *model) handleEnter() (tea.Model, tea.Cmd) {
+	// Rename mode captures the input for the new session name.
+	if m.sessionRename {
+		return m.submitSessionRename()
+	}
+
 	// Handle choice selection
 	if m.inChoiceMode {
 		if _, ok := m.list.SelectedItem().(item); ok {
@@ -1337,6 +1404,16 @@ func (m *model) handleEnter() (tea.Model, tea.Cmd) {
 	// Intercept the sessions command (handled locally, not sent to the LLM)
 	if v := strings.ToLower(value); v == "/sessions" || v == "/session" || v == "sessions" {
 		return m, m.fetchSessions
+	}
+
+	// Intercept the rename command (handled locally and instantly).
+	if v := strings.ToLower(value); v == "/rename" {
+		m.enterSessionRename()
+		return m, nil
+	}
+	if strings.HasPrefix(strings.ToLower(value), "/rename ") {
+		name := strings.TrimSpace(value[len("/rename "):])
+		return m.renameCurrentSession(name)
 	}
 
 	m.thinkStart = time.Now()
@@ -1789,6 +1866,9 @@ func (m model) viewInput(state api.AgentState) string {
 		lines = lines[:m.inputHeight]
 	}
 	content := strings.Join(lines, "\n")
+	if m.sessionRename {
+		content = warnText.Render("Rename session:") + "\n" + content
+	}
 
 	// Chip-fallback pastes (those that didn't fit inline) are shown as
 	// chips below the input.

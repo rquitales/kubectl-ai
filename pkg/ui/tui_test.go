@@ -26,6 +26,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/agent"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
+	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/sessions"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -699,7 +700,7 @@ func TestSlashSessionsCommandOpensBrowser(t *testing.T) {
 
 func TestSlashCommandPassesThroughToAgent(t *testing.T) {
 	m := newBrowserModel()
-	m.input.SetValue("/rename my session")
+	m.input.SetValue("/clear")
 
 	_, cmd := m.handleEnter()
 	if cmd == nil {
@@ -713,8 +714,8 @@ func TestSlashCommandPassesThroughToAgent(t *testing.T) {
 	}
 	// The agent resolves slash commands centrally; the TUI forwards them
 	// verbatim.
-	if resp.Query != "/rename my session" {
-		t.Errorf("Query = %q, want %q", resp.Query, "/rename my session")
+	if resp.Query != "/clear" {
+		t.Errorf("Query = %q, want %q", resp.Query, "/clear")
 	}
 }
 
@@ -1012,5 +1013,96 @@ func TestPaletteAutoModeToggleInstant(t *testing.T) {
 	_, _ = m.toggleAutoMode()
 	if !a.SkipPermissionsEnabled() {
 		t.Error("expected auto mode on after palette toggle")
+	}
+}
+
+func newRenameModel(t *testing.T) (model, *agent.Agent, string) {
+	t.Helper()
+	mgr, err := sessions.NewSessionManager("memory")
+	if err != nil {
+		t.Fatalf("NewSessionManager: %v", err)
+	}
+	s, err := mgr.NewSession(sessions.Metadata{ModelID: "m"})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	t.Cleanup(func() { _ = mgr.DeleteSession(s.ID) })
+
+	a := &agent.Agent{
+		Session:        s,
+		SessionBackend: "memory",
+		Input:          make(chan any, 1),
+	}
+	s.AgentState = api.AgentStateIdle
+	return newModel(a), a, s.ID
+}
+
+func TestRenameBareCommandEntersRenameMode(t *testing.T) {
+	m, a, _ := newRenameModel(t)
+	a.Session.Name = "old name"
+
+	m.input.SetValue("/rename")
+	_, _ = m.handleEnter()
+
+	if !m.sessionRename {
+		t.Fatal("expected rename mode to start on bare /rename")
+	}
+	if got := m.input.Value(); got != "old name" {
+		t.Errorf("rename input = %q, want prefilled %q", got, "old name")
+	}
+	if got := m.input.Placeholder; got != "New session name..." {
+		t.Errorf("placeholder = %q, want %q", got, "New session name...")
+	}
+}
+
+func TestRenameSubmitAppliesAndPersists(t *testing.T) {
+	m, a, _ := newRenameModel(t)
+
+	m.enterSessionRename()
+	m.input.SetValue("my debug session")
+	_, _ = m.handleEnter()
+
+	if m.sessionRename {
+		t.Error("expected rename mode to end after submit")
+	}
+	if a.Session.Name != "my debug session" {
+		t.Errorf("session name = %q, want %q", a.Session.Name, "my debug session")
+	}
+	if got := m.input.Value(); got != "" {
+		t.Errorf("expected input cleared after rename, got %q", got)
+	}
+	if len(m.messages) == 0 || !strings.Contains(m.messages[len(m.messages)-1].Payload.(string), "my debug session") {
+		t.Error("expected a rename confirmation message")
+	}
+}
+
+func TestRenameEscCancels(t *testing.T) {
+	m, _, _ := newRenameModel(t)
+
+	m.input.SetValue("/rename")
+	_, _ = m.handleEnter()
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyEsc})
+
+	if m.sessionRename {
+		t.Error("expected rename mode to end on esc")
+	}
+	if got := m.input.Value(); got != "" {
+		t.Errorf("expected input cleared after cancel, got %q", got)
+	}
+	if got := m.input.Placeholder; got != "Ask kubectl-ai anything..." {
+		t.Errorf("placeholder = %q, want default restored", got)
+	}
+}
+
+func TestRenameWithArgsAppliesImmediately(t *testing.T) {
+	m, a, _ := newRenameModel(t)
+
+	m.input.SetValue("/rename quick name")
+	_, _ = m.handleEnter()
+	if m.sessionRename {
+		t.Error("must not enter rename mode when a name is given")
+	}
+	if a.Session.Name != "quick name" {
+		t.Errorf("session name = %q, want %q", a.Session.Name, "quick name")
 	}
 }
