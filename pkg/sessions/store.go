@@ -15,9 +15,12 @@
 package sessions
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"unicode"
 
 	"time"
 
@@ -26,7 +29,33 @@ import (
 
 const sessionsDirName = "sessions"
 
+// ErrSessionExists is returned when creating a session whose ID is already
+// taken; callers may retry with a fresh ID.
+var ErrSessionExists = errors.New("session already exists")
+
+// maxSessionNameLen caps session names for display purposes.
+const maxSessionNameLen = 128
+
+// SanitizeSessionName makes a session name safe for display and storage: it
+// strips control characters (so e.g. newlines can't break single-line UI
+// elements and terminal escape sequences can't be injected), trims
+// whitespace, and truncates to maxSessionNameLen runes.
+func SanitizeSessionName(name string) string {
+	name = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, name)
+	name = strings.TrimSpace(name)
+	if r := []rune(name); len(r) > maxSessionNameLen {
+		name = string(r[:maxSessionNameLen])
+	}
+	return name
+}
+
 type Metadata struct {
+	Name         string    `json:"name,omitempty"`
 	ProviderID   string    `json:"providerID"`
 	ModelID      string    `json:"modelID"`
 	CreatedAt    time.Time `json:"createdAt"`

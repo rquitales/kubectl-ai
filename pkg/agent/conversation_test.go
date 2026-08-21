@@ -404,3 +404,49 @@ func TestAgent_NewSession_NoDeadlock(t *testing.T) {
 		t.Fatal("NewSession timed out (potential deadlock)")
 	}
 }
+
+func TestFirstUserMessage(t *testing.T) {
+	cases := []struct {
+		name     string
+		messages []*api.Message
+		want     string
+	}{
+		{name: "empty", messages: nil, want: ""},
+		{
+			name: "skips non-user messages",
+			messages: []*api.Message{
+				{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "model says"},
+				{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "user says"},
+			},
+			want: "user says",
+		},
+		{
+			name: "collapses whitespace",
+			messages: []*api.Message{
+				{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "multi\nline\t spaced"},
+			},
+			want: "multi line spaced",
+		},
+		{
+			name: "skips empty",
+			messages: []*api.Message{
+				{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "   "},
+				{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "real"},
+			},
+			want: "real",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := firstUserMessage(c.messages); got != c.want {
+				t.Errorf("firstUserMessage() = %q, want %q", got, c.want)
+			}
+		})
+	}
+
+	long := strings.Repeat("x", 200)
+	got := firstUserMessage([]*api.Message{{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: long}})
+	if !strings.HasSuffix(got, "…") || len([]rune(got)) > 81 {
+		t.Errorf("expected truncation with ellipsis, got %q", got)
+	}
+}
