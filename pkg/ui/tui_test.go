@@ -519,10 +519,8 @@ func TestUpDownRecallsHistory(t *testing.T) {
 	m := newModel(nil)
 	m.messages = historyTestMessages()
 
-	// Up/Down recall history once there is a draft to navigate from; with
-	// an empty input they scroll the transcript instead (see the dedicated
-	// test for that), so seed a draft here.
-	m.input.SetValue("draft")
+	// Up/Down recall input history (the scroll wheel handles transcript
+	// scrolling via mouse capture, not the arrow keys).
 	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyUp})
 	if got := m.input.Value(); got != "second query" {
 		t.Errorf("after up: input = %q, want %q", got, "second query")
@@ -536,60 +534,123 @@ func TestUpDownRecallsHistory(t *testing.T) {
 		t.Errorf("after down: input = %q, want %q", got, "second query")
 	}
 	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyDown})
-	if got := m.input.Value(); got != "draft" {
-		t.Errorf("past newest: input = %q, want %q (draft restored)", got, "draft")
+	if got := m.input.Value(); got != "" {
+		t.Errorf("past newest: input = %q, want empty", got)
 	}
 }
 
-func TestUpDownScrollsWhenEmptyRecallsHistoryWhenDraft(t *testing.T) {
-	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateRunning}}
-	m := newModel(a)
-	m.width, m.height = 100, 24
-	m.resize()
-	// Enough content to overflow the 24-row viewport so scrolling is
-	// observable; the user/model messages below also seed input history.
-	m.messages = []*api.Message{
-		{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "first query"},
-		{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: strings.Repeat("answer line\n", 40)},
-		{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "second query"},
-	}
-	m.dirty = true
-	m.refresh()
-	m.viewport.GotoBottom()
-	bottom := m.viewport.YOffset
-	if bottom == 0 {
-		t.Skip("transcript did not overflow the viewport; cannot test scrolling")
+func TestCtrlGTogglesMouseCapture(t *testing.T) {
+	m := newModel(nil)
+	if !m.mouseEnabled {
+		t.Fatal("mouse capture should start enabled")
 	}
 
-	// With an empty input, Up/Down scroll the transcript — this is also
-	// where the scroll wheel lands under alternate scroll mode (the
-	// terminal turns the wheel into Up/Down keys), so the wheel and the
-	// arrow do the same thing. Works even while the agent is running.
-	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyUp})
-	if m.viewport.YOffset >= bottom {
-		t.Errorf("expected Up to scroll the transcript up while input is empty, YOffset = %d (bottom %d)", m.viewport.YOffset, bottom)
+	// Off: the terminal gets the mouse back so text can be selected.
+	_, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlG})
+	if m.mouseEnabled {
+		t.Error("Ctrl+G did not disable mouse capture")
 	}
+	if cmd == nil {
+		t.Error("expected a command to disable mouse capture")
+	}
+	if got := lastMessageText(m); !strings.Contains(got, "off") {
+		t.Errorf("expected a note that capture is off, got %q", got)
+	}
+
+	// On again: the wheel scrolls once more.
+	_, cmd = m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlG})
+	if !m.mouseEnabled {
+		t.Error("Ctrl+G did not re-enable mouse capture")
+	}
+	if cmd == nil {
+		t.Error("expected a command to re-enable mouse capture")
+	}
+}
+
+func TestResizeDoesNotReEnableDisabledMouse(t *testing.T) {
+	// A resize re-enables capture so split reports don't leak — but it must
+	// not override a user who turned capture off to select text.
+	m := newModel(nil)
+	m.mouseEnabled = false
+	updated, cmd := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	if cmd != nil {
+		t.Error("resize must not re-enable mouse capture while it is toggled off")
+	}
+	if got := updated.(model); got.mouseEnabled {
+		t.Error("resize flipped mouseEnabled back on")
+	}
+
+	// With capture on, a resize does re-establish it.
+	m2 := newModel(nil)
+	if _, cmd := m2.Update(tea.WindowSizeMsg{Width: 100, Height: 30}); cmd == nil {
+		t.Error("resize should re-enable mouse capture when it is on")
+	}
+}
+
+func TestMouseReportBurstDoesNotLeakIntoInput(t *testing.T) {
+	// A fast scroll wheel packs many SGR mouse reports into one read; a
+	// chunk boundary that splits a sequence drops the ESC and/or the
+	// trailing M, and the leftovers arrive as literal runes.
+	bursts := []string{
+		"\x1b[<64;140;44M",                     // one full report
+		"[<64;140;44M",                         // ESC eaten by the parser
+		"[<64;140;44M[<64;140;44M[<65;140;44M", // fast-scroll burst
+		"[<64;140;44M[<64;140",                 // split mid-sequence
+		"[<",                                   // bare fragment
+	}
+	for _, burst := range bursts {
+		m := newModel(nil)
+		_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(burst)})
+		if got := m.input.Value(); got != "" {
+			t.Errorf("burst %q leaked into the input: %q", burst, got)
+		}
+	}
+}
+
+func TestSplitMouseReportAcrossMessagesDoesNotLeak(t *testing.T) {
+	// When a fast scroll splits an SGR report at the read boundary, the
+	// parser's ESC branch stops after one rune, so the report arrives as a
+	// lone Alt+'[' followed by the remainder in a separate message.
+	m := newModel(nil)
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("["), Alt: true})
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("<64;140")})
 	if got := m.input.Value(); got != "" {
-		t.Errorf("Up with empty input must not start history recall, got %q", got)
+		t.Errorf("split report leaked into the input: %q", got)
 	}
-	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyDown})
-	if m.viewport.YOffset != bottom {
-		t.Errorf("expected Down to scroll back to the bottom, YOffset = %d (want %d)", m.viewport.YOffset, bottom)
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(";44M")})
+	if got := m.input.Value(); got != "" {
+		t.Errorf("report tail leaked into the input: %q", got)
 	}
+	// Typing resumes normally once the report has been consumed.
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
+	if got := m.input.Value(); got != "k" {
+		t.Errorf("typing after a split report: value = %q, want %q", got, "k")
+	}
+}
 
-	// Once there is a draft, Up/Down recall input history instead of
-	// scrolling, so editing isn't hijacked by the wheel-as-arrows. Navigating
-	// past the newest entry restores the draft that was saved when recall
-	// started.
-	m.input.SetValue("draft")
-	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyUp})
-	if got := m.input.Value(); got != "second query" {
-		t.Errorf("after up with a draft: input = %q, want %q (history recall)", got, "second query")
+func TestSwallowModeIsBounded(t *testing.T) {
+	// A false positive must not eat input indefinitely.
+	m := newModel(nil)
+	m.swallowMouseSeq = true
+	m.swallowedRunes = 1
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(strings.Repeat("a", maxSwallowedRunes+8))})
+	if m.swallowMouseSeq {
+		t.Error("swallow mode should have given up after maxSwallowedRunes")
 	}
-	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyDown})
-	if got := m.input.Value(); got != "draft" {
-		t.Errorf("after down: input = %q, want %q (draft restored)", got, "draft")
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("ok")})
+	if got := m.input.Value(); !strings.HasSuffix(got, "ok") {
+		t.Errorf("input after bounded swallow = %q, want it to end with %q", got, "ok")
 	}
+}
+
+// lastMessageText returns the payload of the most recent transcript message
+// as a string, or "" when there are none.
+func lastMessageText(m model) string {
+	if len(m.messages) == 0 {
+		return ""
+	}
+	s, _ := m.messages[len(m.messages)-1].Payload.(string)
+	return s
 }
 
 func TestHistorySkipsConsecutiveDuplicates(t *testing.T) {

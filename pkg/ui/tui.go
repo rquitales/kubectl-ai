@@ -132,18 +132,11 @@ type TUI struct {
 }
 
 func NewTUI(agent *agent.Agent) *TUI {
-	// Enable wheel scrolling (DECSET 1007, Alternate Scroll Mode) BEFORE
-	// handing the terminal to bubbletea. Writing it here — before
-	// tea.NewProgram and thus before any rendering — avoids the startup
-	// frame storm, where an out-of-band os.Stdout write from a tea.Cmd can
-	// race with the renderer's compressed frame flushes and get dropped.
-	// DEC private modes are terminal-wide and persist across the alt-screen
-	// switch that WithAltScreen performs next, so setting 1007 here survives
-	// 1049h. This is the only mode we enable: it reports ONLY the wheel as
-	// arrow keys, never button presses or drags, so native click-and-drag
-	// text selection keeps working (unlike 1000/1002/1003, which capture the
-	// drag and on Apple Terminal also leak SGR reports on fast scroll).
-	_, _ = os.Stdout.WriteString("\x1b[?1007h")
+	// Mouse cell-motion capture is toggled on/off by Ctrl+G. When on, the
+	// scroll wheel scrolls the in-app transcript (capture is the only mode
+	// Apple Terminal honors for the wheel — DECSET 1007 is ignored there).
+	// When off, the mouse returns to the terminal so text can be
+	// click-drag-selected and copied. See toggleMouse / Ctrl+G in handleKey.
 	return &TUI{
 		program: tea.NewProgram(newModel(agent), tea.WithAltScreen()),
 		agent:   agent,
@@ -320,10 +313,21 @@ type model struct {
 	// Return deliver a phantom LF (KeyCtrlJ) right after the CR; it is
 	// swallowed so it doesn't leave a stray newline in the next draft.
 	justSubmitted bool
-	spinner       spinner.Model
-	list          list.Model
-	cache         *renderCache
-	messages      []*api.Message
+
+	// mouseEnabled tracks whether cell-motion capture is on. Capture is the
+	// only wheel mode Apple Terminal honors, so it's on by default — but it
+	// takes click-drag from the terminal, so Ctrl+G toggles it off to select.
+	mouseEnabled bool
+
+	// swallowMouseSeq is set while a mouse report the input parser split
+	// across reads is still being consumed; swallowedRunes bounds how long
+	// that can last (see filterMouseRunes). Guards fast-scroll SGR leaks.
+	swallowMouseSeq bool
+	swallowedRunes  int
+	spinner         spinner.Model
+	list            list.Model
+	cache           *renderCache
+	messages        []*api.Message
 	// clearedAt is the transcript position of the Ctrl+L "cleared"
 	// boundary marker (0 = no marker). Content before it leaves the
 	// current view but is revealed again by scrolling up (revealAll).
@@ -437,16 +441,17 @@ func newModel(agent *agent.Agent) model {
 	ri.Cursor.Style = primaryText
 
 	m := model{
-		agent:       agent,
-		input:       ti,
-		inputHeight: 1,
-		historyIdx:  -1,
-		viewport:    vp,
-		spinner:     sp,
-		list:        l,
-		cache:       newRenderCache(),
-		renameInput: ri,
-		dirty:       true,
+		agent:        agent,
+		input:        ti,
+		inputHeight:  1,
+		historyIdx:   -1,
+		viewport:     vp,
+		spinner:      sp,
+		list:         l,
+		cache:        newRenderCache(),
+		renameInput:  ri,
+		dirty:        true,
+		mouseEnabled: true,
 	}
 	if agent != nil {
 		if s := agent.GetSession(); s != nil {
@@ -457,52 +462,17 @@ func newModel(agent *agent.Agent) model {
 	return m
 }
 
-// Wheel scrolling via DECSET 1007 (Alternate Scroll Mode) only.
-//
-// 1007 makes the terminal translate the scroll wheel into Up/Down arrow
-// keys while the app is in the alternate screen buffer, and reports NOTHING
-// else — no button presses, no drags. So native click-and-drag text
-// selection is never stolen, and no SGR mouse reports are ever generated
-// (which means no burst-split leak into the input box). The wheel arrives
-// as ordinary arrow keys, which the Up/Down handler scrolls (see handleKey)
-// when the input is empty.
-//
-// This is deliberately NOT X10 (1000) or cell/all-motion (1002/1003): on
-// Apple Terminal those capture the drag (breaking selection) and emit SGR
-// reports that leak on fast scroll. 1007 is the only mode that gives wheel
-// scrolling without taking the mouse.
-//
-// The DECSET sequence is written directly to os.Stdout — not via tea.Printf,
-// which is suppressed while the altscreen is active (we always run in
-// altscreen) and wraps the payload as a printed line rather than a raw
-// control sequence. This is the same pattern the clipboard copy (OSC 52)
-// already uses in this file.
-type enableWheelMsg struct{}
-type disableWheelMsg struct{}
-
-const (
-	decSetWheel   = "\x1b[?1007h"
-	decResetWheel = "\x1b[?1007l"
-)
-
-func enableWheel() tea.Cmd {
-	return func() tea.Msg {
-		_, _ = os.Stdout.WriteString(decSetWheel)
-		return enableWheelMsg{}
-	}
-}
-func disableWheel() tea.Cmd {
-	return func() tea.Msg {
-		_, _ = os.Stdout.WriteString(decResetWheel)
-		return disableWheelMsg{}
-	}
-}
-
 func (m model) Init() tea.Cmd {
+	// Enable mouse cell-motion capture by default so the scroll wheel
+	// scrolls the in-app transcript. Capture is the only wheel mode Apple
+	// Terminal honors (DECSET 1007 is ignored there), so on that terminal
+	// this is the tradeoff: wheel works, but click-drag selection doesn't
+	// while capture is on — Ctrl+G toggles it off to select, back on to
+	// scroll. The SGR-leak guard in handleKey stops fast-scroll bursts from
+	// typing report fragments into the input box.
 	return tea.Batch(
 		textarea.Blink, m.spinner.Tick, m.tick(),
-		// Enable wheel scrolling via DECSET 1007. See enableWheelMsg above.
-		enableWheel(),
+		tea.EnableMouseCellMotion,
 	)
 }
 
@@ -516,17 +486,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		m.dirty = true
 		m.resize()
-		// A resize can reset the terminal's scroll-mode state, so re-request
-		// it; otherwise the wheel stops scrolling after resizing.
-		return m, enableWheel()
-
-	case enableWheelMsg, disableWheelMsg:
-		// The DECSET sequence was already written to os.Stdout by the
-		// command; nothing more to do here.
-		return m, nil
+		// A resize makes the renderer re-enter alt-screen and re-emit the
+		// mouse-enable sequence; re-enable cell-motion so the wheel keeps
+		// working — unless the user toggled it off to select text.
+		if !m.mouseEnabled {
+			return m, nil
+		}
+		return m, tea.EnableMouseCellMotion
 
 	case tea.KeyMsg:
 		return m.handleKey(msg)
+
+	case tea.MouseMsg:
+		return m.handleMouse(msg)
 
 	case *api.Message:
 		return m.handleAgentMsg(msg)
@@ -864,6 +836,90 @@ func (m *model) navigateList(keyType tea.KeyType) tea.Cmd {
 	return cmd
 }
 
+// maxSwallowedRunes bounds how far filterMouseRunes will keep dropping input
+// while looking for a mouse report's terminator. A real SGR report is ~13
+// bytes; this is a safety valve so a false positive can never eat more than a
+// few keystrokes.
+const maxSwallowedRunes = 32
+
+// isMouseSeqStart reports whether a split SGR mouse report begins at
+// runes[i]. A full report looks like "\x1b[<64;140;44M"; a read boundary can
+// cut it anywhere, so the recognizable openings are ESC+"[", "[<", and "<"
+// followed by a digit. None of these occur as genuine multi-rune typed input.
+func isMouseSeqStart(runes []rune, i int) bool {
+	if i+1 >= len(runes) {
+		return false
+	}
+	switch runes[i] {
+	case '\x1b':
+		return runes[i+1] == '['
+	case '[':
+		return runes[i+1] == '<'
+	case '<':
+		return runes[i+1] >= '0' && runes[i+1] <= '9'
+	}
+	return false
+}
+
+// filterMouseRunes drops SGR mouse-report fragments from a burst of input
+// runes, carrying state across messages. A fast scroll wheel packs many
+// reports into one read; when the parser's chunk boundary splits a report it
+// emits the pieces as ordinary runes (the ESC branch stops after one rune, so
+// "[" arrives in its own message ahead of the "<64;140" remainder). Matching
+// per-message can't work, so swallowing spans messages via swallowMouseSeq,
+// ending at the M/m terminator or maxSwallowedRunes.
+func (m *model) filterMouseRunes(runes []rune) []rune {
+	out := make([]rune, 0, len(runes))
+	for i := 0; i < len(runes); i++ {
+		if m.swallowMouseSeq {
+			m.swallowedRunes++
+			r := runes[i]
+			if r == 'M' || r == 'm' || m.swallowedRunes > maxSwallowedRunes {
+				m.swallowMouseSeq = false
+				m.swallowedRunes = 0
+			}
+			continue
+		}
+		if isMouseSeqStart(runes, i) {
+			m.swallowMouseSeq = true
+			m.swallowedRunes = 1
+			continue
+		}
+		out = append(out, runes[i])
+	}
+	return out
+}
+
+// toggleMouse turns cell-motion capture on or off. Capture is the only wheel
+// mode Apple Terminal honors, so it's on by default for scrolling — but it
+// takes click-drag from the terminal, so toggling it off restores native text
+// selection (PgUp/PgDn scroll while it's off), and back on restores the wheel.
+func (m *model) toggleMouse() (tea.Model, tea.Cmd) {
+	m.mouseEnabled = !m.mouseEnabled
+	if m.mouseEnabled {
+		m.appendLocalMessage("🖱  Mouse capture on — wheel scrolls the transcript. Ctrl+G to turn it off for text selection.")
+		return m, tea.EnableMouseCellMotion
+	}
+	m.swallowMouseSeq = false
+	m.swallowedRunes = 0
+	m.appendLocalMessage("🖱  Mouse capture off — drag to select and copy text. PgUp/PgDn scroll; Ctrl+G to turn the wheel back on.")
+	return m, tea.DisableMouse
+}
+
+// handleMouse routes mouse events: the scroll wheel scrolls the transcript
+// viewport. Other events (clicks, drag) are ignored — drag selection isn't
+// possible while capture is on, which is why Ctrl+G toggles it off.
+func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	const wheelStep = 3
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		m.viewport.ScrollUp(wheelStep)
+	case tea.MouseButtonWheelDown:
+		m.viewport.ScrollDown(wheelStep)
+	}
+	return m, nil
+}
+
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.justSubmitted {
 		m.justSubmitted = false
@@ -872,6 +928,28 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// that follows the CR, so it doesn't leave a stray newline in
 			// the next draft.
 			return m, nil
+		}
+	}
+
+	// A fast scroll wheel packs many SGR mouse reports into one read, and a
+	// chunk boundary that splits one leaves fragments that reach us as
+	// ordinary runes. Drop them before they can land in the input box. The
+	// parser emits a split report's leading "\x1b[" as a lone '[' with Alt
+	// set, ahead of the "<64;140" remainder, so recognise that artifact on
+	// its own; from there filterMouseRunes swallows the rest across messages.
+	if msg.Type == tea.KeyRunes {
+		if !m.swallowMouseSeq && msg.Alt && len(msg.Runes) == 1 && msg.Runes[0] == '[' {
+			m.swallowMouseSeq = true
+			m.swallowedRunes = 1
+			return m, nil
+		}
+		if m.swallowMouseSeq || len(msg.Runes) > 1 {
+			if cleaned := m.filterMouseRunes(msg.Runes); len(cleaned) != len(msg.Runes) {
+				if len(cleaned) == 0 {
+					return m, nil
+				}
+				msg.Runes = cleaned
+			}
 		}
 	}
 
@@ -896,9 +974,9 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyCtrlC, tea.KeyCtrlD:
 		m.quitting = true
-		// Reset alternate scroll mode on quit so the terminal reverts to its
-		// default wheel behavior after exit.
-		return m, tea.Batch(tea.Quit, disableWheel())
+		// Disable mouse capture on quit so the terminal stops sending SGR
+		// reports (which would otherwise leak as literal text after exit).
+		return m, tea.Batch(tea.Quit, tea.DisableMouse)
 	case tea.KeyEsc:
 		return m.handleEsc()
 	case tea.KeyCtrlL:
@@ -932,6 +1010,11 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.dirty = true
 		m.refresh()
 		return m, nil
+	case tea.KeyCtrlG:
+		// Toggle mouse capture. Capture drives wheel scrolling (the only
+		// wheel mode Apple Terminal honors) but takes click-drag from the
+		// terminal, disabling text selection — Ctrl+G turns it off to select.
+		return m.toggleMouse()
 	case tea.KeyShiftTab:
 		// Toggle auto-accept mode (skip permission prompts), like opencode
 		// and Claude Code.
@@ -1026,17 +1109,11 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.navigateList(tea.KeyUp)
 		}
 		// Within a multi-line draft, Up moves the cursor up to the first
-		// line. When there is no draft and no history navigation in flight,
-		// Up scrolls the transcript — which is also where the scroll wheel
-		// lands under alternate scroll mode (the terminal turns the wheel
-		// into Up/Down keys), so the wheel and the arrow key do the same
-		// thing. Once there is a draft, Up recalls older input history.
+		// line; from there (and for single-line drafts) it recalls older
+		// input history, like opencode and Claude Code. The scroll wheel
+		// (when capture is on) and PgUp/PgDn scroll the transcript.
 		if m.input.LineCount() > 1 && m.input.Line() > 0 {
 			m.input.CursorUp()
-			return m, nil
-		}
-		if m.input.Value() == "" && m.historyIdx == -1 {
-			m.viewport.ScrollUp(1)
 			return m, nil
 		}
 		m.historyPrev()
@@ -1046,12 +1123,6 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		if m.input.LineCount() > 1 && m.input.Line() < m.input.LineCount()-1 {
 			m.input.CursorDown()
-			return m, nil
-		}
-		// Mirror of Up: scroll the transcript when the input is empty and
-		// not navigating history; otherwise recall newer input history.
-		if m.input.Value() == "" && m.historyIdx == -1 {
-			m.viewport.ScrollDown(1)
 			return m, nil
 		}
 		m.historyNext()
@@ -3273,8 +3344,9 @@ func helpText() string {
 | **Ctrl+Y** | copy last reply |
 | **Ctrl+O** | expand/collapse tool results |
 | **Ctrl+T** | expand/collapse model reasoning |
+| **Ctrl+G** | toggle mouse capture (off to select text, on to scroll) |
 | **PgUp / PgDn** | scroll transcript |
-| **wheel** | scroll transcript (drag to select text) |
+| **wheel** | scroll transcript (when mouse capture is on) |
 | **Tab** | autocomplete (commands, @files, /context, /namespace) |
 
 ## Slash commands
@@ -3295,10 +3367,10 @@ func helpText() string {
 
 Type **!command** to run a shell command, or **@path** to attach a file.
 
-**Scrolling & selecting:** the scroll wheel and ↑/↓ scroll the transcript
-when the input is empty; once you have a draft, ↑/↓ recall input history.
-Click and drag to select and copy text as usual — the mouse is never
-captured, so selection always works.
+**Scrolling & selecting:** the scroll wheel scrolls the transcript while
+mouse capture is on (the default). To select and copy text, press **Ctrl+G**
+to release the mouse, drag to select, copy, then **Ctrl+G** to turn the wheel
+back on. **PgUp/PgDn** scroll while capture is off.
 `
 }
 
