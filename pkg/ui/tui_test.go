@@ -1211,3 +1211,51 @@ func TestBrowserCannotDeleteCurrentSession(t *testing.T) {
 		t.Error("expected an error status about not deleting the current session")
 	}
 }
+
+func TestCtrlLHidesTranscriptVisually(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.width, m.height = 100, 40
+	m.resize()
+	m.messages = []*api.Message{
+		{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "secret question", Timestamp: time.Now()},
+		{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "secret answer", Timestamp: time.Now()},
+	}
+	m.dirty = true
+	m.refresh()
+
+	// Ctrl+L hides everything rendered but keeps the state intact.
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlL})
+	if got := m.renderMessages(); strings.Contains(got, "secret question") || strings.Contains(got, "secret answer") {
+		t.Error("expected transcript hidden after ctrl+l")
+	} else if !strings.Contains(got, "transcript cleared") {
+		t.Error("expected a 'transcript cleared' marker")
+	}
+	if len(m.messages) != 2 {
+		t.Errorf("messages must stay in state, got %d", len(m.messages))
+	}
+
+	// A new message after the clear is visible; old ones stay hidden.
+	// (glamour splits words with ANSI codes, so match single words.)
+	m.messages = append(m.messages, &api.Message{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "new answer", Timestamp: time.Now()})
+	m.dirty = true
+	m.refresh()
+	got := m.renderMessages()
+	if !strings.Contains(got, "answer") {
+		t.Error("expected new message visible after clear")
+	}
+	if strings.Contains(got, "secret") {
+		t.Error("expected old messages to stay hidden after clear")
+	}
+
+	// With a new message present, Ctrl+L clears again...
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlL})
+	if got := m.renderMessages(); strings.Contains(got, "answer") {
+		t.Error("expected ctrl+l to clear the transcript again")
+	}
+	// ...and with nothing new since, Ctrl+L restores it.
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlL})
+	if got := m.renderMessages(); !strings.Contains(got, "secret") {
+		t.Error("expected ctrl+l toggle to restore the transcript")
+	}
+}

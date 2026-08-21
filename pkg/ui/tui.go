@@ -290,11 +290,16 @@ type model struct {
 	list          list.Model
 	cache         *renderCache
 	messages      []*api.Message
-	width         int
-	height        int
-	dirty         bool
-	quitting      bool
-	thinkStart    time.Time
+	// transcriptOffset hides messages before this index from the screen
+	// (Ctrl+L visual clear); the store and history are unaffected.
+	transcriptOffset int
+	// sessionID tracks the active session so switches are detectable.
+	sessionID  string
+	width      int
+	height     int
+	dirty      bool
+	quitting   bool
+	thinkStart time.Time
 	// Choice mode tracking
 	inChoiceMode   bool
 	choicePrompt   string
@@ -360,7 +365,7 @@ func newModel(agent *agent.Agent) model {
 	ri.PlaceholderStyle = dimStyle
 	ri.Cursor.Style = primaryText
 
-	return model{
+	m := model{
 		agent:       agent,
 		input:       ti,
 		inputHeight: 1,
@@ -372,6 +377,12 @@ func newModel(agent *agent.Agent) model {
 		renameInput: ri,
 		dirty:       true,
 	}
+	if agent != nil {
+		if s := agent.GetSession(); s != nil {
+			m.sessionID = s.ID
+		}
+	}
+	return m
 }
 
 func (m model) Init() tea.Cmd {
@@ -675,6 +686,18 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case tea.KeyEsc:
 		return m.handleEsc()
+	case tea.KeyCtrlL:
+		// Visual screen clear: hide the transcript without touching the
+		// session (unlike /clear). Pressing again with nothing new restores.
+		if m.transcriptOffset > 0 && m.transcriptOffset >= len(m.messages) {
+			m.transcriptOffset = 0
+		} else {
+			m.transcriptOffset = len(m.messages)
+		}
+		m.dirty = true
+		m.refresh()
+		m.viewport.GotoBottom()
+		return m, nil
 	case tea.KeyCtrlP:
 		m.openPalette()
 		return m, nil
@@ -1473,6 +1496,12 @@ func (m *model) handleEnter() (tea.Model, tea.Cmd) {
 
 func (m *model) handleAgentMsg(msg *api.Message) (tea.Model, tea.Cmd) {
 	session := m.agent.GetSession()
+	// A session switch resets the visual-clear offset so the resumed
+	// session's transcript shows in full.
+	if session.ID != m.sessionID {
+		m.transcriptOffset = 0
+		m.sessionID = session.ID
+	}
 	m.messages = session.AllMessages()
 	m.dirty = true
 
@@ -1566,7 +1595,11 @@ func (m model) renderMessages() string {
 			return "Error rendering messages"
 		}
 
-		for _, msg := range m.messages {
+		from := min(m.transcriptOffset, len(m.messages))
+		if from > 0 {
+			sb.WriteString(dimStyle.PaddingLeft(1).Render("── transcript cleared (ctrl+l) ──") + "\n\n")
+		}
+		for _, msg := range m.messages[from:] {
 			if s := m.renderMessage(msg, renderer, width); s != "" {
 				sb.WriteString(s)
 			}
@@ -1944,7 +1977,7 @@ func (m model) viewHelp(state api.AgentState) string {
 	case state == api.AgentStateRunning:
 		hints = []string{"Ctrl+C: cancel"}
 	default:
-		hints = []string{"Enter: send", "Ctrl+J: newline", "Ctrl+P: commands", "↑/↓: history", "Ctrl+Y: copy", "Shift+Tab: auto", "Esc: clear/stop", "Ctrl+C: quit"}
+		hints = []string{"Enter: send", "Ctrl+J: newline", "Ctrl+P: commands", "↑/↓: history", "Ctrl+L: clear screen", "Ctrl+Y: copy", "Shift+Tab: auto", "Esc: clear/stop", "Ctrl+C: quit"}
 		if m.viewport.TotalLineCount() > m.viewport.Height {
 			hints = append(hints, "PgUp/PgDn: scroll")
 		}
