@@ -1212,7 +1212,7 @@ func TestBrowserCannotDeleteCurrentSession(t *testing.T) {
 	}
 }
 
-func TestCtrlLHidesTranscriptVisually(t *testing.T) {
+func TestCtrlLClearsViewButScrollUpReveals(t *testing.T) {
 	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
 	m := newModel(a)
 	m.width, m.height = 100, 40
@@ -1223,39 +1223,41 @@ func TestCtrlLHidesTranscriptVisually(t *testing.T) {
 	}
 	m.dirty = true
 	m.refresh()
+	m.viewport.GotoBottom()
 
-	// Ctrl+L hides everything rendered but keeps the state intact.
+	// Ctrl+L clears the current view: only the marker remains visible.
 	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlL})
-	if got := m.renderMessages(); strings.Contains(got, "secret question") || strings.Contains(got, "secret answer") {
-		t.Error("expected transcript hidden after ctrl+l")
-	} else if !strings.Contains(got, "transcript cleared") {
+	got := m.renderMessages()
+	if !strings.Contains(got, "transcript cleared") {
 		t.Error("expected a 'transcript cleared' marker")
+	}
+	if strings.Contains(got, "secret") {
+		t.Error("expected the current view cleared of old messages after ctrl+l")
 	}
 	if len(m.messages) != 2 {
 		t.Errorf("messages must stay in state, got %d", len(m.messages))
 	}
 
-	// A new message after the clear is visible; old ones stay hidden.
-	// (glamour splits words with ANSI codes, so match single words.)
-	m.messages = append(m.messages, &api.Message{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "new answer", Timestamp: time.Now()})
-	m.dirty = true
-	m.refresh()
-	got := m.renderMessages()
-	if !strings.Contains(got, "answer") {
-		t.Error("expected new message visible after clear")
+	// Scrolling up reveals the hidden transcript again.
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyPgUp})
+	got = m.renderMessages()
+	if !strings.Contains(got, "secret") {
+		t.Error("expected scrolling up to reveal the hidden transcript")
 	}
-	if strings.Contains(got, "secret") {
-		t.Error("expected old messages to stay hidden after clear")
+	if !strings.Contains(got, "transcript cleared") {
+		t.Error("expected the marker to stay visible while revealed")
 	}
 
-	// With a new message present, Ctrl+L clears again...
-	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlL})
-	if got := m.renderMessages(); strings.Contains(got, "answer") {
-		t.Error("expected ctrl+l to clear the transcript again")
+	// Scrolling back to the bottom re-hides it.
+	m.viewport.GotoBottom()
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyPgDown})
+	if got := m.renderMessages(); strings.Contains(got, "secret") {
+		t.Error("expected returning to the bottom to re-hide the transcript")
 	}
-	// ...and with nothing new since, Ctrl+L restores it.
+
+	// Ctrl+L again removes the cleared state entirely.
 	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlL})
-	if got := m.renderMessages(); !strings.Contains(got, "secret") {
-		t.Error("expected ctrl+l toggle to restore the transcript")
+	if got := m.renderMessages(); !strings.Contains(got, "secret") || strings.Contains(got, "transcript cleared") {
+		t.Error("expected second ctrl+l to fully restore the transcript")
 	}
 }

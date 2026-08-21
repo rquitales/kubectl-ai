@@ -290,9 +290,14 @@ type model struct {
 	list          list.Model
 	cache         *renderCache
 	messages      []*api.Message
-	// transcriptOffset hides messages before this index from the screen
-	// (Ctrl+L visual clear); the store and history are unaffected.
-	transcriptOffset int
+	// clearedAt is the transcript position of the Ctrl+L "cleared"
+	// boundary marker (0 = no marker). Content before it leaves the
+	// current view but is revealed again by scrolling up (revealAll).
+	clearedAt int
+	// revealAll temporarily shows the whole transcript (user scrolled up
+	// while cleared); it resets when scrolling back to the bottom or on
+	// new messages.
+	revealAll bool
 	// sessionID tracks the active session so switches are detectable.
 	sessionID  string
 	width      int
@@ -687,12 +692,14 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyEsc:
 		return m.handleEsc()
 	case tea.KeyCtrlL:
-		// Visual screen clear: hide the transcript without touching the
-		// session (unlike /clear). Pressing again with nothing new restores.
-		if m.transcriptOffset > 0 && m.transcriptOffset >= len(m.messages) {
-			m.transcriptOffset = 0
+		// Clear the current view (transcript leaves the screen) while
+		// keeping everything one PgUp away. Pressing again restores.
+		if m.clearedAt > 0 {
+			m.clearedAt = 0
+			m.revealAll = false
 		} else {
-			m.transcriptOffset = len(m.messages)
+			m.clearedAt = len(m.messages)
+			m.revealAll = false
 		}
 		m.dirty = true
 		m.refresh()
@@ -739,9 +746,21 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyCtrlY:
 		return m.copyLastResponse()
 	case tea.KeyPgUp:
+		// Scrolling up while cleared reveals the hidden transcript.
+		if m.clearedAt > 0 && !m.revealAll {
+			m.revealAll = true
+			m.dirty = true
+			m.refresh()
+		}
 		m.viewport.ScrollUp(m.viewport.Height / 2)
 	case tea.KeyPgDown:
 		m.viewport.ScrollDown(m.viewport.Height / 2)
+		// Back at the bottom: the cleared view applies again.
+		if m.revealAll && m.viewport.AtBottom() {
+			m.revealAll = false
+			m.dirty = true
+			m.refresh()
+		}
 	case tea.KeyBackspace:
 		if m.inChoiceMode {
 			return m, nil
@@ -1496,10 +1515,10 @@ func (m *model) handleEnter() (tea.Model, tea.Cmd) {
 
 func (m *model) handleAgentMsg(msg *api.Message) (tea.Model, tea.Cmd) {
 	session := m.agent.GetSession()
-	// A session switch resets the visual-clear offset so the resumed
+	// A session switch resets the cleared boundary so the resumed
 	// session's transcript shows in full.
 	if session.ID != m.sessionID {
-		m.transcriptOffset = 0
+		m.clearedAt = 0
 		m.sessionID = session.ID
 	}
 	m.messages = session.AllMessages()
@@ -1551,13 +1570,22 @@ func (m *model) handleAgentMsg(msg *api.Message) (tea.Model, tea.Cmd) {
 		m.choiceOptionID = ""
 	}
 
-	// Only follow the transcript to the bottom if the user is already at the
-	// bottom; yanking the viewport down while the user scrolled up (e.g. to
-	// select text for copying) is hostile.
-	atBottom := m.viewport.AtBottom()
-	m.refresh()
-	if atBottom {
+	// A new message snaps the view back to the cleared state: hide the
+	// revealed history again and land on the fresh content below the marker.
+	if m.clearedAt > 0 && m.revealAll {
+		m.revealAll = false
+		m.dirty = true
+		m.refresh()
 		m.viewport.GotoBottom()
+	} else {
+		// Only follow the transcript to the bottom if the user is already at
+		// the bottom; yanking the viewport down while the user scrolled up
+		// (e.g. to select text for copying) is hostile.
+		atBottom := m.viewport.AtBottom()
+		m.refresh()
+		if atBottom {
+			m.viewport.GotoBottom()
+		}
 	}
 
 	if session.AgentState == api.AgentStateRunning || session.AgentState == api.AgentStateInitializing {
@@ -1595,14 +1623,22 @@ func (m model) renderMessages() string {
 			return "Error rendering messages"
 		}
 
-		from := min(m.transcriptOffset, len(m.messages))
-		if from > 0 {
-			sb.WriteString(dimStyle.PaddingLeft(1).Render("── transcript cleared (ctrl+l) ──") + "\n\n")
+		from := min(m.clearedAt, len(m.messages))
+		start := 0
+		if from > 0 && !m.revealAll {
+			// Cleared view: only the marker and what came after it.
+			start = from
 		}
-		for _, msg := range m.messages[from:] {
+		for i, msg := range m.messages[start:] {
+			if i == from && from > 0 {
+				sb.WriteString(dimStyle.PaddingLeft(1).Render("── transcript cleared (ctrl+l) ──") + "\n\n")
+			}
 			if s := m.renderMessage(msg, renderer, width); s != "" {
 				sb.WriteString(s)
 			}
+		}
+		if from == len(m.messages) && from > 0 {
+			sb.WriteString(dimStyle.PaddingLeft(1).Render("── transcript cleared (ctrl+l) ──") + "\n\n")
 		}
 	}
 
