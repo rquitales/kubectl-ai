@@ -3901,3 +3901,34 @@ func TestViewInputInitializingLabel(t *testing.T) {
 		t.Errorf("expected 'Thinking...' label while running, got:\n%s", got2)
 	}
 }
+
+func TestFrameStaysExactlyOneScreenTallWhileTyping(t *testing.T) {
+	// Regression: typing the first character shows the draft-counter line,
+	// growing the input block without shrinking the viewport, so the frame
+	// became one line taller than the terminal and the status bar scrolled
+	// out of view until a window resize recalculated the layout.
+	a := &agent.Agent{Session: &api.Session{ID: "test", ModelID: "m", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.width, m.height = 120, 24
+	m.resize()
+
+	if got := lipgloss.Height(m.View()); got != m.height {
+		t.Fatalf("initial frame height = %d, want exactly %d (one screen)", got, m.height)
+	}
+
+	// Type a character: the draft counter appears under the input box.
+	m.input.SetValue("a")
+	m.syncInputHeight()
+
+	if got := lipgloss.Height(m.View()); got != m.height {
+		t.Errorf("frame height after typing = %d, want exactly %d (input block grew but viewport did not shrink)", got, m.height)
+	}
+
+	// Typing enough to soft-wrap grows the content lines too; the frame
+	// must still fit exactly.
+	m.input.SetValue(strings.Repeat("x", m.input.Width()+10))
+	m.syncInputHeight()
+	if got := lipgloss.Height(m.View()); got != m.height {
+		t.Errorf("frame height after wrap = %d, want exactly %d", got, m.height)
+	}
+}
