@@ -303,8 +303,13 @@ type model struct {
 	viewport    viewport.Model
 	input       textarea.Model
 	inputHeight int
-	pastes      []pastedBlock
-	nextPasteID int
+	// laidOutInputBlockHeight is the input block height the current layout
+	// was computed with; syncInputHeight compares against it to detect
+	// growth that doesn't change the content line count (draft counter,
+	// completion hint appearing).
+	laidOutInputBlockHeight int
+	pastes                  []pastedBlock
+	nextPasteID             int
 	// Input history navigation (previous submitted messages, oldest first).
 	inputHistory []string
 	historyIdx   int // -1 when not navigating
@@ -822,8 +827,13 @@ func (m *model) resize() {
 }
 
 func (m *model) updateViewportHeight() {
+	// Record the input block height this layout was computed with, so
+	// syncInputHeight can tell when the block has grown since (e.g. the
+	// draft-counter line appearing) even when the content line count is
+	// unchanged.
+	m.laidOutInputBlockHeight = m.inputBlockHeight()
 	// Layout: status(1) + 2 dividers(2) + input block + help(1) + bottom padding(1)
-	contentH := m.height - (m.inputBlockHeight() + 5)
+	contentH := m.height - (m.laidOutInputBlockHeight + 5)
 	if m.browserOpen && m.width > 0 {
 		contentH -= lipgloss.Height(m.viewSessionBrowser())
 	}
@@ -873,13 +883,17 @@ func (m *model) agentState() api.AgentState {
 // content, capped at maxInputHeight lines, and adjusts the viewport height
 // accordingly. The textarea itself keeps a fixed internal height; we only
 // clip how many of its rendered lines we show (see viewInput).
+//
+// It compares the whole input *block* height — not just the content line
+// count — because typing can toggle the completion-hint/draft-counter line
+// (e.g. the counter appears on the first typed character) without changing
+// the number of content lines, and the viewport must still shrink to keep
+// the frame exactly one screen tall.
 func (m *model) syncInputHeight() {
-	h := min(visualLines(m.input.Value(), m.input.Width()), maxInputHeight)
-	if h == m.inputHeight {
-		return
+	m.inputHeight = min(visualLines(m.input.Value(), m.input.Width()), maxInputHeight)
+	if m.inputBlockHeight() != m.laidOutInputBlockHeight {
+		m.updateViewportHeight()
 	}
-	m.inputHeight = h
-	m.updateViewportHeight()
 }
 
 // visualLines estimates how many terminal rows s occupies when soft-wrapped
