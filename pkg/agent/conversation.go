@@ -1321,7 +1321,14 @@ func (c *Agent) runShellEscape(ctx context.Context, command string) {
 		output = "(no output)"
 	}
 
-	c.addMessage(api.MessageSourceAgent, api.MessageTypeText, fmt.Sprintf("$ %s\n%s", command, output))
+	// Store as a fenced code block so the transcript's markdown renderer
+	// preserves the output's alignment instead of reflowing it as prose
+	// (and a leading '#' doesn't become a heading).
+	fence := "```"
+	if strings.Contains(output, "```") {
+		fence = "~~~"
+	}
+	c.addMessage(api.MessageSourceAgent, api.MessageTypeText, fmt.Sprintf("%s\n$ %s\n%s\n%s", fence, command, output, fence))
 
 	observation := fmt.Sprintf("User ran: %s\nOutput:\n%s", command, output)
 	c.currChatContent = append(c.currChatContent, observation)

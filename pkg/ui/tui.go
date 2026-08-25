@@ -1539,6 +1539,13 @@ func (m *model) lastToolOutput() (string, bool) {
 	for i := len(m.messages) - 1; i >= 0; i-- {
 		msg := m.messages[i]
 		if msg.Type == api.MessageTypeToolCallResponse {
+			// Mirror the display path: on failure, the transcript shows
+			// stderr/error, so that's what should land on the clipboard.
+			if toolResultFailed(msg.Payload) {
+				if s := toolResultErrorText(msg.Payload); strings.TrimSpace(s) != "" {
+					return s, true
+				}
+			}
 			if text := toolResultText(msg.Payload); strings.TrimSpace(text) != "" {
 				return text, true
 			}
@@ -3148,6 +3155,10 @@ func (m model) renderToolResult(msg *api.Message) string {
 			exitLabel = fmt.Sprintf("exit %d ", code)
 		}
 	}
+	// Only colorize when the payload actually looks like a unified diff —
+	// otherwise YAML list items ("- name: ..."), git log stat lines, etc.
+	// would be painted red/green as if they were diff hunks.
+	isDiff := looksLikeUnifiedDiff(lines)
 	for i, l := range shown {
 		prefix := "    "
 		if i == 0 {
@@ -3157,17 +3168,17 @@ func (m model) renderToolResult(msg *api.Message) string {
 				prefix = "  ⎿ "
 			}
 		}
-		rendered := prefix + truncateRunes(l, lineWidth)
+		rendered := prefix + truncateCells(l, lineWidth)
 		// Colorize unified-diff lines so a kubectl diff / apply --dry-run
 		// preview reads as a diff: additions green, deletions red. Only
 		// applied to successful results (failed ones stay uniformly red).
 		// Lines that aren't diff markers keep the base line style.
-		if !failed {
+		if !failed && isDiff {
 			switch {
-			case strings.HasPrefix(strings.TrimSpace(l), "+"):
+			case strings.HasPrefix(l, "+") && !strings.HasPrefix(l, "+++"):
 				out = append(out, lipgloss.NewStyle().Foreground(colorSecondary).Render(rendered))
 				continue
-			case strings.HasPrefix(strings.TrimSpace(l), "-"):
+			case strings.HasPrefix(l, "-") && !strings.HasPrefix(l, "---"):
 				out = append(out, lipgloss.NewStyle().Foreground(colorError).Render(rendered))
 				continue
 			}
@@ -3183,7 +3194,8 @@ func (m model) renderToolResult(msg *api.Message) string {
 		}
 		out = append(out, lineStyle.Render(hint))
 	} else if m.expandToolResults {
-		out[len(out)-1] += lineStyle.Render(" (ctrl+o to collapse)")
+		// Own line: appending to the last output line corrupts real content.
+		out = append(out, lineStyle.Render("    (ctrl+o to collapse)"))
 	}
 	return strings.Join(out, "\n") + "\n"
 }
@@ -3193,21 +3205,31 @@ func (m model) renderToolResult(msg *api.Message) string {
 func toolResultText(payload any) string {
 	switch p := payload.(type) {
 	case string:
-		return p
+		return sanitizeTerminal(p)
 	case map[string]any:
 		if len(p) == 0 {
 			return ""
 		}
 		for _, k := range []string{"stdout", "stderr", "content", "result", "output"} {
 			if s, ok := p[k].(string); ok && s != "" {
-				return s
+				return sanitizeTerminal(s)
 			}
 		}
 		if b, err := json.Marshal(p); err == nil {
-			return string(b)
+			return sanitizeTerminal(string(b))
 		}
 	}
-	return fmt.Sprintf("%v", payload)
+	return sanitizeTerminal(fmt.Sprintf("%v", payload))
+}
+
+// sanitizeTerminal strips ANSI escape sequences and carriage returns from
+// command output before it enters the transcript. Forced-color output
+// (--color=always, progress bars) would otherwise bleed styles into the
+// frame, and a mid-sequence truncation would print garbage.
+func sanitizeTerminal(s string) string {
+	s = ansi.Strip(s)
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	return strings.ReplaceAll(s, "\r", "")
 }
 
 // toolResultFailed reports whether a tool-call result represents a failure:
@@ -3240,7 +3262,7 @@ func toolResultErrorText(payload any) string {
 	if p, ok := payload.(map[string]any); ok {
 		for _, k := range []string{"error", "stderr"} {
 			if s, ok := p[k].(string); ok && s != "" {
-				return s
+				return sanitizeTerminal(s)
 			}
 		}
 	}
@@ -3274,6 +3296,16 @@ func (m model) renderError(msg *api.Message, w int) string {
 	payload, ok := msg.Payload.(string)
 	if !ok {
 		return ""
+	}
+	// Sanitize (ANSI/control chars from API or kubectl errors would corrupt
+	// the frame) and cap: a giant error payload must not flood the
+	// transcript.
+	payload = sanitizeTerminal(payload)
+	const maxErrLines = 50
+	lines := strings.Split(strings.TrimRight(payload, "\n"), "\n")
+	if len(lines) > maxErrLines {
+		lines = append(lines[:maxErrLines], fmt.Sprintf("… +%d more lines", len(lines)-maxErrLines))
+		payload = strings.Join(lines, "\n")
 	}
 	// Wrap the error body to the box's inner width (border + padding = 4) so a
 	// long multi-line error (kubectl output, a stack trace) wraps instead of
@@ -4426,4 +4458,19 @@ func formatDuration(d time.Duration) string {
 	default:
 		return fmt.Sprintf("%dh%dm", int(d.Hours()), int(d.Minutes())%60)
 	}
+}
+
+// looksLikeUnifiedDiff reports whether the lines look like a unified diff
+// (hunk headers or diff file headers), so +/- coloring only applies to real
+// diffs and not to any output that happens to contain leading + or -.
+func looksLikeUnifiedDiff(lines []string) bool {
+	for _, l := range lines {
+		if strings.HasPrefix(l, "@@") ||
+			(strings.HasPrefix(l, "--- ") && !strings.HasPrefix(l, "----")) ||
+			strings.HasPrefix(l, "+++ ") ||
+			strings.HasPrefix(l, "diff ") {
+			return true
+		}
+	}
+	return false
 }
