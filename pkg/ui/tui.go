@@ -745,6 +745,20 @@ func (m *model) setBrowserStatus(text string, isErr bool) {
 	m.browserStatus = browserStatusMsg{text: text, isErr: isErr}
 }
 
+// resetDraftState clears the input and draft bookkeeping after a submit (or
+// a locally-handled command) and re-syncs the layout.
+func (m *model) resetDraftState() {
+	m.input.Reset()
+	m.pastes = nil
+	m.historyIdx = -1
+	m.historyDraft = ""
+	m.justSubmitted = true
+	m.syncInputHeight()
+	m.dirty = true
+	m.refresh()
+	m.viewport.GotoBottom()
+}
+
 // appendLocalMessage adds a transient agent-styled message to the
 // transcript (for UI-originated events; it is not persisted). Reserved for
 // content the user explicitly requested (e.g. /help, /mcp output) — NOT for
@@ -2369,6 +2383,51 @@ func (m *model) handleEnter() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// Intercept locally-handled commands BEFORE the optimistic echo. Their
+	// output is persisted as ephemeral messages — it survives store
+	// snapshots and session replay, but never enters the LLM's history.
+	lower := strings.ToLower(value)
+	switch {
+	case lower == "/help" || lower == "/?":
+		m.resetDraftState()
+		if m.agent != nil {
+			m.agent.AddEphemeralMessage(api.MessageSourceUser, value)
+			m.agent.AddEphemeralMessage(api.MessageSourceAgent, helpText())
+		} else {
+			m.appendLocalMessage(helpText())
+		}
+		return m, nil
+	case lower == "/mcp":
+		m.resetDraftState()
+		if m.agent != nil {
+			m.agent.AddEphemeralMessage(api.MessageSourceUser, value)
+			m.agent.AddEphemeralMessage(api.MessageSourceAgent, mcpStatusText(m.agent.GetSession()))
+		} else {
+			m.appendLocalMessage("_No MCP servers configured._")
+		}
+		return m, nil
+	case lower == "/tools":
+		m.resetDraftState()
+		if m.agent != nil {
+			m.agent.AddEphemeralMessage(api.MessageSourceUser, value)
+			m.agent.AddEphemeralMessage(api.MessageSourceAgent, toolsText(m.agent.ListAllTools()))
+		} else {
+			m.appendLocalMessage("_No tools available._")
+		}
+		return m, nil
+	case lower == "/sessions" || lower == "/session" || lower == "sessions":
+		m.resetDraftState()
+		return m, m.fetchSessions
+	case lower == "/rename":
+		m.resetDraftState()
+		m.enterSessionRename()
+		return m, nil
+	case strings.HasPrefix(lower, "/rename "):
+		m.resetDraftState()
+		name := strings.TrimSpace(value[len("/rename "):])
+		return m.renameCurrentSession(name)
+	}
+
 	// Add user message
 	m.messages = append(m.messages, &api.Message{
 		Source:    api.MessageSourceUser,
@@ -2376,59 +2435,7 @@ func (m *model) handleEnter() (tea.Model, tea.Cmd) {
 		Payload:   value,
 		Timestamp: time.Now(),
 	})
-	m.input.Reset()
-	m.pastes = nil
-	m.historyIdx = -1
-	m.historyDraft = ""
-	m.justSubmitted = true
-	m.syncInputHeight()
-	m.dirty = true
-	m.refresh()
-	m.viewport.GotoBottom()
-
-	// Intercept the sessions command (handled locally, not sent to the LLM)
-	if v := strings.ToLower(value); v == "/sessions" || v == "/session" || v == "sessions" {
-		return m, m.fetchSessions
-	}
-
-	// Intercept the rename command (handled locally and instantly).
-	if v := strings.ToLower(value); v == "/rename" {
-		m.enterSessionRename()
-		return m, nil
-	}
-	if strings.HasPrefix(strings.ToLower(value), "/rename ") {
-		name := strings.TrimSpace(value[len("/rename "):])
-		return m.renameCurrentSession(name)
-	}
-
-	// Intercept the help command (handled locally, prints a reference into the
-	// transcript instead of round-tripping to the LLM).
-	if v := strings.ToLower(value); v == "/help" || v == "/?" {
-		m.appendLocalMessage(helpText())
-		return m, nil
-	}
-
-	// Intercept the /mcp command (handled locally, prints MCP server
-	// connection details into the transcript).
-	if v := strings.ToLower(value); v == "/mcp" {
-		if m.agent != nil {
-			m.appendLocalMessage(mcpStatusText(m.agent.GetSession()))
-		} else {
-			m.appendLocalMessage("_No MCP servers configured._")
-		}
-		return m, nil
-	}
-
-	// Intercept the /tools command (handled locally, prints the available
-	// tools into the transcript).
-	if v := strings.ToLower(value); v == "/tools" {
-		if m.agent != nil {
-			m.appendLocalMessage(toolsText(m.agent.ListAllTools()))
-		} else {
-			m.appendLocalMessage("_No tools available._")
-		}
-		return m, nil
-	}
+	m.resetDraftState()
 
 	m.thinkStart = time.Now()
 
@@ -2526,9 +2533,11 @@ func (m *model) handleAgentMsg(msg *api.Message) (tea.Model, tea.Cmd) {
 	if msg.Type == api.MessageTypeTextDelta {
 		return m.handleTextDelta(msg)
 	}
-	// Live-streamed model reasoning/thinking arrives the same way, as ephemeral
-	// thinking deltas (and a final thinking message that replaces them).
-	if msg.Type == api.MessageTypeThinkingDelta || msg.Type == api.MessageTypeThinking {
+	// Live-streamed model reasoning/thinking arrives as ephemeral thinking
+	// deltas. The FINAL thinking message is stored (ephemeral: display-only,
+	// never fed to the LLM), so it goes through the normal snapshot path —
+	// which also keeps it from being dropped by the delta throttle.
+	if msg.Type == api.MessageTypeThinkingDelta || (msg.Type == api.MessageTypeThinking && !msg.Ephemeral) {
 		return m.handleThinkingDelta(msg)
 	}
 

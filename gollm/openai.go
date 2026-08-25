@@ -472,7 +472,9 @@ func (cs *openAIChatSession) Initialize(messages []*api.Message) error {
 	cs.history = make([]openai.ChatCompletionMessageParamUnion, 0, len(messages))
 
 	for _, msg := range messages {
-		if msg.Type != api.MessageTypeText || msg.Payload == nil {
+		// Ephemeral messages (thinking blocks, local command output) are
+		// display-only and must not enter the model's context.
+		if msg.Ephemeral || msg.Type != api.MessageTypeText || msg.Payload == nil {
 			continue
 		}
 
