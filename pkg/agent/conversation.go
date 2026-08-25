@@ -89,6 +89,10 @@ type Agent struct {
 
 	// Kubeconfig is the path to the kubeconfig file.
 	Kubeconfig string
+	// ModelPinned is true when the model was chosen explicitly (e.g. the
+	// --model flag), so resuming a session must not override it with the
+	// session's stored model.
+	ModelPinned bool
 	// kubeconfigOverride is the session-scoped kubeconfig override path
 	// (set by /context or /namespace), applied via KUBECONFIG for this
 	// process without mutating the base file.
@@ -1712,7 +1716,6 @@ func (c *Agent) LoadSession(sessionID string) error {
 	}
 
 	c.sessionMu.Lock()
-	defer c.sessionMu.Unlock()
 
 	if session.ChatMessageStore == nil {
 		session.ChatMessageStore = sessions.NewInMemoryChatStore()
@@ -1728,12 +1731,29 @@ func (c *Agent) LoadSession(sessionID string) error {
 		c.Session.AgentState = api.AgentStateIdle
 	}
 
-	if err := manager.UpdateLastAccessed(session); err != nil {
-		return fmt.Errorf("failed to update session metadata: %w", err)
+	// Resume with the session's model (the status bar already shows it) —
+	// unless the user pinned a model explicitly (--model flag). Without this
+	// the agent silently ran the flag/default model while displaying the
+	// session's.
+	modelChanged := session.ModelID != "" && session.ModelID != c.Model
+	if modelChanged && !c.ModelPinned {
+		c.Model = session.ModelID
 	}
 
+	if err := manager.UpdateLastAccessed(session); err != nil {
+		c.sessionMu.Unlock()
+		return fmt.Errorf("failed to update session metadata: %w", err)
+	}
+	c.sessionMu.Unlock()
+
 	if c.llmChat != nil {
-		if err := c.llmChat.Initialize(c.Session.ChatMessageStore.ChatMessages()); err != nil {
+		if modelChanged && !c.ModelPinned {
+			// The chat is bound to the model at StartChat time, so a model
+			// change needs a full rebuild (which re-initializes from history).
+			if err := c.rebuildChat(context.Background()); err != nil {
+				return fmt.Errorf("failed to rebuild chat for the session's model: %w", err)
+			}
+		} else if err := c.llmChat.Initialize(c.Session.ChatMessageStore.ChatMessages()); err != nil {
 			return fmt.Errorf("failed to re-initialize chat with new session: %w", err)
 		}
 	}

@@ -1558,3 +1558,84 @@ func TestHandleModelChoiceCancelLeavesModelUnchanged(t *testing.T) {
 		t.Errorf("state = %s after cancel, want done", st)
 	}
 }
+
+func TestAgent_LoadSession_AppliesSessionModel(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	manager, err := sessions.NewSessionManager("memory")
+	if err != nil {
+		t.Fatalf("creating session manager: %v", err)
+	}
+	sess, err := manager.NewSession(sessions.Metadata{ModelID: "session-model"})
+	if err != nil {
+		t.Fatalf("creating session: %v", err)
+	}
+
+	client := mocks.NewMockClient(ctrl)
+	chat := mocks.NewMockChat(ctrl)
+	// First the initial build with the flag model, then — on LoadSession —
+	// the chat is rebuilt bound to the SESSION's model.
+	gomock.InOrder(
+		client.EXPECT().StartChat(gomock.Any(), "flag-default-model").Return(chat),
+		client.EXPECT().StartChat(gomock.Any(), "session-model").Return(chat),
+	)
+	chat.EXPECT().Initialize(gomock.Any()).Return(nil).Times(2)
+	chat.EXPECT().SetFunctionDefinitions(gomock.Any()).Return(nil).Times(2)
+
+	a := &Agent{
+		Session:        &api.Session{ID: "current", ChatMessageStore: sessions.NewInMemoryChatStore()},
+		SessionBackend: "memory",
+		LLM:            client,
+		Model:          "flag-default-model",
+	}
+	if err := a.rebuildChat(context.Background()); err != nil {
+		t.Fatalf("initial rebuildChat: %v", err)
+	}
+
+	if err := a.LoadSession(sess.ID); err != nil {
+		t.Fatalf("LoadSession failed: %v", err)
+	}
+	if a.Model != "session-model" {
+		t.Errorf("Model = %q, want the session's %q", a.Model, "session-model")
+	}
+}
+
+func TestAgent_LoadSession_PinnedModelWins(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	manager, err := sessions.NewSessionManager("memory")
+	if err != nil {
+		t.Fatalf("creating session manager: %v", err)
+	}
+	sess, err := manager.NewSession(sessions.Metadata{ModelID: "session-model"})
+	if err != nil {
+		t.Fatalf("creating session: %v", err)
+	}
+
+	client := mocks.NewMockClient(ctrl)
+	chat := mocks.NewMockChat(ctrl)
+	// Pinned: no rebuild — the existing chat is re-initialized in place.
+	client.EXPECT().StartChat(gomock.Any(), "flag-model").Return(chat)
+	chat.EXPECT().Initialize(gomock.Any()).Return(nil).Times(2)
+	chat.EXPECT().SetFunctionDefinitions(gomock.Any()).Return(nil)
+
+	a := &Agent{
+		Session:        &api.Session{ID: "current", ChatMessageStore: sessions.NewInMemoryChatStore()},
+		SessionBackend: "memory",
+		LLM:            client,
+		Model:          "flag-model",
+		ModelPinned:    true,
+	}
+	if err := a.rebuildChat(context.Background()); err != nil {
+		t.Fatalf("initial rebuildChat: %v", err)
+	}
+
+	if err := a.LoadSession(sess.ID); err != nil {
+		t.Fatalf("LoadSession failed: %v", err)
+	}
+	if a.Model != "flag-model" {
+		t.Errorf("Model = %q, want pinned %q", a.Model, "flag-model")
+	}
+}

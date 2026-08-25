@@ -268,3 +268,27 @@ func TestPruneEmptySessions(t *testing.T) {
 	_ = empty1
 	_ = empty2
 }
+
+func TestPruneEmptySessionsExcludesResumeTarget(t *testing.T) {
+	// Regression: the startup sweep ran before resume resolution, so
+	// --resume-session of a session with no model reply yet (e.g. an
+	// LLM-error-only first turn) failed with "session not found".
+	manager := &SessionManager{store: newMemoryStore()}
+
+	empty, _ := manager.NewSession(Metadata{ModelID: "m"})
+	resumeTarget, _ := manager.NewSession(Metadata{ModelID: "m"})
+
+	pruned, err := manager.PruneEmptySessions(resumeTarget.ID)
+	if err != nil {
+		t.Fatalf("PruneEmptySessions failed: %v", err)
+	}
+	if pruned != 1 {
+		t.Errorf("pruned = %d, want 1 (only the non-excluded empty session)", pruned)
+	}
+	if got, err := manager.FindSessionByID(resumeTarget.ID); err != nil || got == nil {
+		t.Errorf("resume target must survive the sweep: %v", err)
+	}
+	if got, _ := manager.FindSessionByID(empty.ID); got != nil {
+		t.Error("non-excluded empty session should have been pruned")
+	}
+}

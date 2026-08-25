@@ -164,13 +164,20 @@ func HasConversationMessages(messages []*api.Message) bool {
 // PruneEmptySessions deletes every session that has no real conversation
 // (no model-sourced messages), returning the number deleted. Used to sweep
 // accumulated empty sessions on startup.
-func (sm *SessionManager) PruneEmptySessions() (int, error) {
+func (sm *SessionManager) PruneEmptySessions(excludeIDs ...string) (int, error) {
+	exclude := make(map[string]bool, len(excludeIDs))
+	for _, id := range excludeIDs {
+		exclude[id] = true
+	}
 	sessionList, err := sm.store.ListSessions()
 	if err != nil {
 		return 0, err
 	}
 	pruned := 0
 	for _, s := range sessionList {
+		if exclude[s.ID] {
+			continue
+		}
 		if HasConversationMessages(s.ChatMessageStore.ChatMessages()) {
 			continue
 		}
