@@ -29,6 +29,7 @@ import (
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/agent"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/sandbox"
+	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/spinner"
 
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/sessions"
@@ -4505,5 +4506,70 @@ func TestStatusBarUsesCachedContextTokens(t *testing.T) {
 	}
 	if got := m.viewStatus(a.GetSession()); !strings.Contains(got, "ctx ") || !strings.Contains(got, "50%") {
 		t.Errorf("expected a 50%% context indicator from the cache, got:\n%s", got)
+	}
+}
+
+func TestWaitingForInputShowsApprovalCue(t *testing.T) {
+	m := newBrowserModel()
+	got := m.viewState(api.AgentStateWaitingForInput)
+	if !strings.Contains(got, "Approval") {
+		t.Errorf("WaitingForInput should read as an approval prompt, got %q", got)
+	}
+}
+
+func TestNumberKeySelectsChoiceOption(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateWaitingForInput}, Input: make(chan any, 1)}
+	m := newModel(a)
+	m.inChoiceMode = true
+	m.choiceType = "permission"
+	m.list.SetItems([]list.Item{item("Yes"), item("Yes, don't ask again"), item("No")})
+	m.list.Select(0)
+
+	_, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("3")})
+	if cmd == nil {
+		t.Fatal("expected a choice command from number key 3")
+	}
+	go cmd()
+	got := <-a.Input
+	resp, ok := got.(*api.UserChoiceResponse)
+	if !ok {
+		t.Fatalf("expected *api.UserChoiceResponse, got %T", got)
+	}
+	if resp.Choice != 3 {
+		t.Errorf("number key 3 selected choice %d, want 3", resp.Choice)
+	}
+	if m.inChoiceMode {
+		t.Error("choice mode should close after a number-key selection")
+	}
+}
+
+func TestChoiceRequestClosesPalette(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateWaitingForInput}}
+	m := newModel(a)
+	m.width, m.height = 100, 40
+	m.resize()
+	m.paletteOpen = true
+
+	m.handleAgentMsg(&api.Message{
+		Type:    api.MessageTypeUserChoiceRequest,
+		Payload: &api.UserChoiceRequest{Prompt: "p", Options: []api.UserChoiceOption{{Label: "Yes"}}, Kind: "permission"},
+	})
+	if m.paletteOpen {
+		t.Error("a choice request must close the palette — the prompt must never hide behind it")
+	}
+	if !m.inChoiceMode {
+		t.Error("expected choice mode to open")
+	}
+}
+
+func TestStatusClickIgnoredWhilePanelOpen(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", ModelID: "m", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.width, m.height = 100, 40
+	m.resize()
+	m.paletteOpen = true
+	_, cmd := m.handleStatusClick(50, 0)
+	if cmd != nil {
+		t.Error("status clicks must be no-ops while an overlay is open")
 	}
 }

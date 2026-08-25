@@ -1163,7 +1163,7 @@ func (m *model) handleStatusClick(x, y int) (tea.Model, tea.Cmd) {
 	if y != 0 || m.width <= 0 || m.agent == nil {
 		return m, nil
 	}
-	if m.inChoiceMode || m.sessionRename || m.renaming {
+	if m.inChoiceMode || m.sessionRename || m.renaming || m.browserOpen || m.paletteOpen || m.pickerOpen {
 		return m, nil
 	}
 	session := m.agent.GetSession()
@@ -1216,8 +1216,9 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// While the session browser is open it captures all keys except quit
-	// (including pastes, which are routed by handleBrowserKey).
-	if m.browserOpen && msg.Type != tea.KeyCtrlC && msg.Type != tea.KeyCtrlD {
+	// and the non-destructive global toggles (copy, expand, mouse).
+	if m.browserOpen && msg.Type != tea.KeyCtrlC && msg.Type != tea.KeyCtrlD &&
+		msg.Type != tea.KeyCtrlY && msg.Type != tea.KeyCtrlO && msg.Type != tea.KeyCtrlT && msg.Type != tea.KeyCtrlG {
 		return m.handleBrowserKey(msg)
 	}
 
@@ -1490,6 +1491,15 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, m.navigateList(tea.KeyDown)
 			case "k":
 				return m, m.navigateList(tea.KeyUp)
+			case "1", "2", "3", "4", "5", "6", "7", "8", "9":
+				// Number keys pick an option directly (the terminal and
+				// HTML UIs both support this).
+				n := int(msg.String()[0] - '0')
+				if n <= len(m.list.Items()) {
+					m.list.Select(n - 1)
+					return m.handleEnter()
+				}
+				return m, nil
 			}
 			// Don't let keystrokes accumulate invisibly in the input
 			// while a choice picker is active.
@@ -1842,6 +1852,10 @@ func (m *model) paletteItems() []paletteItem {
 }
 
 func (m *model) openPalette() {
+	if m.inChoiceMode {
+		// A pending prompt (permission/model/continue) owns the input area.
+		return
+	}
 	if m.browserOpen {
 		m.closeBrowser()
 	}
@@ -2587,10 +2601,16 @@ func (m *model) handleEnter() (tea.Model, tea.Cmd) {
 
 	m.thinkStart = time.Now()
 
-	return m, func() tea.Msg {
+	send := func() tea.Msg {
 		m.agent.Input <- &api.UserInputResponse{Query: value}
 		return nil
 	}
+	// The agent only reads its input while idle; a query submitted mid-run
+	// queues invisibly. Say so.
+	if st := m.agentState(); st == api.AgentStateRunning || st == api.AgentStateInitializing || st == api.AgentStateWaitingForInput {
+		return m, tea.Batch(send, m.setFlash("Queued — the agent is busy; it will run when done."))
+	}
+	return m, send
 }
 
 // handleTextDelta folds a live-streaming text delta into the transcript:
@@ -2703,13 +2723,15 @@ func (m *model) handleAgentMsg(msg *api.Message) (tea.Model, tea.Cmd) {
 	// Check if we're entering choice mode - use the incoming message directly
 	// to avoid race conditions where the message isn't yet in AllMessages()
 	if msg.Type == api.MessageTypeUserChoiceRequest {
-		// A permission prompt supersedes the session browser and the picker.
+		// A permission prompt supersedes the session browser, the picker,
+		// and the palette — a prompt must never hide behind an overlay.
 		if m.browserOpen {
 			m.closeBrowser()
 		}
 		if m.pickerOpen {
 			m.closePicker()
 		}
+		m.paletteOpen = false
 		if req, ok := msg.Payload.(*api.UserChoiceRequest); ok {
 			items := make([]list.Item, len(req.Options))
 			for i, opt := range req.Options {
@@ -4043,7 +4065,7 @@ func (m model) viewState(state api.AgentState) string {
 	}{
 		api.AgentStateRunning:         {"●", "Running", successText},
 		api.AgentStateInitializing:    {"", "Initializing...", mutedStyle},
-		api.AgentStateWaitingForInput: {"●", "Ready", successText},
+		api.AgentStateWaitingForInput: {"?", "Approval", warnText},
 		api.AgentStateIdle:            {"○", "Idle", mutedStyle},
 		api.AgentStateDone:            {"✓", "Done", successText},
 		api.AgentStateExited:          {"○", "Exited", mutedStyle},
