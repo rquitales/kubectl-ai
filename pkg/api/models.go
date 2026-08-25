@@ -88,6 +88,10 @@ const (
 type UserChoiceRequest struct {
 	Prompt  string
 	Options []UserChoiceOption
+	// Kind distinguishes the request's origin ("permission", "model",
+	// "continue", ...) so UIs can apply kind-specific affordances — e.g.
+	// Esc cancels a model picker but declines a permission prompt.
+	Kind string `json:"kind,omitempty"`
 }
 
 type UserChoiceOption struct {

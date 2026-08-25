@@ -3932,3 +3932,45 @@ func TestFrameStaysExactlyOneScreenTallWhileTyping(t *testing.T) {
 		t.Errorf("frame height after wrap = %d, want exactly %d", got, m.height)
 	}
 }
+
+func TestEscCancelsModelPicker(t *testing.T) {
+	// Regression: Esc on the /model picker used to send the generic decline
+	// (choice 3), which handleModelChoice interpreted as "select the 3rd
+	// model" — silently switching and persisting a model on cancel.
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateWaitingForInput}, Input: make(chan any, 1)}
+	m := newModel(a)
+	m.inChoiceMode = true
+	m.choiceType = "model"
+
+	_, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyEsc})
+	if m.inChoiceMode {
+		t.Error("expected choice mode to close on esc")
+	}
+	if cmd == nil {
+		t.Fatal("expected a cancel command")
+	}
+	go cmd()
+	got := <-a.Input
+	resp, ok := got.(*api.UserChoiceResponse)
+	if !ok {
+		t.Fatalf("expected *api.UserChoiceResponse, got %T", got)
+	}
+	if resp.Choice != 0 {
+		t.Errorf("expected cancel (choice 0), got %d", resp.Choice)
+	}
+}
+
+func TestChoiceKindStoredFromRequest(t *testing.T) {
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateWaitingForInput}}
+	m := newModel(a)
+	m.handleAgentMsg(&api.Message{
+		Type:    api.MessageTypeUserChoiceRequest,
+		Payload: &api.UserChoiceRequest{Prompt: "Select a model:", Options: []api.UserChoiceOption{{Label: "m1"}}, Kind: "model"},
+	})
+	if !m.inChoiceMode {
+		t.Fatal("expected choice mode to open")
+	}
+	if m.choiceType != "model" {
+		t.Errorf("choiceType = %q, want %q", m.choiceType, "model")
+	}
+}
