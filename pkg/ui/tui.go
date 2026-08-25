@@ -3622,11 +3622,7 @@ func (m model) statusLayout(session *api.Session) (string, statusSpans) {
 	}
 	model = truncateRunes(model, 30)
 
-	// Running session token total, hidden until the provider reports usage.
-	totalTokens := 0
-	for _, msg := range session.AllMessages() {
-		totalTokens += msg.Tokens
-	}
+	totalTokens := currentContextTokens(session)
 
 	left := primaryText.Render("kubectl-ai") + sep + mutedStyle.Render(name) + sep + m.viewState(session.AgentState)
 	if m.agent != nil && m.agent.SkipPermissionsEnabled() {
@@ -3817,11 +3813,30 @@ func init() {
 	}
 }
 
+// currentContextTokens returns the current context-window fill: the LATEST
+// model message's total token count (prompt + completion), which by
+// construction includes the whole conversation. Summing per-message totals
+// would re-count the entire history on every turn and grow quadratically,
+// long past the real window size.
+func currentContextTokens(session *api.Session) int {
+	if session == nil {
+		return 0
+	}
+	msgs := session.AllMessages()
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Source == api.MessageSourceModel && msgs[i].Tokens > 0 {
+			return msgs[i].Tokens
+		}
+	}
+	return 0
+}
+
 // viewContextBudget renders a compact context-usage indicator for the status
 // bar: a small fill bar plus a percentage, colored by usage tier (green low,
 // yellow moderate, red high). Returns "" when there's no usage yet. The
-// percentage is totalTokens / contextBudgetTokens, a rough guide since the
-// model's real limit isn't exposed to the TUI.
+// percentage is latestTurnTokens / contextBudgetTokens (env-overridable via
+// KUBECTL_AI_CONTEXT_BUDGET), a rough guide since the model's real limit
+// isn't exposed to the TUI.
 func (m model) viewContextBudget(totalTokens int) string {
 	if totalTokens <= 0 || contextBudgetTokens <= 0 {
 		return ""

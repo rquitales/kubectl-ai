@@ -3191,8 +3191,8 @@ func TestRenderTextMsgMarksShellEscape(t *testing.T) {
 
 func TestViewStatusShowsContextBudget(t *testing.T) {
 	store := sessions.NewInMemoryChatStore()
-	_ = store.AddChatMessage(&api.Message{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "a", Tokens: 40000})
-	_ = store.AddChatMessage(&api.Message{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "b", Tokens: 5200})
+	_ = store.AddChatMessage(&api.Message{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "a", Tokens: 44000})
+	_ = store.AddChatMessage(&api.Message{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "b", Tokens: 45200})
 
 	a := &agent.Agent{Session: &api.Session{
 		ID: "test", AgentState: api.AgentStateIdle, ModelID: "m", ChatMessageStore: store,
@@ -3200,7 +3200,8 @@ func TestViewStatusShowsContextBudget(t *testing.T) {
 	m := newModel(a)
 	m.width = 100
 
-	// 45200 / 128000 ≈ 35%: the status bar shows the context-usage indicator.
+	// The LATEST model turn's total (45200) is the context-window fill:
+	// 45200 / 128000 ≈ 35%.
 	got := m.viewStatus(a.GetSession())
 	if !strings.Contains(got, "ctx ") || !strings.Contains(got, "35%") {
 		t.Errorf("expected a context budget indicator at 35%%, got:\n%s", got)
@@ -4217,5 +4218,32 @@ func TestFinalThinkingSurvivesStoreSnapshot(t *testing.T) {
 	}
 	if !found {
 		t.Error("final thinking message did not survive the store snapshot")
+	}
+}
+
+func TestContextBudgetUsesLatestTurnTokens(t *testing.T) {
+	// Regression: the ctx% indicator summed per-message token totals — each
+	// of which already includes the whole conversation — so it grew
+	// quadratically and hit 100% red long before the window filled.
+	a := &agent.Agent{Session: &api.Session{ID: "t", ModelID: "m", AgentState: api.AgentStateIdle}}
+	store := sessions.NewInMemoryChatStore()
+	a.Session.ChatMessageStore = store
+	store.AddChatMessage(&api.Message{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "q1"})
+	store.AddChatMessage(&api.Message{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "a1", Tokens: 10_000})
+	store.AddChatMessage(&api.Message{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "q2"})
+	store.AddChatMessage(&api.Message{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "a2", Tokens: 20_000})
+
+	m := newModel(a)
+	// Latest turn (20k = real context size) against the 128k budget: ~15%,
+	// not (10k+20k)/128k = 23%, and definitely not runaway growth.
+	if got := currentContextTokens(a.Session); got != 20_000 {
+		t.Errorf("currentContextTokens = %d, want 20000 (latest model turn, not the sum)", got)
+	}
+	bar := m.viewContextBudget(20_000)
+	if !strings.Contains(bar, "15%") {
+		t.Errorf("budget for 20k/128k = %q, want 15%%", bar)
+	}
+	if got := m.viewContextBudget(0); got != "" {
+		t.Errorf("expected empty budget with no usage, got %q", got)
 	}
 }
