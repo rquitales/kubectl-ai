@@ -674,6 +674,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.err != nil {
 			m.pickerStatus = msg.err.Error()
+			m.updateViewportHeight()
 			return m, nil
 		}
 		m.pickerItems = make([]pickerItem, len(msg.names))
@@ -698,6 +699,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.err != nil {
 			m.pickerStatus = msg.err.Error()
+			m.updateViewportHeight()
 			return m, nil
 		}
 		m.pickerItems = make([]pickerItem, len(msg.names))
@@ -852,7 +854,10 @@ func (m *model) resize() {
 	// so rendered lines never reach the terminal's last column and wrap.
 	m.input.SetWidth(max(m.width-8, 20))
 	m.list.SetWidth(m.width - 4)
-	m.renameInput.Width = max(m.width-30, 10)
+	// The rename footer composes "Rename: " + input + "  (enter: save • esc:
+	// cancel)" (~37 fixed cells) plus box chrome (6): size the input so the
+	// composed line can never wrap.
+	m.renameInput.Width = max(m.width-45, 8)
 	m.updateViewportHeight()
 	m.refresh()
 	m.viewport.GotoBottom()
@@ -1822,6 +1827,8 @@ func (m *model) movePickerSelection(delta int) {
 		return
 	}
 	m.pickerIndex = (m.pickerIndex + delta + n) % n
+	// The scroll window moves; long rows may wrap differently — re-measure.
+	m.updateViewportHeight()
 }
 
 // handlePickerKey drives the click-opened picker (Esc/Up/Down/Enter + j/k),
@@ -2158,6 +2165,7 @@ func (m *model) handleBrowserKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.browserIndex = max(len(m.browserSessions)-1, 0)
 			}
 			m.dirty = true
+			m.updateViewportHeight()
 		}
 		return m, nil
 	}
@@ -2220,6 +2228,8 @@ func (m *model) appendBrowserFilter(r string) {
 		m.browserIndex = max(len(m.browserSessions)-1, 0)
 	}
 	m.dirty = true
+	// Row count (and footer text) changed — re-measure the panel.
+	m.updateViewportHeight()
 }
 
 // isPrintableBrowserRune reports whether r is a single printable character
@@ -2238,6 +2248,8 @@ func (m *model) moveBrowserSelection(delta int) {
 		return
 	}
 	m.browserIndex = (m.browserIndex + delta + len(m.browserSessions)) % len(m.browserSessions)
+	// The scroll window moves; re-measure in case row heights changed.
+	m.updateViewportHeight()
 }
 
 // enterSessionRename switches the input into rename mode for the current
@@ -3287,9 +3299,9 @@ func (m *model) browserRows() int {
 	if n == 0 {
 		n = 1 // the "no sessions" row
 	}
-	// Reserve: browser chrome (title+blank+footer+2 borders = 5) and at
-	// least 5 transcript lines.
-	avail := m.height - m.inputBlockHeight() - 5 - 5 - 5
+	// Reserve: browser chrome (title+blank+blank+footer+2 borders = 6) and
+	// at least 5 transcript lines.
+	avail := m.height - m.inputBlockHeight() - 5 - 6 - 5
 	if avail < 2 {
 		avail = 2
 	}
@@ -3306,15 +3318,24 @@ func (m model) viewPalette() string {
 	if len(items) == 0 {
 		sb.WriteString(mutedStyle.Render("  No actions available."))
 		sb.WriteString("\n")
-	}
-	for i, item := range items {
-		hint := dimStyle.Render("  " + item.hint)
-		if i == m.paletteIndex {
-			sb.WriteString(primaryText.Render("> "+item.label) + hint)
-		} else {
-			sb.WriteString("  " + textStyle.Render(item.label) + hint)
+	} else {
+		// Window around the selection so the palette fits short terminals
+		// (chrome is title+blank+blank+footer+2 borders = 6 lines).
+		rows := m.paletteRows()
+		start := max(m.paletteIndex-rows/2, 0)
+		if start+rows > len(items) {
+			start = max(len(items)-rows, 0)
 		}
-		sb.WriteString("\n")
+		for i := start; i < min(start+rows, len(items)); i++ {
+			item := items[i]
+			hint := dimStyle.Render("  " + item.hint)
+			if i == m.paletteIndex {
+				sb.WriteString(primaryText.Render("> "+item.label) + hint)
+			} else {
+				sb.WriteString("  " + textStyle.Render(item.label) + hint)
+			}
+			sb.WriteString("\n")
+		}
 	}
 
 	sb.WriteString("\n")
@@ -3324,6 +3345,20 @@ func (m model) viewPalette() string {
 		inputBox.Width(max(m.width-4, 20)).Render(sb.String()))
 }
 
+// paletteRows is the number of palette rows shown, adapted to the terminal
+// height so the palette never overflows the frame on short terminals.
+func (m *model) paletteRows() int {
+	n := len(m.paletteItems())
+	if n == 0 {
+		n = 1 // the "No actions available" row
+	}
+	avail := m.height - m.inputBlockHeight() - 5 - 6 - 5
+	if avail < 2 {
+		avail = 2
+	}
+	return min(n, avail)
+}
+
 // pickerRows is the number of picker rows shown, adapted to the terminal
 // height like browserRows so a long context/namespace list never overflows.
 func (m *model) pickerRows() int {
@@ -3331,7 +3366,8 @@ func (m *model) pickerRows() int {
 	if n == 0 {
 		n = 1 // the "Loading…" / error row
 	}
-	avail := m.height - m.inputBlockHeight() - 5 - 5 - 5
+	// Chrome is title+blank+blank+footer+2 borders = 6 lines.
+	avail := m.height - m.inputBlockHeight() - 5 - 6 - 5
 	if avail < 2 {
 		avail = 2
 	}
@@ -3349,7 +3385,7 @@ func (m model) viewPicker() string {
 		if strings.Contains(m.pickerStatus, "Loading") {
 			sb.WriteString(m.spinner.View() + " " + m.pickerStatus)
 		} else {
-			sb.WriteString(errorText.Render(m.pickerStatus))
+			sb.WriteString(errorText.Render(truncateRunes(m.pickerStatus, max(m.width-6, 10))))
 		}
 		sb.WriteString("\n")
 	} else {
@@ -3366,10 +3402,11 @@ func (m model) viewPicker() string {
 			if it.current {
 				mark = dimStyle.Render(" (current)")
 			}
+			value := truncateRunes(it.value, max(m.width-20, 10))
 			if i == sel {
-				sb.WriteString(primaryText.Render("> "+it.value) + mark)
+				sb.WriteString(primaryText.Render("> "+value) + mark)
 			} else {
-				sb.WriteString("  " + textStyle.Render(it.value) + mark)
+				sb.WriteString("  " + textStyle.Render(value) + mark)
 			}
 			sb.WriteString("\n")
 		}
@@ -3429,6 +3466,9 @@ func (m model) viewSessionBrowser() string {
 				meta = "current • " + meta
 			}
 
+			// Keep the row on one line: reserve room for the cursor
+			// marker, the meta suffix, and the box chrome.
+			name = truncateRunes(name, max(m.width-6-len([]rune(meta))-4, 8))
 			if i == m.browserIndex {
 				// The selected row gets a "> " cursor; the current session
 				// also gets a "●" marker so it's obvious at a glance.
@@ -3452,9 +3492,9 @@ func (m model) viewSessionBrowser() string {
 		sb.WriteString(warnText.Render("Rename: ") + m.renameInput.View() + dimStyle.Render("  (enter: save • esc: cancel)"))
 	case m.browserStatus.text != "":
 		if m.browserStatus.isErr {
-			sb.WriteString(errorText.Render(m.browserStatus.text))
+			sb.WriteString(errorText.Render(truncateRunes(m.browserStatus.text, max(m.width-6, 10))))
 		} else {
-			sb.WriteString(successText.Render(m.browserStatus.text))
+			sb.WriteString(successText.Render(truncateRunes(m.browserStatus.text, max(m.width-6, 10))))
 		}
 	default:
 		hint := "↑/↓/j/k: navigate • type to filter • enter: switch • r: rename • d: delete • ctrl+n: new • esc: close"
@@ -4149,7 +4189,7 @@ func (m *model) completionHint() string {
 func (m model) viewInput(state api.AgentState) string {
 	// Show dimmed input hint when in choice mode (picker is inline above)
 	if m.inChoiceMode {
-		content := mutedStyle.Render("Use ↑/↓ to navigate, Enter to select, Esc to decline")
+		content := mutedStyle.Render(truncateRunes("Use ↑/↓ to navigate, Enter to select, Esc to decline", max(m.width-6, 10)))
 		return lipgloss.NewStyle().Padding(0, 1).Render(inputBoxDim.Width(m.width - 4).Render(content))
 	}
 
@@ -4249,7 +4289,10 @@ func (m model) viewHelp(state api.AgentState) string {
 	var hints []string
 	switch {
 	case m.browserOpen:
-		return "" // the browser renders its own key hints
+		// The browser renders its own key hints, but the layout budgets two
+		// lines here (help + bottom padding) — return a 2-line blank so the
+		// frame height stays exact.
+		return "\n"
 	case m.inChoiceMode:
 		hints = []string{"↑/↓: navigate", "Enter: select", "Esc: decline", "Ctrl+C: quit"}
 	case state == api.AgentStateRunning:

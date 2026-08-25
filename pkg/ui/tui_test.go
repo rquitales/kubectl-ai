@@ -4064,3 +4064,59 @@ func TestExitStateQuitsProgram(t *testing.T) {
 		t.Fatal("expected a quit command on agentExitedMsg")
 	}
 }
+
+func TestFrameStaysExactWithOpenPanels(t *testing.T) {
+	// Regression: the picker/browser chrome was under-budgeted by one line
+	// and the palette had no height windowing at all, so opening any panel
+	// on a standard 80x24 terminal made the frame taller than the screen
+	// and pushed the status bar out of view.
+	a := &agent.Agent{Session: &api.Session{ID: "test", ModelID: "m", AgentState: api.AgentStateIdle}}
+	newTestModel := func() model {
+		m := newModel(a)
+		m.width, m.height = 80, 24
+		m.resize()
+		return m
+	}
+	check := func(m model, what string) {
+		t.Helper()
+		if got := lipgloss.Height(m.View()); got != m.height {
+			t.Errorf("%s: frame height = %d, want exactly %d", what, got, m.height)
+		}
+	}
+
+	// Picker with a height-capped long list.
+	m := newTestModel()
+	m.pickerOpen = true
+	m.pickerKind = pickerNamespace
+	m.pickerTitle = "Namespaces"
+	for i := 0; i < 30; i++ {
+		m.pickerItems = append(m.pickerItems, pickerItem{value: fmt.Sprintf("namespace-%d", i)})
+	}
+	m.updateViewportHeight()
+	check(m, "picker with 30 items")
+
+	// Picker showing an error line instead of rows.
+	m.pickerItems = nil
+	m.pickerStatus = "cluster unreachable"
+	m.updateViewportHeight()
+	check(m, "picker error")
+
+	// Palette (13 items) on a 24-row terminal.
+	m = newTestModel()
+	m.paletteOpen = true
+	m.updateViewportHeight()
+	check(m, "palette")
+
+	// Session browser with many sessions.
+	m = newTestModel()
+	m.browserOpen = true
+	for i := 0; i < 20; i++ {
+		m.browserSessions = append(m.browserSessions, api.SessionInfo{ID: fmt.Sprintf("s%d", i), ModelID: "m"})
+	}
+	m.updateViewportHeight()
+	check(m, "session browser")
+
+	// Browser with a long error status in the footer.
+	m.browserStatus = browserStatusMsg{text: strings.Repeat("x", 200), isErr: true}
+	check(m, "browser long error footer")
+}
