@@ -881,10 +881,13 @@ func (m *model) resize() {
 	// cancel)" (~37 fixed cells) plus box chrome (6): size the input so the
 	// composed line can never wrap.
 	m.renameInput.Width = max(m.width-45, 8)
+	atBottom := m.viewport.AtBottom()
 	m.syncInputHeight()
 	m.updateViewportHeight()
 	m.refresh()
-	m.viewport.GotoBottom()
+	if atBottom {
+		m.viewport.GotoBottom()
+	}
 }
 
 func (m *model) updateViewportHeight() {
@@ -1086,9 +1089,44 @@ func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	const wheelStep = 3
 	switch msg.Button {
 	case tea.MouseButtonWheelUp:
-		m.viewport.ScrollUp(wheelStep)
+		// With a panel open, the wheel drives the panel's list — not the
+		// transcript behind it.
+		switch {
+		case m.browserOpen:
+			m.moveBrowserSelection(-1)
+		case m.paletteOpen:
+			m.movePaletteSelection(-1)
+		case m.pickerOpen:
+			m.movePickerSelection(-1)
+		default:
+			// Wheeling up reveals Ctrl+L-cleared history, like PgUp.
+			if m.clearedAt > 0 && !m.revealAll {
+				before := lipgloss.Height(m.renderMessages())
+				m.revealAll = true
+				added := lipgloss.Height(m.renderMessages()) - before
+				m.dirty = true
+				m.refresh()
+				m.viewport.YOffset += max(added, 0)
+			}
+			m.viewport.ScrollUp(wheelStep)
+		}
 	case tea.MouseButtonWheelDown:
-		m.viewport.ScrollDown(wheelStep)
+		switch {
+		case m.browserOpen:
+			m.moveBrowserSelection(1)
+		case m.paletteOpen:
+			m.movePaletteSelection(1)
+		case m.pickerOpen:
+			m.movePickerSelection(1)
+		default:
+			m.viewport.ScrollDown(wheelStep)
+			// Back at the bottom: the cleared view applies again.
+			if m.revealAll && m.viewport.AtBottom() {
+				m.revealAll = false
+				m.dirty = true
+				m.refresh()
+			}
+		}
 	case tea.MouseButtonLeft:
 		// Gate on press: cell-motion streams MouseActionMotion events with
 		// Button==Left while the button is held, so without this one drag
@@ -1201,7 +1239,14 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.clearedAt = 0
 			m.revealAll = false
 		} else {
-			m.clearedAt = len(m.messages)
+			// Exclude trailing live-stream delta entries: their final
+			// message arrives with the same ID and would land ABOVE the
+			// marker (hidden), even though most of it came after the clear.
+			n := len(m.messages)
+			for n > 0 && (m.messages[n-1].Type == api.MessageTypeTextDelta || m.messages[n-1].Type == api.MessageTypeThinkingDelta) {
+				n--
+			}
+			m.clearedAt = n
 			m.revealAll = false
 		}
 		m.dirty = true
@@ -1213,17 +1258,27 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyCtrlO:
 		// Toggle expanded tool call results (collapsed by default so
-		// back-to-back tool calls stay compact).
+		// back-to-back tool calls stay compact). Keep the view stuck to the
+		// bottom when the user was there — expanding a 200-line result
+		// shouldn't leave you staring at the old offset.
+		atBottom := m.viewport.AtBottom()
 		m.expandToolResults = !m.expandToolResults
 		m.dirty = true
 		m.refresh()
+		if atBottom {
+			m.viewport.GotoBottom()
+		}
 		return m, nil
 	case tea.KeyCtrlT:
 		// Toggle expanded model reasoning/thinking (collapsed by default so
 		// a long reasoning trace doesn't dominate the transcript).
+		atBottom := m.viewport.AtBottom()
 		m.expandThinking = !m.expandThinking
 		m.dirty = true
 		m.refresh()
+		if atBottom {
+			m.viewport.GotoBottom()
+		}
 		return m, nil
 	case tea.KeyCtrlG:
 		// Toggle mouse capture. Capture drives wheel scrolling (the only
@@ -1368,11 +1423,15 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyCtrlY:
 		return m.copyLastResponse()
 	case tea.KeyPgUp:
-		// Scrolling up while cleared reveals the hidden transcript.
+		// Scrolling up while cleared reveals the hidden transcript. Bump
+		// the offset by the revealed height so the current lines stay put.
 		if m.clearedAt > 0 && !m.revealAll {
+			before := lipgloss.Height(m.renderMessages())
 			m.revealAll = true
+			added := lipgloss.Height(m.renderMessages()) - before
 			m.dirty = true
 			m.refresh()
+			m.viewport.YOffset += max(added, 0)
 		}
 		m.viewport.ScrollUp(m.viewport.Height / 2)
 	case tea.KeyPgDown:
@@ -2546,17 +2605,13 @@ func (m *model) handleTextDelta(msg *api.Message) (tea.Model, tea.Cmd) {
 	}
 	m.lastDeltaRefresh = time.Now()
 
-	// Mirror the follow-bottom behavior of handleAgentMsg.
-	if m.clearedAt > 0 && m.revealAll {
-		m.revealAll = false
-		m.refresh()
+	// Follow the bottom only when already there. Unlike handleAgentMsg, a
+	// delta must NOT snap a cleared+revealed view back down: the user is
+	// reviewing history while the reply streams in.
+	atBottom := m.viewport.AtBottom()
+	m.refresh()
+	if atBottom {
 		m.viewport.GotoBottom()
-	} else {
-		atBottom := m.viewport.AtBottom()
-		m.refresh()
-		if atBottom {
-			m.viewport.GotoBottom()
-		}
 	}
 	return m, nil
 }
@@ -2981,7 +3036,10 @@ func (m model) renderMessage(msg *api.Message, r *glamour.TermRenderer, w int) s
 	// whose content changes per chunk; the final text message shares the
 	// delta's ID and must render fresh).
 	cacheable := msg.ID != "" && msg.Type != api.MessageTypeToolCallRequest && msg.Type != api.MessageTypeTextDelta &&
-		msg.Type != api.MessageTypeThinking && msg.Type != api.MessageTypeThinkingDelta
+		msg.Type != api.MessageTypeThinking && msg.Type != api.MessageTypeThinkingDelta &&
+		// Tool responses depend on the expandToolResults toggle — caching
+		// them froze orphan (post-Ctrl+L-split) responses in one state.
+		msg.Type != api.MessageTypeToolCallResponse
 	if cacheable {
 		if cached, ok := m.cache.get(msg.ID); ok {
 			return cached
