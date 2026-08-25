@@ -4332,3 +4332,78 @@ func TestEscDuringRunningFlashesOnlyWhenCancellable(t *testing.T) {
 	}
 	_ = cmd
 }
+
+func TestRenamePreservesDraft(t *testing.T) {
+	// Regression: entering rename mode overwrote the in-progress draft and
+	// Esc/submit cleared it; now the draft is stashed and restored.
+	m := newBrowserModel()
+	m.input.SetValue("my half-written question")
+
+	m.enterSessionRename()
+	if m.input.Value() == "my half-written question" {
+		t.Fatal("rename should prefill the session name, not keep the draft")
+	}
+	m.exitSessionRename()
+	if got := m.input.Value(); got != "my half-written question" {
+		t.Errorf("draft after rename exit = %q, want restored", got)
+	}
+}
+
+func TestRenamePasteFlattensToSingleLine(t *testing.T) {
+	m := newBrowserModel()
+	m.enterSessionRename()
+	m.handlePaste(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("multi\nline\nname"), Paste: true})
+	if got := m.input.Value(); strings.Contains(got, "\n") || strings.Contains(got, "[+") {
+		t.Errorf("rename paste = %q, want a flat single line (no tokens)", got)
+	}
+	m.exitSessionRename()
+}
+
+func TestWholeTokenBackspaceRequiresCursorAtEnd(t *testing.T) {
+	// Regression: backspace with the cursor mid-draft ate the paste token at
+	// the tail of the input.
+	m := newBrowserModel()
+	m.input.SetValue("fix this")
+	m.handlePaste(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(strings.Repeat("log line\n", 12)), Paste: true})
+	if len(m.pastes) != 1 {
+		t.Fatalf("expected one attached paste, got %d", len(m.pastes))
+	}
+	// Cursor to the start (not at the token).
+	m.input.CursorStart()
+	m.handleKey(tea.KeyMsg{Type: tea.KeyBackspace})
+	if len(m.pastes) != 1 {
+		t.Error("mid-draft backspace must not remove the tail paste token")
+	}
+	// At the end, it removes the whole token.
+	m.input.CursorEnd()
+	m.handleKey(tea.KeyMsg{Type: tea.KeyBackspace})
+	if len(m.pastes) != 0 {
+		t.Error("end-of-draft backspace should remove the paste token")
+	}
+}
+
+func TestHistoryRecallClearsPasteAttachments(t *testing.T) {
+	m := newBrowserModel()
+	// History is rebuilt from the transcript: give it a real user message.
+	m.messages = append(m.messages, &api.Message{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "first query ever"})
+
+	m.handlePaste(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(strings.Repeat("blob\n", 12)), Paste: true})
+	if len(m.pastes) != 1 {
+		t.Fatalf("expected one attached paste, got %d", len(m.pastes))
+	}
+	m.historyPrev()
+	if len(m.pastes) != 0 {
+		t.Error("history recall must clear orphaned paste attachments")
+	}
+	if got := m.input.Value(); got != "first query ever" {
+		t.Errorf("recalled %q, want the history entry", got)
+	}
+}
+
+func TestShellModeTrimsLeadingWhitespace(t *testing.T) {
+	m := newBrowserModel()
+	m.input.SetValue("  !rm -rf /")
+	if !m.shellMode() {
+		t.Error("shellMode must trim leading whitespace (the agent does)")
+	}
+}
