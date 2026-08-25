@@ -427,3 +427,74 @@ func TestAgentMaxIterationsContinuePrompt(t *testing.T) {
 		t.Fatalf("expected user-input-request after stop, got %v", m.Type)
 	}
 }
+
+func TestAgentRetainsPartialStreamOnError(t *testing.T) {
+	// Regression: a mid-stream failure (or interrupt) used to discard the
+	// accumulated partial reply — the next store snapshot wiped the
+	// ephemeral delta entry and the transcript showed only the error.
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	store := sessions.NewInMemoryChatStore()
+	client := mocks.NewMockClient(ctrl)
+	chat := mocks.NewMockChat(ctrl)
+
+	client.EXPECT().StartChat(gomock.Any(), "test-model").Return(chat)
+	chat.EXPECT().Initialize(gomock.Any()).Return(nil)
+	chat.EXPECT().SetFunctionDefinitions(gomock.Any()).Return(nil)
+	client.EXPECT().GenerateCompletion(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+	chat.EXPECT().IsRetryableError(gomock.Any()).Return(false).AnyTimes()
+
+	chat.EXPECT().SendStreaming(gomock.Any(), gomock.Any()).Return(
+		gollm.ChatResponseIterator(func(yield func(gollm.ChatResponse, error) bool) {
+			if !yield(chatWith(fText("partial answer so far")), nil) {
+				return
+			}
+			yield(nil, fmt.Errorf("connection reset"))
+		}), nil)
+
+	a := &Agent{
+		ChatMessageStore: store,
+		LLM:              client,
+		Model:            "test-model",
+		MaxIterations:    4,
+		Session: &api.Session{
+			ID:               "test-session",
+			ChatMessageStore: store,
+			AgentState:       api.AgentStateIdle,
+		},
+	}
+
+	if err := a.Init(ctx); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := a.Run(ctx, ""); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if m := recvMsg(t, ctx, a.Output); m.Type != api.MessageTypeUserInputRequest {
+		t.Fatalf("expected user-input-request, got %v", m.Type)
+	}
+	a.Input <- &api.UserInputResponse{Query: "tell me something"}
+
+	errMsg := recvUntil(t, ctx, a.Output, func(m *api.Message) bool {
+		return m.Type == api.MessageTypeError
+	})
+	if errMsg == nil {
+		t.Fatalf("did not receive the error message")
+	}
+
+	// The partial reply is persisted alongside the error.
+	var texts []string
+	for _, m := range store.ChatMessages() {
+		if m.Source == api.MessageSourceModel && m.Type == api.MessageTypeText {
+			texts = append(texts, fmt.Sprintf("%v", m.Payload))
+		}
+	}
+	if len(texts) != 1 || texts[0] != "partial answer so far" {
+		t.Errorf("stored model texts = %v, want [partial answer so far]", texts)
+	}
+}

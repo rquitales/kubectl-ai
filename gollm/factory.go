@@ -333,9 +333,16 @@ func (rc *retryChat[C]) Send(ctx context.Context, contents ...any) (ChatResponse
 	return Retry[ChatResponse](ctx, rc.config, rc.underlying.IsRetryableError, operation)
 }
 
-// Embed implements the Client interface for the retryClient decorator.
+// SendStreaming implements the Chat interface for the retryChat decorator.
+// The streaming CALL is retried (connection refused, 429 before the first
+// byte, etc.); errors that arrive mid-stream during iteration surface to the
+// caller as before. The agentic loop only ever calls SendStreaming, so
+// without this the configured retry policy never applied.
 func (rc *retryChat[C]) SendStreaming(ctx context.Context, contents ...any) (ChatResponseIterator, error) {
-	return rc.underlying.SendStreaming(ctx, contents...)
+	operation := func(ctx context.Context) (ChatResponseIterator, error) {
+		return rc.underlying.SendStreaming(ctx, contents...)
+	}
+	return Retry[ChatResponseIterator](ctx, rc.config, rc.underlying.IsRetryableError, operation)
 }
 
 func (rc *retryChat[C]) SetFunctionDefinitions(functionDefinitions []*FunctionDefinition) error {
