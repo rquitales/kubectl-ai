@@ -420,6 +420,10 @@ type model struct {
 	// Session rename mode: the input captures a new session name instead
 	// of a chat message.
 	sessionRename bool
+	// renameDraft/renamePastes stash the in-progress draft while rename mode
+	// borrows the input box; restored on exit.
+	renameDraft  string
+	renamePastes []pastedBlock
 }
 
 func newModel(agent *agent.Agent) model {
@@ -1301,6 +1305,9 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.syncInputHeight()
 			return m, nil
 		}
+		if strings.HasPrefix(m.input.Value(), "/") {
+			return m, m.setFlash("No matching command.")
+		}
 		// Not a slash command: keep the textarea's default behavior.
 		var cmd tea.Cmd
 		m.input, cmd = m.input.Update(msg)
@@ -1382,8 +1389,9 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		// Backspace right after an inline paste placeholder removes the
 		// whole placeholder and its paste (like deleting an attachment in
-		// opencode).
-		if m.input.Line() == m.input.LineCount()-1 {
+		// opencode). The cursor must be at the very end of the input —
+		// deleting mid-draft with a token at the tail must not eat it.
+		if m.input.Line() == m.input.LineCount()-1 && m.cursorAtInputEnd() {
 			if token, ok := m.tokenAtEndOfInput(); ok {
 				m.removeToken(token)
 				m.syncInputHeight()
@@ -1468,6 +1476,7 @@ func (m *model) historyPrev() {
 		return // already at the oldest entry
 	}
 	m.input.SetValue(m.inputHistory[m.historyIdx])
+	m.pastes = nil
 	m.syncInputHeight()
 }
 
@@ -1485,6 +1494,7 @@ func (m *model) historyNext() {
 		m.input.SetValue(m.historyDraft)
 		m.historyDraft = ""
 	}
+	m.pastes = nil
 	m.syncInputHeight()
 }
 
@@ -1799,6 +1809,7 @@ func (m *model) handlePaletteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		item := items[m.paletteIndex]
+		m.justSubmitted = true
 		m.closePalette()
 		return item.run(m)
 	}
@@ -1894,6 +1905,7 @@ func (m *model) handlePickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		sel := m.pickerItems[m.pickerIndex].value
 		kind := m.pickerKind
+		m.justSubmitted = true
 		m.closePicker()
 		switch kind {
 		case pickerContext:
@@ -2002,6 +2014,22 @@ func (m *model) interruptRun() (tea.Model, tea.Cmd) {
 
 // tokenAtEndOfInput returns the paste placeholder token (if any) that the
 // current input value ends with.
+// cursorAtInputEnd reports whether the cursor sits at the very end of the
+// draft (last hard line, at its end — accounting for soft-wrap via the
+// current soft line's start offset).
+func (m *model) cursorAtInputEnd() bool {
+	v := m.input.Value()
+	if v == "" || m.input.Line() != m.input.LineCount()-1 {
+		return false
+	}
+	last := v
+	if i := strings.LastIndex(v, "\n"); i >= 0 {
+		last = v[i+1:]
+	}
+	info := m.input.LineInfo()
+	return info.StartColumn+info.CharOffset >= len([]rune(last))
+}
+
 func (m *model) tokenAtEndOfInput() (string, bool) {
 	value := m.input.Value()
 	for i := len(m.pastes) - 1; i >= 0; i-- {
@@ -2073,6 +2101,13 @@ func (m *model) handlePaste(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	if m.sessionRename {
+		// Session names are single-line: flatten the paste verbatim.
+		m.input.InsertString(strings.Join(strings.Fields(content), " "))
+		m.syncInputHeight()
+		return m, nil
+	}
+
 	if n := strings.Count(content, "\n") + 1; n >= pasteCollapseLines {
 		m.nextPasteID++
 		token := fmt.Sprintf("[+%d lines]", n)
@@ -2089,7 +2124,14 @@ func (m *model) handlePaste(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.pastes = append(m.pastes, block)
 	} else {
-		m.input.InsertString(content)
+		// bubbles truncates InsertString silently at the CharLimit — warn
+		// instead of losing the tail of the paste.
+		if limit := m.input.CharLimit; limit > 0 && m.input.Length()+len([]rune(content)) > limit {
+			m.input.InsertString(content)
+			m.setFlash("Paste truncated at the draft size limit — send, then paste the rest.")
+		} else {
+			m.input.InsertString(content)
+		}
 	}
 	m.syncInputHeight()
 	return m, nil
@@ -2299,6 +2341,10 @@ func (m *model) moveBrowserSelection(delta int) {
 // session, prefilling the current name.
 func (m *model) enterSessionRename() {
 	m.sessionRename = true
+	// Stash the in-progress draft so cancelling/submitting the rename
+	// doesn't silently destroy it.
+	m.renameDraft = m.input.Value()
+	m.renamePastes = m.pastes
 	name := ""
 	if s := m.agent.GetSession(); s != nil {
 		name = s.Name
@@ -2309,11 +2355,15 @@ func (m *model) enterSessionRename() {
 	m.syncInputHeight()
 }
 
-// exitSessionRename leaves rename mode, clearing the input.
+// exitSessionRename leaves rename mode, restoring the stashed draft.
 func (m *model) exitSessionRename() {
 	m.sessionRename = false
 	m.input.Placeholder = "Ask anything, or / for commands, !shell, @file…"
-	m.input.Reset()
+	m.input.SetValue(m.renameDraft)
+	m.pastes = m.renamePastes
+	m.renameDraft = ""
+	m.renamePastes = nil
+	m.input.CursorEnd()
 	m.syncInputHeight()
 }
 
@@ -2356,6 +2406,7 @@ func (m *model) handleEnter() (tea.Model, tea.Cmd) {
 					m.inChoiceMode = false
 					m.choicePrompt = ""
 					m.choiceOptionID = ""
+					m.justSubmitted = true
 					// Don't reset choiceType/sessionIDs yet or it might race, but actually we are done.
 					m.dirty = true
 					m.refresh()
@@ -4114,7 +4165,9 @@ func (m model) lastToken() string {
 
 // shellMode reports whether the input is a `!` shell escape command.
 func (m model) shellMode() bool {
-	return strings.HasPrefix(m.input.Value(), "!")
+	// The agent trims whitespace before checking for the shell escape, so
+	// the hint must too — otherwise "  !rm -rf" executes without the cue.
+	return strings.HasPrefix(strings.TrimLeft(m.input.Value(), " \t"), "!")
 }
 
 // completionHintVisible reports whether a hint line (slash completions,
