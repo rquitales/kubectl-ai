@@ -4247,3 +4247,47 @@ func TestContextBudgetUsesLatestTurnTokens(t *testing.T) {
 		t.Errorf("expected empty budget with no usage, got %q", got)
 	}
 }
+
+func TestToolOutputSanitizesANSI(t *testing.T) {
+	// Forced-color output must not bleed escape sequences into the frame.
+	got := toolResultText(map[string]any{"stdout": "\x1b[31mred text\x1b[0m\r\nnext\x1b[1m"})
+	if strings.Contains(got, "\x1b") || strings.Contains(got, "\r") {
+		t.Errorf("toolResultText kept escape/control chars: %q", got)
+	}
+	if !strings.Contains(got, "red text") {
+		t.Errorf("sanitized output lost content: %q", got)
+	}
+}
+
+func TestDiffColoringOnlyForRealDiffs(t *testing.T) {
+	if looksLikeUnifiedDiff([]string{"- name: foo", "+ something"}) {
+		t.Error("YAML list items misclassified as a diff")
+	}
+	if !looksLikeUnifiedDiff([]string{"diff -u -N /tmp/a /tmp/b", "-old", "+new"}) {
+		t.Error("kubectl diff output not recognized as a diff")
+	}
+	if !looksLikeUnifiedDiff([]string{"@@ -1,2 +1,2 @@", "-old", "+new"}) {
+		t.Error("hunk-only diff not recognized")
+	}
+}
+
+func TestLastToolOutputPrefersStderrOnFailure(t *testing.T) {
+	m := newModel(nil)
+	m.messages = append(m.messages, &api.Message{
+		Source: api.MessageSourceAgent,
+		Type:   api.MessageTypeToolCallResponse,
+		Payload: map[string]any{
+			"stdout":    "normal output",
+			"stderr":    "the real error",
+			"exit_code": float64(1),
+			"error":     "command failed",
+		},
+	})
+	got, ok := m.lastToolOutput()
+	if !ok {
+		t.Fatal("expected a copyable output")
+	}
+	if !strings.Contains(got, "the real error") && !strings.Contains(got, "command failed") {
+		t.Errorf("copy got %q, want the failure channel (what the transcript shows)", got)
+	}
+}
