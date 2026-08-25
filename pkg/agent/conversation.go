@@ -1033,6 +1033,30 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 					log.Error(llmError, "error streaming LLM response")
 					c.setAgentState(api.AgentStateDone)
 					c.pendingFunctionCalls = []ToolCallAnalysis{}
+					// Keep whatever the model managed to say: persist the
+					// accumulated partial text/thinking (reusing the stream
+					// IDs so UIs replace the ephemeral delta entries) instead
+					// of letting it vanish on the next store snapshot.
+					if streamedText != "" {
+						c.sendMessage(&api.Message{
+							ID:        streamID,
+							Source:    api.MessageSourceModel,
+							Type:      api.MessageTypeText,
+							Payload:   streamedText,
+							Timestamp: time.Now(),
+							Tokens:    usageTotalTokens(lastUsage),
+						})
+					}
+					if streamedThinking != "" {
+						c.sendMessage(&api.Message{
+							ID:        thinkStreamID,
+							Source:    api.MessageSourceModel,
+							Type:      api.MessageTypeThinking,
+							Payload:   streamedThinking,
+							Timestamp: time.Now(),
+							Ephemeral: true,
+						})
+					}
 					if c.interruptRequested(llmError) {
 						c.addMessage(api.MessageSourceAgent, api.MessageTypeText, "⚠ Interrupted.")
 					} else {
