@@ -1319,6 +1319,18 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.inChoiceMode {
 			return m, m.navigateList(tea.KeyUp)
 		}
+		if st := m.agentState(); st == api.AgentStateRunning || st == api.AgentStateInitializing {
+			// The input box is hidden behind the spinner while the agent
+			// runs — scroll the transcript instead of editing an invisible
+			// draft. Scrolling up while cleared reveals the hidden history.
+			if m.clearedAt > 0 && !m.revealAll {
+				m.revealAll = true
+				m.dirty = true
+				m.refresh()
+			}
+			m.viewport.ScrollUp(1)
+			return m, nil
+		}
 		// Within a multi-line draft, Up moves the cursor up to the first
 		// line; from there (and for single-line drafts) it recalls older
 		// input history, like opencode and Claude Code. The scroll wheel
@@ -1331,6 +1343,15 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyDown:
 		if m.inChoiceMode {
 			return m, m.navigateList(tea.KeyDown)
+		}
+		if st := m.agentState(); st == api.AgentStateRunning || st == api.AgentStateInitializing {
+			m.viewport.ScrollDown(1)
+			if m.revealAll && m.viewport.AtBottom() {
+				m.revealAll = false
+				m.dirty = true
+				m.refresh()
+			}
+			return m, nil
 		}
 		if m.input.LineCount() > 1 && m.input.Line() < m.input.LineCount()-1 {
 			m.input.CursorDown()
@@ -1632,20 +1653,15 @@ func (m *model) handleEsc() (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// Interrupt a running agent.
+	// Interrupt a running agent. CancelRun is non-blocking, so call it
+	// synchronously: only flash "Interrupted" when a run was actually
+	// cancellable (e.g. not during a plain state without a run context).
 	if m.agent != nil {
 		if s := m.agentState(); s == api.AgentStateRunning || s == api.AgentStateInitializing {
-			// Flash a status-bar confirmation so the user sees the interrupt
-			// landed; the returned closure both cancels the run (CancelRun
-			// signals it to stop asynchronously) and arms the flash timer.
-			flash := m.setFlash("⏹ Interrupted.")
-			return m, func() tea.Msg {
-				m.agent.CancelRun()
-				if flash != nil {
-					flash()
-				}
-				return nil
+			if m.agent.CancelRun() {
+				return m, m.setFlash("⏹ Interrupted.")
 			}
+			return m, nil
 		}
 	}
 
@@ -4382,7 +4398,7 @@ func (m model) viewHelp(state api.AgentState) string {
 	case m.inChoiceMode:
 		hints = []string{"↑/↓: navigate", "Enter: select", "Esc: decline", "Ctrl+C: quit"}
 	case state == api.AgentStateRunning:
-		hints = []string{"↑/↓: scroll", "Ctrl+C: cancel", "Esc: interrupt"}
+		hints = []string{"↑/↓ PgUp/PgDn: scroll", "Esc: interrupt", "Ctrl+C: quit"}
 	default:
 		hints = []string{
 			"Enter: send", "Ctrl+P: commands", "↑/↓: history",

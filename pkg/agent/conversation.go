@@ -330,6 +330,18 @@ func (c *Agent) agentState() api.AgentState {
 func (s *Agent) Init(ctx context.Context) error {
 	log := klog.FromContext(ctx)
 
+	// Startup can take a while (sandbox creation, MCP connects): surface it.
+	if s.Session != nil {
+		s.Session.AgentState = api.AgentStateInitializing
+		defer func() {
+			// Only flip back while still initializing — a concurrent Run
+			// may have moved the state on already.
+			if s.Session != nil && s.Session.AgentState == api.AgentStateInitializing {
+				s.Session.AgentState = api.AgentStateIdle
+			}
+		}()
+	}
+
 	s.Input = make(chan any, 10)
 	s.Output = make(chan any, 64)
 	s.currIteration = 0
@@ -1536,17 +1548,23 @@ func (c *Agent) compactConversation(ctx context.Context) (answer string, handled
 	}
 	// Flip to Running so the TUI shows the spinner (and the bottom-divider
 	// scroll cue) during the summarization call, then back to Done so the
-	// input box returns.
+	// input box returns. The call runs on a run context so Esc interrupts
+	// it for real (CancelRun cancels runCtx).
+	runCtx := c.StartRun(ctx)
 	c.setAgentState(api.AgentStateRunning)
 	defer func() {
+		c.endRun()
 		c.setAgentState(api.AgentStateDone)
 	}()
 
-	completion, err := c.LLM.GenerateCompletion(ctx, &gollm.CompletionRequest{
+	completion, err := c.LLM.GenerateCompletion(runCtx, &gollm.CompletionRequest{
 		Model:  c.Model,
 		Prompt: "Summarize this conversation concisely for continuing the task. Keep key facts, decisions, and current state:\n\n" + conversation,
 	})
 	if err != nil {
+		if runCtx.Err() != nil {
+			return "⚠ Compact interrupted.", true, nil
+		}
 		return "", false, fmt.Errorf("summarizing conversation: %w", err)
 	}
 	summary := strings.TrimSpace(completion.Response())

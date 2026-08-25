@@ -3909,8 +3909,13 @@ func TestViewHelpRunningShowsCancel(t *testing.T) {
 	m := newModel(a)
 	m.width = 60
 	help := m.viewHelp(api.AgentStateRunning)
-	if !strings.Contains(help, "Ctrl+C: cancel") {
-		t.Errorf("running: expected cancel hint, got:\n%s", help)
+	// The bar must tell the truth: Ctrl+C QUITS (there is no cancel path);
+	// Esc interrupts the run.
+	if !strings.Contains(help, "Ctrl+C: quit") {
+		t.Errorf("running: expected the quit hint (Ctrl+C quits the app), got:\n%s", help)
+	}
+	if !strings.Contains(help, "Esc: interrupt") {
+		t.Errorf("running: expected the interrupt hint, got:\n%s", help)
 	}
 	if !strings.Contains(help, "scroll") {
 		t.Errorf("running: expected the arrow scroll hint, got:\n%s", help)
@@ -4290,4 +4295,40 @@ func TestLastToolOutputPrefersStderrOnFailure(t *testing.T) {
 	if !strings.Contains(got, "the real error") && !strings.Contains(got, "command failed") {
 		t.Errorf("copy got %q, want the failure channel (what the transcript shows)", got)
 	}
+}
+
+func TestArrowKeysScrollWhileRunning(t *testing.T) {
+	// While the agent runs, the input box is hidden behind the spinner —
+	// Up/Down must scroll the transcript, not edit the invisible draft.
+	a := &agent.Agent{Session: &api.Session{ID: "t", AgentState: api.AgentStateRunning}}
+	m := newModel(a)
+	m.width, m.height = 80, 24
+	m.resize()
+	for i := 0; i < 50; i++ {
+		m.messages = append(m.messages, &api.Message{Source: api.MessageSourceAgent, Type: api.MessageTypeText, Payload: fmt.Sprintf("line %d", i)})
+	}
+	m.dirty = true
+	m.refresh()
+	m.viewport.GotoBottom()
+
+	m.input.SetValue("draft in progress")
+	m.handleKey(tea.KeyMsg{Type: tea.KeyUp})
+	if got := m.input.Value(); got != "draft in progress" {
+		t.Errorf("Up while running edited the hidden draft: %q", got)
+	}
+	if m.viewport.YOffset == m.viewport.TotalLineCount()-m.viewport.Height {
+		t.Error("Up while running did not scroll the transcript")
+	}
+}
+
+func TestEscDuringRunningFlashesOnlyWhenCancellable(t *testing.T) {
+	// A running state without a run context (old /compact) must not flash
+	// a lying "Interrupted" message.
+	a := &agent.Agent{Session: &api.Session{ID: "t", AgentState: api.AgentStateRunning}}
+	m := newModel(a)
+	_, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyEsc})
+	if m.flash != "" {
+		t.Errorf("flash = %q, want none when nothing was cancellable", m.flash)
+	}
+	_ = cmd
 }
