@@ -1546,6 +1546,17 @@ func (m *model) handleEsc() (tea.Model, tea.Cmd) {
 				return nil
 			}
 		}
+		// Model picker: cancel without changing the model (Choice 0). Sending
+		// the generic decline (3) here would select the third model.
+		if m.choiceType == "model" {
+			m.inChoiceMode = false
+			m.choicePrompt = ""
+			m.choiceOptionID = ""
+			return m, func() tea.Msg {
+				m.agent.Input <- &api.UserChoiceResponse{Choice: 0}
+				return nil
+			}
+		}
 		// Permission prompt: decline and interrupt the run.
 		m.inChoiceMode = false
 		m.choicePrompt = ""
@@ -2505,7 +2516,10 @@ func (m *model) handleAgentMsg(msg *api.Message) (tea.Model, tea.Cmd) {
 			m.inChoiceMode = true
 			m.choicePrompt = req.Prompt
 			m.choiceOptionID = msg.ID
-			m.choiceType = "confirm"
+			m.choiceType = req.Kind
+			if m.choiceType == "" {
+				m.choiceType = "confirm" // legacy requests without a kind
+			}
 		}
 	} else if msg.Type == api.MessageTypeSessionPickerRequest {
 		if req, ok := msg.Payload.(*api.SessionPickerRequest); ok {

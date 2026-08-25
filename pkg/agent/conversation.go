@@ -870,6 +870,7 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 							{Value: "continue", Label: "Continue"},
 							{Value: "stop", Label: "Stop"},
 						},
+						Kind: "continue",
 					})
 					continue
 				}
@@ -1965,6 +1966,7 @@ func (c *Agent) openModelPicker(ctx context.Context) (answer string, handled boo
 	c.addMessage(api.MessageSourceAgent, api.MessageTypeUserChoiceRequest, &api.UserChoiceRequest{
 		Prompt:  "Select a model:",
 		Options: options,
+		Kind:    "model",
 	})
 	return "", true, nil
 }
@@ -1976,6 +1978,11 @@ func (c *Agent) handleModelChoice(ctx context.Context, response *api.UserChoiceR
 	c.setAgentState(api.AgentStateDone)
 
 	idx := response.Choice - 1
+	if response.Choice == 0 {
+		// Esc/cancel: leave the model unchanged.
+		c.addMessage(api.MessageSourceAgent, api.MessageTypeText, "Model switch cancelled.")
+		return
+	}
 	if idx < 0 || idx >= len(models) {
 		c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Invalid model selection.")
 		return
@@ -2313,7 +2320,7 @@ func permissionChoiceRequest(calls []ToolCallAnalysis) *api.UserChoiceRequest {
 	if names := modifyingToolNames(calls); len(names) == 1 {
 		options = append(options, api.UserChoiceOption{Value: "always_allow_" + names[0], Label: "Always allow " + names[0]})
 	}
-	return &api.UserChoiceRequest{Prompt: confirmationPrompt, Options: options}
+	return &api.UserChoiceRequest{Prompt: confirmationPrompt, Options: options, Kind: "permission"}
 }
 
 // allowTools adds the given tool names to the in-memory always-allow set.

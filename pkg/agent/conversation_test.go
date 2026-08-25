@@ -1531,3 +1531,30 @@ func TestSessionKubeconfigPinnedAgainstExternalEdits(t *testing.T) {
 		t.Errorf("after reset context = %q, want prod (the pinned snapshot)", current)
 	}
 }
+
+func TestHandleModelChoiceCancelLeavesModelUnchanged(t *testing.T) {
+	// Regression: Esc on the /model picker sends Choice 0 (cancel); it used
+	// to send the generic decline (3), which selected — and persisted — the
+	// third model in the list.
+	a := &Agent{
+		Session:            &api.Session{ChatMessageStore: sessions.NewInMemoryChatStore()},
+		Model:              "current-model",
+		pendingModelChoice: []string{"m1", "m2", "m3"},
+		Output:             make(chan any, 10),
+	}
+	go func() {
+		for range a.Output {
+		}
+	}()
+
+	a.handleModelChoice(context.Background(), &api.UserChoiceResponse{Choice: 0})
+	if a.Model != "current-model" {
+		t.Errorf("Model = %q after cancel, want unchanged %q", a.Model, "current-model")
+	}
+	if a.pendingModelChoice != nil {
+		t.Error("pendingModelChoice should be cleared after cancel")
+	}
+	if st := a.AgentState(); st != api.AgentStateDone {
+		t.Errorf("state = %s after cancel, want done", st)
+	}
+}
