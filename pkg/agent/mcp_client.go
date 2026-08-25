@@ -36,22 +36,7 @@ func (a *Agent) InitializeMCPClient(ctx context.Context) error {
 
 	// Connect to servers and register tools
 	err = manager.RegisterWithToolSystem(ctx, func(serverName string, toolInfo mcp.Tool) error {
-		// Create schema for the tool
-		schema, err := tools.ConvertToolToGollm(&toolInfo)
-		if err != nil {
-			return err
-		}
-
-		// Create an MCPTool wrapper first to get the unique name
-		mcpTool := tools.NewMCPTool(serverName, toolInfo.Name, toolInfo.Description, schema, manager)
-
-		// Update schema with unique name and better description to avoid conflicts
-		schema.Name = mcpTool.UniqueToolName()
-		schema.Description = fmt.Sprintf("%s (from %s)", toolInfo.Description, serverName)
-
-		// Create and register MCP tool wrapper
-		tools.RegisterTool(mcpTool)
-		return nil
+		return a.registerMCPTool(serverName, toolInfo, manager)
 	})
 
 	if err != nil {
@@ -61,6 +46,33 @@ func (a *Agent) InitializeMCPClient(ctx context.Context) error {
 	// Store the manager for later use
 	a.mcpManager = manager
 
+	return nil
+}
+
+// registerMCPTool registers a single MCP tool into the agent's OWN toolset
+// (not the package-global registry): the agent clones its toolset before MCP
+// initialization, so global registration would be invisible to the LLM's
+// function definitions, to tool dispatch, and to /tools. Duplicate
+// registrations (e.g. a second Init in the same process) are skipped rather
+// than panicking.
+func (a *Agent) registerMCPTool(serverName string, toolInfo mcp.Tool, manager *mcp.Manager) error {
+	// Create schema for the tool
+	schema, err := tools.ConvertToolToGollm(&toolInfo)
+	if err != nil {
+		return err
+	}
+
+	// Create an MCPTool wrapper first to get the unique name
+	mcpTool := tools.NewMCPTool(serverName, toolInfo.Name, toolInfo.Description, schema, manager)
+
+	// Update schema with unique name and better description to avoid conflicts
+	schema.Name = mcpTool.UniqueToolName()
+	schema.Description = fmt.Sprintf("%s (from %s)", toolInfo.Description, serverName)
+
+	if a.Tools.Lookup(mcpTool.UniqueToolName()) != nil {
+		return nil // already registered
+	}
+	a.Tools.RegisterTool(mcpTool)
 	return nil
 }
 

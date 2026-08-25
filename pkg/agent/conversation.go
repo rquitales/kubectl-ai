@@ -402,10 +402,8 @@ func (s *Agent) Init(ctx context.Context) error {
 	s.Tools.RegisterTool(tools.NewBashTool(s.Executor))
 	s.Tools.RegisterTool(tools.NewKubectlTool(s.Executor))
 
-	if err := s.rebuildChat(ctx); err != nil {
-		return err
-	}
-
+	// MCP tools must be registered BEFORE rebuildChat so the chat's
+	// function definitions include them.
 	if s.MCPClientEnabled {
 		if err := s.InitializeMCPClient(ctx); err != nil {
 			klog.Errorf("Failed to initialize MCP client: %v", err)
@@ -416,6 +414,10 @@ func (s *Agent) Init(ctx context.Context) error {
 		if err := s.UpdateMCPStatus(ctx, s.MCPClientEnabled); err != nil {
 			klog.Warningf("Failed to update MCP status: %v", err)
 		}
+	}
+
+	if err := s.rebuildChat(ctx); err != nil {
+		return err
 	}
 
 	return nil
