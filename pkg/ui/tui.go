@@ -368,6 +368,10 @@ type model struct {
 	namespacesFetching  bool
 	// sessionID tracks the active session so switches are detectable.
 	sessionID string
+	// contextTokens caches the context-window token fill, recomputed on
+	// message arrival — never per frame (the filesystem session backend
+	// re-reads the history file on every AllMessages call).
+	contextTokens int
 	// Kube context/namespace shown in the status bar; resolved once at
 	// startup and re-resolved on a TTL by the 1s tick (a cheap file read).
 	kubeContext     kubeContextInfo
@@ -550,7 +554,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case spinner.TickMsg:
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
-		return m, cmd
+		// Keep the chain alive only while something visibly animates —
+		// otherwise it reschedules at ~12fps for the process lifetime.
+		switch m.agentState() {
+		case api.AgentStateRunning, api.AgentStateInitializing:
+			return m, cmd
+		}
+		if m.pickerOpen && strings.Contains(m.pickerStatus, "Loading") {
+			return m, cmd
+		}
+		return m, nil
 
 	case flashClearMsg:
 		// Clear the status-bar flash only if this is the most recent one
@@ -562,8 +575,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tickMsg:
-		// Re-resolve the kube context on a TTL so an external
-		// `kubectl config use-context` is reflected in the status bar.
+		// Re-resolve the kube context on a TTL. The kubeconfig is
+		// session-pinned (external `kubectl config use-context` edits do
+		// NOT flow in); this refresh covers the session's own /context and
+		// /namespace overrides rewriting the pinned file.
 		if time.Since(m.kubeContextLast) > kubeContextTTL {
 			m.resolveKubeContext()
 		}
@@ -1990,7 +2005,7 @@ func (m *model) fetchContexts() tea.Msg {
 	if m.agent == nil {
 		return contextListMsg{err: fmt.Errorf("no agent")}
 	}
-	names, err := kube.ListContexts(m.agent.Kubeconfig)
+	names, err := kube.ListContexts(m.agent.ActiveKubeconfig())
 	if err != nil {
 		return contextListMsg{err: err}
 	}
@@ -2677,6 +2692,7 @@ func (m *model) handleAgentMsg(msg *api.Message) (tea.Model, tea.Cmd) {
 		m.clearedAt = 0
 		m.sessionID = session.ID
 	}
+	m.contextTokens = currentContextTokens(session)
 	// Re-snapshot from the store. When this is the final text message of a
 	// streamed iteration, the snapshot contains it (with the stream ID) and
 	// drops the ephemeral delta entry: the streaming entry is replaced in
@@ -3779,7 +3795,7 @@ func (m model) statusLayout(session *api.Session) (string, statusSpans) {
 	}
 	model = truncateRunes(model, 30)
 
-	totalTokens := currentContextTokens(session)
+	totalTokens := m.contextTokens
 
 	left := primaryText.Render("kubectl-ai") + sep + mutedStyle.Render(name) + sep + m.viewState(session.AgentState)
 	if m.agent != nil && m.agent.SkipPermissionsEnabled() {
@@ -4326,7 +4342,7 @@ func (m *model) contextMatches() []string {
 		if m.agent == nil {
 			return nil
 		}
-		names, err := kube.ListContexts(m.agent.Kubeconfig)
+		names, err := kube.ListContexts(m.agent.ActiveKubeconfig())
 		if err != nil {
 			return nil
 		}

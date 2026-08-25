@@ -29,6 +29,8 @@ import (
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/agent"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/sandbox"
+	"github.com/charmbracelet/bubbles/spinner"
+
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/sessions"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/tools"
 	tea "github.com/charmbracelet/bubbletea"
@@ -3200,6 +3202,9 @@ func TestViewStatusShowsContextBudget(t *testing.T) {
 	m := newModel(a)
 	m.width = 100
 
+	// The cache updates on message arrival (mirroring the live flow).
+	m.handleAgentMsg(&api.Message{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "b", Tokens: 45200})
+
 	// The LATEST model turn's total (45200) is the context-window fill:
 	// 45200 / 128000 ≈ 35%.
 	got := m.viewStatus(a.GetSession())
@@ -3207,9 +3212,12 @@ func TestViewStatusShowsContextBudget(t *testing.T) {
 		t.Errorf("expected a context budget indicator at 35%%, got:\n%s", got)
 	}
 
-	// Hidden when no usage was reported.
-	empty := &api.Session{ID: "test", AgentState: api.AgentStateIdle}
-	if g := m.viewStatus(empty); strings.Contains(g, "ctx ") {
+	// Hidden when no usage was reported (fresh model, empty session — the
+	// token cache is zero).
+	emptyAgent := &agent.Agent{Session: &api.Session{ID: "test2", AgentState: api.AgentStateIdle, ChatMessageStore: sessions.NewInMemoryChatStore()}}
+	m2 := newModel(emptyAgent)
+	m2.width = 100
+	if g := m2.viewStatus(emptyAgent.GetSession()); strings.Contains(g, "ctx ") {
 		t.Errorf("expected no context indicator for an empty session, got:\n%s", g)
 	}
 }
@@ -4456,5 +4464,46 @@ func TestCtrlLExcludesTrailingStreamDelta(t *testing.T) {
 	m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlL})
 	if m.clearedAt != 1 {
 		t.Errorf("clearedAt = %d, want 1 (the ephemeral delta entry excluded)", m.clearedAt)
+	}
+}
+
+func TestSpinnerTickChainStopsWhenIdle(t *testing.T) {
+	// The spinner chain used to reschedule at ~12fps for the process
+	// lifetime; it must only run while something visibly animates.
+	m := newBrowserModel() // agent Idle
+	_, cmd := m.Update(spinner.TickMsg{})
+	if cmd != nil {
+		t.Error("idle spinner tick must not reschedule")
+	}
+
+	a := &agent.Agent{Session: &api.Session{ID: "t", AgentState: api.AgentStateRunning}}
+	m2 := newModel(a)
+	_, cmd2 := m2.Update(spinner.TickMsg{})
+	if cmd2 == nil {
+		t.Error("running spinner tick must keep animating")
+	}
+}
+
+func TestStatusBarUsesCachedContextTokens(t *testing.T) {
+	store := sessions.NewInMemoryChatStore()
+	a := &agent.Agent{Session: &api.Session{ID: "t", ModelID: "m", AgentState: api.AgentStateIdle, ChatMessageStore: store}}
+	m := newModel(a)
+	m.width = 100
+
+	// No cache yet → no indicator.
+	if got := m.viewStatus(a.GetSession()); strings.Contains(got, "ctx ") {
+		t.Errorf("no indicator expected before any message, got:\n%s", got)
+	}
+
+	// A message arrival updates the cache (not per-frame store reads).
+	// Production stores before broadcasting, so mirror that.
+	msg := &api.Message{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "hi", Tokens: 64000}
+	_ = store.AddChatMessage(msg)
+	m.handleAgentMsg(msg)
+	if m.contextTokens != 64000 {
+		t.Fatalf("contextTokens cache = %d, want 64000", m.contextTokens)
+	}
+	if got := m.viewStatus(a.GetSession()); !strings.Contains(got, "ctx ") || !strings.Contains(got, "50%") {
+		t.Errorf("expected a 50%% context indicator from the cache, got:\n%s", got)
 	}
 }

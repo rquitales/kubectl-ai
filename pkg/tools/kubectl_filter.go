@@ -137,6 +137,10 @@ func KubectlDryRunPreview(command string) string {
 	if err != nil {
 		return ""
 	}
+	// A heredoc body would swallow the appended flag — no preview.
+	if strings.Contains(command, "<<") {
+		return ""
+	}
 	subcommand := ""
 	syntax.Walk(file, func(node syntax.Node) bool {
 		if call, ok := node.(*syntax.CallExpr); ok {
