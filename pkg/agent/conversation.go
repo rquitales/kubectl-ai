@@ -292,14 +292,16 @@ func (c *Agent) addModelTextMessage(text string, tokens int) *api.Message {
 // sendMessage adds a fully-formed message to the session and sends it to the
 // output channel.
 func (c *Agent) sendMessage(message *api.Message) *api.Message {
-	c.sessionMu.Lock()
-	defer c.sessionMu.Unlock()
-
 	// Don't store UI control signals - they're not part of the conversation
 	if message.Type != api.MessageTypeUserInputRequest {
+		c.sessionMu.Lock()
 		c.Session.ChatMessageStore.AddChatMessage(message)
 		c.Session.LastModified = time.Now()
+		c.sessionMu.Unlock()
 	}
+	// Send OUTSIDE the lock: a slow UI with a full buffer would otherwise
+	// block the agent while it holds sessionMu, deadlocking the UI (which
+	// takes the same mutex in View/Update).
 	c.Output <- message
 	return message
 }
@@ -516,7 +518,10 @@ func deriveSessionName(messages []*api.Message) string {
 		"clear": true, "reset": true, "exit": true, "quit": true,
 		"session": true, "sessions": true, "tools": true, "model": true,
 		"models": true, "new-session": true, "save-session": true,
-		"compact": true,
+		"compact": true, "namespace": true, "ns": true, "context": true,
+		"contexts": true, "help": true, "mcp": true, "rename": true,
+		"rename-session": true, "resume": true, "resume-session": true,
+		"delete": true, "delete-session": true,
 	}
 	for _, msg := range messages {
 		if msg.Source != api.MessageSourceUser || msg.Type != api.MessageTypeText {
@@ -1079,6 +1084,7 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 						c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+llmError.Error())
 						c.lastErr = llmError
 					}
+					c.endRun()
 					continue
 				}
 
@@ -1140,6 +1146,7 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 					c.Session.LastModified = time.Now()
 					c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
 					c.lastErr = err
+					c.endRun()
 					continue
 				}
 
@@ -2105,6 +2112,23 @@ func (c *Agent) switchModel(ctx context.Context, modelID string) error {
 		return fmt.Errorf("unknown model %q. Available models: %s", modelID, strings.Join(models, ", "))
 	}
 
+	// Rebuild first: if it fails, nothing has changed.
+	if err := func() error {
+		c.sessionMu.Lock()
+		prev := c.Model
+		c.Model = modelID // rebuildChat binds StartChat to c.Model
+		c.sessionMu.Unlock()
+		if err := c.rebuildChat(ctx); err != nil {
+			c.sessionMu.Lock()
+			c.Model = prev
+			c.sessionMu.Unlock()
+			return err
+		}
+		return nil
+	}(); err != nil {
+		return fmt.Errorf("rebuilding chat for model %q: %w", modelID, err)
+	}
+
 	c.sessionMu.Lock()
 	c.Model = modelID
 	c.Session.ModelID = modelID
@@ -2119,10 +2143,6 @@ func (c *Agent) switchModel(ctx context.Context, modelID string) error {
 	}
 	if err := manager.UpdateLastAccessed(session); err != nil {
 		klog.Warningf("Failed to persist model change for session %q: %v", session.ID, err)
-	}
-
-	if err := c.rebuildChat(ctx); err != nil {
-		return fmt.Errorf("rebuilding chat for model %q: %w", modelID, err)
 	}
 	return nil
 }
