@@ -43,6 +43,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"k8s.io/klog/v2"
 )
 
@@ -520,6 +521,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		m2, cmd := m.handleKey(msg)
+		// Re-budget the layout: key handling may have changed the input
+		// block height without touching content lines (choice mode
+		// enter/exit, hint/counter toggles).
+		m.syncInputHeight()
 		// Opportunistically (async!) warm the namespace-completion cache when
 		// the draft is a /namespace command — never synchronously on this
 		// goroutine.
@@ -852,12 +857,13 @@ func (m *model) resize() {
 	// The textarea must fit the input box's content area exactly: box border
 	// (2) + box padding (2) + outer padding (2) = 6, plus 2 cells of slack
 	// so rendered lines never reach the terminal's last column and wrap.
-	m.input.SetWidth(max(m.width-8, 20))
+	m.input.SetWidth(max(m.width-8, 4))
 	m.list.SetWidth(m.width - 4)
 	// The rename footer composes "Rename: " + input + "  (enter: save • esc:
 	// cancel)" (~37 fixed cells) plus box chrome (6): size the input so the
 	// composed line can never wrap.
 	m.renameInput.Width = max(m.width-45, 8)
+	m.syncInputHeight()
 	m.updateViewportHeight()
 	m.refresh()
 	m.viewport.GotoBottom()
@@ -881,7 +887,7 @@ func (m *model) updateViewportHeight() {
 		contentH -= lipgloss.Height(m.viewPicker())
 	}
 
-	contentH = max(contentH, 5)
+	contentH = max(contentH, 1)
 	m.viewport.Height = contentH
 }
 
@@ -2616,6 +2622,10 @@ func (m *model) handleAgentMsg(msg *api.Message) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	// Agent-state flips change the input block height (spinner box vs draft
+	// box with its counter/hint lines) — re-budget the layout.
+	m.syncInputHeight()
+
 	if session.AgentState == api.AgentStateRunning || session.AgentState == api.AgentStateInitializing {
 		return m, m.spinner.Tick
 	}
@@ -2814,10 +2824,10 @@ func (m model) renderMessages() string {
 	if len(m.messages) == 0 {
 		sb.WriteString(m.renderWelcome())
 	} else {
-		width := min(m.viewport.Width-6, 90)
-		if width < 40 {
-			width = 40
-		}
+		// Never floor the content width above the viewport: the viewport
+		// hard-cuts over-wide lines, so a too-wide floor would silently lose
+		// content on narrow terminals.
+		width := max(min(m.viewport.Width-6, 90), 20)
 
 		renderer, err := m.cache.getRenderer(width)
 		if err != nil {
@@ -3342,7 +3352,7 @@ func (m model) viewPalette() string {
 	sb.WriteString(dimStyle.Render("↑/↓/j/k: navigate • enter: run • esc: close"))
 
 	return lipgloss.NewStyle().Padding(0, 1).Render(
-		inputBox.Width(max(m.width-4, 20)).Render(sb.String()))
+		inputBox.Width(max(m.width-4, 8)).Render(sb.String()))
 }
 
 // paletteRows is the number of palette rows shown, adapted to the terminal
@@ -3385,7 +3395,7 @@ func (m model) viewPicker() string {
 		if strings.Contains(m.pickerStatus, "Loading") {
 			sb.WriteString(m.spinner.View() + " " + m.pickerStatus)
 		} else {
-			sb.WriteString(errorText.Render(truncateRunes(m.pickerStatus, max(m.width-6, 10))))
+			sb.WriteString(errorText.Render(truncateCells(m.pickerStatus, max(m.width-6, 10))))
 		}
 		sb.WriteString("\n")
 	} else {
@@ -3402,7 +3412,7 @@ func (m model) viewPicker() string {
 			if it.current {
 				mark = dimStyle.Render(" (current)")
 			}
-			value := truncateRunes(it.value, max(m.width-20, 10))
+			value := truncateCells(it.value, max(m.width-20, 10))
 			if i == sel {
 				sb.WriteString(primaryText.Render("> "+value) + mark)
 			} else {
@@ -3416,7 +3426,7 @@ func (m model) viewPicker() string {
 	sb.WriteString(dimStyle.Render("↑/↓/j/k: navigate • enter: select • esc: close"))
 
 	return lipgloss.NewStyle().Padding(0, 1).Render(
-		inputBox.Width(max(m.width-4, 20)).Render(sb.String()))
+		inputBox.Width(max(m.width-4, 8)).Render(sb.String()))
 }
 
 // viewSessionBrowser renders the session browser panel shown above the input.
@@ -3492,9 +3502,9 @@ func (m model) viewSessionBrowser() string {
 		sb.WriteString(warnText.Render("Rename: ") + m.renameInput.View() + dimStyle.Render("  (enter: save • esc: cancel)"))
 	case m.browserStatus.text != "":
 		if m.browserStatus.isErr {
-			sb.WriteString(errorText.Render(truncateRunes(m.browserStatus.text, max(m.width-6, 10))))
+			sb.WriteString(errorText.Render(truncateCells(m.browserStatus.text, max(m.width-6, 10))))
 		} else {
-			sb.WriteString(successText.Render(truncateRunes(m.browserStatus.text, max(m.width-6, 10))))
+			sb.WriteString(successText.Render(truncateCells(m.browserStatus.text, max(m.width-6, 10))))
 		}
 	default:
 		hint := "↑/↓/j/k: navigate • type to filter • enter: switch • r: rename • d: delete • ctrl+n: new • esc: close"
@@ -3510,7 +3520,7 @@ func (m model) viewSessionBrowser() string {
 	}
 
 	return lipgloss.NewStyle().Padding(0, 1).Render(
-		inputBox.Width(max(m.width-4, 20)).Render(sb.String()))
+		inputBox.Width(max(m.width-4, 8)).Render(sb.String()))
 }
 
 // statusSpan is a half-open [start, end) column range within the status bar.
@@ -3668,18 +3678,24 @@ func (m model) statusLayout(session *api.Session) (string, statusSpans) {
 
 	// The status bar must always be exactly one line, no matter the
 	// terminal width: shrink the name (then the model, then the kube
-	// context) until it fits.
+	// context) until it fits. While a flash is active, skip the right-hand
+	// shrink loops — they rebuild `right` from the model/kube segments and
+	// would silently discard the flash; truncate the flash itself instead.
 	for lipgloss.Width(left)+lipgloss.Width(right) > m.width-2 && len([]rune(name)) > 8 {
 		name = truncateRunes(name, len([]rune(name))-4)
 		left = primaryText.Render("kubectl-ai") + sep + mutedStyle.Render(name) + sep + m.viewState(session.AgentState)
 	}
-	for lipgloss.Width(left)+lipgloss.Width(right) > m.width-2 && len([]rune(model)) > 7 {
-		model = truncateRunes(model, len([]rune(model))-4)
-		right = renderRight(model)
-	}
-	for lipgloss.Width(left)+lipgloss.Width(right) > m.width-2 && len([]rune(kube)) > 8 {
-		kube = truncateRunes(kube, len([]rune(kube))-4)
-		right = renderRight(model)
+	if !flashActive {
+		for lipgloss.Width(left)+lipgloss.Width(right) > m.width-2 && len([]rune(model)) > 7 {
+			model = truncateRunes(model, len([]rune(model))-4)
+			right = renderRight(model)
+		}
+		for lipgloss.Width(left)+lipgloss.Width(right) > m.width-2 && len([]rune(kube)) > 8 {
+			kube = truncateRunes(kube, len([]rune(kube))-4)
+			right = renderRight(model)
+		}
+	} else {
+		right = truncateCells(right, max(m.width-2-lipgloss.Width(left), 4))
 	}
 
 	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right) - 2
@@ -3688,7 +3704,7 @@ func (m model) statusLayout(session *api.Session) (string, statusSpans) {
 		// Truncate the joined string so the status bar stays on one line
 		// instead of wrapping. Offsets are meaningless here — no targets.
 		joined := strings.TrimSpace(left + " " + right)
-		return statusBar.Width(m.width).Render(" " + truncateRunes(joined, max(m.width-2, 1)) + " "), spans
+		return statusBar.Width(m.width).Render(" " + truncateCells(joined, max(m.width-2, 1)) + " "), spans
 	}
 
 	// Compute click spans for the right-hand segments. Anchor from the right
@@ -3755,6 +3771,20 @@ func truncateRunes(s string, n int) string {
 		return "…"
 	}
 	return string(r[:n-1]) + "…"
+}
+
+// truncateCells truncates s to at most n terminal CELLS (not runes), so
+// CJK/emoji-heavy text can't wrap a line the layout budgeted as one row.
+// It is ANSI-aware: embedded escape sequences are preserved and never
+// counted or cut.
+func truncateCells(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= n {
+		return s
+	}
+	return ansi.Truncate(s, n, "…")
 }
 
 // formatTokens renders a token count compactly: plain below 1000 ("42"),
@@ -4168,28 +4198,28 @@ func (m *model) completionHint() string {
 	}
 	if matches := m.contextMatches(); len(matches) > 0 {
 		hint := "  " + strings.Join(matches, "  ")
-		return dimStyle.Render(truncateRunes(hint, max(m.input.Width(), 20)))
+		return dimStyle.Render(truncateCells(hint, max(m.input.Width(), 20)))
 	}
 	if matches := m.namespaceMatches(); len(matches) > 0 {
 		hint := "  " + strings.Join(matches, "  ")
-		return dimStyle.Render(truncateRunes(hint, max(m.input.Width(), 20)))
+		return dimStyle.Render(truncateCells(hint, max(m.input.Width(), 20)))
 	}
 	if matches := m.fileMatches(); len(matches) > 0 {
 		hint := "  " + strings.Join(matches, "  ")
-		return dimStyle.Render(truncateRunes(hint, max(m.input.Width(), 20)))
+		return dimStyle.Render(truncateCells(hint, max(m.input.Width(), 20)))
 	}
 	matches := slashCompletions(m.input.Value())
 	if len(matches) == 0 {
 		return ""
 	}
 	hint := "  " + strings.Join(matches, "  ")
-	return dimStyle.Render(truncateRunes(hint, max(m.input.Width(), 20)))
+	return dimStyle.Render(truncateCells(hint, max(m.input.Width(), 20)))
 }
 
 func (m model) viewInput(state api.AgentState) string {
 	// Show dimmed input hint when in choice mode (picker is inline above)
 	if m.inChoiceMode {
-		content := mutedStyle.Render(truncateRunes("Use ↑/↓ to navigate, Enter to select, Esc to decline", max(m.width-6, 10)))
+		content := mutedStyle.Render(truncateCells("Use ↑/↓ to navigate, Enter to select, Esc to decline", max(m.width-6, 10)))
 		return lipgloss.NewStyle().Padding(0, 1).Render(inputBoxDim.Width(m.width - 4).Render(content))
 	}
 

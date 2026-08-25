@@ -4120,3 +4120,42 @@ func TestFrameStaysExactWithOpenPanels(t *testing.T) {
 	m.browserStatus = browserStatusMsg{text: strings.Repeat("x", 200), isErr: true}
 	check(m, "browser long error footer")
 }
+
+func TestFrameStaysExactAcrossAgentStateTransitions(t *testing.T) {
+	// Regression: while the agent runs, the input block renders a 3-line
+	// spinner box; when the turn finished with a draft in the box, the block
+	// grew (draft lines + counter) but nothing re-budgeted the viewport, so
+	// the frame overflowed and the status bar scrolled out of view.
+	a := &agent.Agent{Session: &api.Session{ID: "test", ModelID: "m", AgentState: api.AgentStateIdle}}
+	m := newModel(a)
+	m.width, m.height = 80, 24
+	m.resize()
+
+	// User drafts a follow-up, then the agent starts running.
+	m.input.SetValue("follow-up question while it works")
+	m.syncInputHeight()
+	a.Session.AgentState = api.AgentStateRunning
+	m.handleAgentMsg(&api.Message{Source: api.MessageSourceAgent, Type: api.MessageTypeText, Payload: "working…"})
+	if got := lipgloss.Height(m.View()); got != m.height {
+		t.Fatalf("frame height while running = %d, want exactly %d", got, m.height)
+	}
+
+	// Turn finishes: the draft box (with counter line) returns.
+	a.Session.AgentState = api.AgentStateDone
+	m.handleAgentMsg(&api.Message{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "done"})
+	if got := lipgloss.Height(m.View()); got != m.height {
+		t.Errorf("frame height after turn end with a draft = %d, want exactly %d", got, m.height)
+	}
+}
+
+func TestTruncateCellsHandlesWideChars(t *testing.T) {
+	// 10 CJK chars = 20 cells; rune-truncation to 10 would render 20 cells
+	// and wrap a budgeted single line.
+	s := strings.Repeat("界", 10)
+	if got := truncateCells(s, 10); lipgloss.Width(got) > 10 {
+		t.Errorf("truncateCells(10 CJK, 10) renders %d cells, want <= 10", lipgloss.Width(got))
+	}
+	if got := truncateCells("ascii", 10); got != "ascii" {
+		t.Errorf("truncateCells short string = %q, want unchanged", got)
+	}
+}
