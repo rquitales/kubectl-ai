@@ -617,7 +617,9 @@ func TestOpenAIChatSessionInitializeSeedsHistory(t *testing.T) {
 
 		{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "and the flux kustomization?"},
 		{Source: api.MessageSourceAgent, Type: api.MessageTypeText, Payload: "note from the agent"},
-		{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: ""}, // skipped: empty
+		{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: ""},                                    // skipped: empty
+		{Source: api.MessageSourceAgent, Type: api.MessageTypeText, Payload: "local /help output", Ephemeral: true}, // skipped: ephemeral
+		{Source: api.MessageSourceModel, Type: api.MessageTypeThinking, Payload: "pondering", Ephemeral: true},      // skipped: ephemeral
 	}
 
 	if err := cs.Initialize(messages); err != nil {
@@ -635,7 +637,8 @@ func TestOpenAIResponseChatSessionInitializeSeedsHistory(t *testing.T) {
 	messages := []*api.Message{
 		{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "first question"},
 		{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "first answer"},
-		{Source: api.MessageSourceModel, Type: api.MessageTypeToolCallRequest, Payload: "kubectl get pods"}, // skipped
+		{Source: api.MessageSourceModel, Type: api.MessageTypeToolCallRequest, Payload: "kubectl get pods"},        // skipped
+		{Source: api.MessageSourceAgent, Type: api.MessageTypeText, Payload: "local /mcp output", Ephemeral: true}, // skipped: ephemeral
 	}
 
 	if err := cs.Initialize(messages); err != nil {

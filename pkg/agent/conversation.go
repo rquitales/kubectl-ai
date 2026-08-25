@@ -242,6 +242,22 @@ func (c *Agent) addMessage(source api.MessageSource, messageType api.MessageType
 	return c.addMessageWithID(uuid.New().String(), source, messageType, payload)
 }
 
+// AddEphemeralMessage stores and broadcasts an agent message that is
+// display-only: it survives store snapshots and session replay in the
+// transcript, but LLM history seeding skips it. Used for locally handled
+// commands (/help, /mcp, /tools) whose output previously vanished from the
+// transcript on the next store snapshot.
+func (c *Agent) AddEphemeralMessage(source api.MessageSource, payload string) {
+	c.sendMessage(&api.Message{
+		ID:        uuid.New().String(),
+		Source:    source,
+		Type:      api.MessageTypeText,
+		Payload:   payload,
+		Timestamp: time.Now(),
+		Ephemeral: true,
+	})
+}
+
 // addMessageWithID is addMessage with a caller-chosen message ID. It is used
 // for the final text of a streamed iteration so it carries the same ID as the
 // live text-delta messages that preceded it (UIs then replace the streaming
@@ -1042,16 +1058,20 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 					c.maybeGenerateSessionTitle()
 				}
 				// The final thinking message replaces the live thinking-delta
-				// entry in UIs. It is not stored (reasoning is ephemeral and is
-				// already kept in the provider's history via the accumulator).
+				// entry in UIs. It is stored as an EPHEMERAL message so the
+				// transcript keeps it (collapsed "Thought for N lines" +
+				// Ctrl+T) across store snapshots and session replay, while
+				// LLM history seeding skips it (the provider keeps reasoning
+				// in its own history via the accumulator).
 				if streamedThinking != "" {
-					c.Output <- &api.Message{
+					c.sendMessage(&api.Message{
 						ID:        thinkStreamID,
 						Source:    api.MessageSourceModel,
 						Type:      api.MessageTypeThinking,
 						Payload:   streamedThinking,
 						Timestamp: time.Now(),
-					}
+						Ephemeral: true,
+					})
 				}
 				// If no function calls to be made, we're done
 				if len(functionCalls) == 0 {

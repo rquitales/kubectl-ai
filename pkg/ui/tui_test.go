@@ -994,6 +994,27 @@ func newBrowserModel() model {
 	return m
 }
 
+// wireEphemeral gives a test agent the store and output channel that
+// AddEphemeralMessage needs.
+func wireEphemeral(m *model) {
+	m.agent.Output = make(chan any, 10)
+	m.agent.Session.ChatMessageStore = sessions.NewInMemoryChatStore()
+}
+
+// drainEphemeral feeds n emitted agent messages back through the model's
+// message handler, mirroring the live reader goroutine.
+func drainEphemeral(t *testing.T, m *model, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		select {
+		case got := <-m.agent.Output:
+			m.handleAgentMsg(got.(*api.Message))
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for ephemeral message %d", i)
+		}
+	}
+}
+
 func TestBrowserOpensWithCurrentSessionSelected(t *testing.T) {
 	m := newBrowserModel()
 	m.openBrowser(testSessions())
@@ -1256,10 +1277,11 @@ func TestSlashCommandPassesThroughToAgent(t *testing.T) {
 func TestSlashHelpPrintsReferenceLocally(t *testing.T) {
 	for _, value := range []string{"/help", "/?"} {
 		m := newBrowserModel()
+		wireEphemeral(&m)
 		m.input.SetValue(value)
 
 		_, cmd := m.handleEnter()
-		// /help is handled locally: no command is sent to the agent.
+		// /help is handled locally: no command is sent to the agent's input.
 		if cmd != nil {
 			select {
 			case got := <-m.agent.Input:
@@ -1267,9 +1289,13 @@ func TestSlashHelpPrintsReferenceLocally(t *testing.T) {
 			case <-time.After(50 * time.Millisecond):
 			}
 		}
-		// A help message is appended to the transcript (user query + reference).
+		// The echo + reference arrive as ephemeral agent messages.
+		drainEphemeral(t, &m, 2)
 		if len(m.messages) != 2 {
 			t.Fatalf("%q: expected 2 transcript messages (query + help), got %d", value, len(m.messages))
+		}
+		if !m.messages[1].Ephemeral {
+			t.Errorf("%q: help message must be ephemeral (excluded from LLM history)", value)
 		}
 		help, ok := m.messages[1].Payload.(string)
 		if !ok {
@@ -1304,9 +1330,11 @@ func TestSlashMCPPrintsDetailsLocally(t *testing.T) {
 		},
 	}}
 	m := newModel(a)
+	wireEphemeral(&m)
 	m.input.SetValue("/mcp")
 
 	_, cmd := m.handleEnter()
+	drainEphemeral(t, &m, 2)
 	// /mcp is handled locally: no command is sent to the agent.
 	if cmd != nil {
 		select {
@@ -1338,8 +1366,10 @@ func TestSlashMCPPrintsDetailsLocally(t *testing.T) {
 func TestSlashMCPUnconfigured(t *testing.T) {
 	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateIdle}}
 	m := newModel(a)
+	wireEphemeral(&m)
 	m.input.SetValue("/mcp")
 	_, _ = m.handleEnter()
+	drainEphemeral(t, &m, 2)
 	if len(m.messages) != 2 {
 		t.Fatalf("expected 2 transcript messages, got %d", len(m.messages))
 	}
@@ -4157,5 +4187,35 @@ func TestTruncateCellsHandlesWideChars(t *testing.T) {
 	}
 	if got := truncateCells("ascii", 10); got != "ascii" {
 		t.Errorf("truncateCells short string = %q, want unchanged", got)
+	}
+}
+
+func TestFinalThinkingSurvivesStoreSnapshot(t *testing.T) {
+	// Regression: the final thinking message was never stored, so the next
+	// store snapshot (any subsequent message) wiped it — the collapsed
+	// "Thought for N lines" block and Ctrl+T expansion never appeared in
+	// real usage.
+	store := sessions.NewInMemoryChatStore()
+	a := &agent.Agent{Session: &api.Session{ID: "t", ModelID: "m", AgentState: api.AgentStateRunning, ChatMessageStore: store}, Output: make(chan any, 10)}
+	m := newModel(a)
+	m.width, m.height = 100, 40
+	m.resize()
+
+	// Live deltas accumulate an ephemeral entry...
+	m.handleAgentMsg(&api.Message{ID: "think-1", Source: api.MessageSourceModel, Type: api.MessageTypeThinkingDelta, Payload: "pondering"})
+	// ...then the final thinking message is STORED (ephemeral)...
+	store.AddChatMessage(&api.Message{ID: "think-1", Source: api.MessageSourceModel, Type: api.MessageTypeThinking, Payload: "pondering deeply", Ephemeral: true})
+	// ...and the next ordinary message triggers a store snapshot, which
+	// previously dropped the thinking entry.
+	m.handleAgentMsg(&api.Message{ID: "txt-1", Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "answer"})
+
+	found := false
+	for _, msg := range m.messages {
+		if msg.Type == api.MessageTypeThinking && msg.Payload == "pondering deeply" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("final thinking message did not survive the store snapshot")
 	}
 }

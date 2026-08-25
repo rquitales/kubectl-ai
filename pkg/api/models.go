@@ -75,6 +75,10 @@ type Message struct {
 	// provider for the LLM response that produced this message; 0 when the
 	// provider reported none. Only set on model text messages.
 	Tokens int
+	// Ephemeral marks messages that are persisted for transcript fidelity
+	// (thinking blocks, local command output like /help) but must never be
+	// fed back into the LLM's conversation history.
+	Ephemeral bool `json:"ephemeral,omitempty"`
 }
 
 type MessageSource string
