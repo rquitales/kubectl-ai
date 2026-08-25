@@ -356,9 +356,12 @@ type model struct {
 	// Kube context names for /context autocomplete, cached briefly.
 	contextNames     []string
 	contextNamesLast time.Time
-	// Cluster namespaces for /namespace autocomplete, cached briefly.
-	namespaceNames     []string
-	namespaceNamesLast time.Time
+	// Cluster namespaces for /namespace autocomplete, fetched async and
+	// cached briefly (errors are negative-cached with a shorter TTL).
+	namespaceNames      []string
+	namespaceNamesLast  time.Time
+	namespaceNamesErrAt time.Time
+	namespacesFetching  bool
 	// sessionID tracks the active session so switches are detectable.
 	sessionID string
 	// Kube context/namespace shown in the status bar; resolved once at
@@ -513,7 +516,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.EnableMouseCellMotion
 
 	case tea.KeyMsg:
-		return m.handleKey(msg)
+		m2, cmd := m.handleKey(msg)
+		// Opportunistically (async!) warm the namespace-completion cache when
+		// the draft is a /namespace command — never synchronously on this
+		// goroutine.
+		if cmd2 := m.maybeFetchNamespaces(); cmd2 != nil {
+			cmd = tea.Batch(cmd, cmd2)
+		}
+		return m2, cmd
 
 	case tea.MouseMsg:
 		return m.handleMouse(msg)
@@ -695,6 +705,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.pickerStatus = ""
+		m.updateViewportHeight()
+		return m, nil
+
+	case nsCompletionsMsg:
+		m.namespacesFetching = false
+		if msg.err != nil {
+			// Negative-cache: don't retry on every keystroke while the
+			// cluster is unreachable.
+			m.namespaceNamesErrAt = time.Now()
+			return m, nil
+		}
+		m.namespaceNames = msg.names
+		m.namespaceNamesLast = time.Now()
+		m.namespaceNamesErrAt = time.Time{}
+		// The completion hint may have appeared — re-budget the layout.
 		m.updateViewportHeight()
 		return m, nil
 	}
@@ -3968,16 +3993,9 @@ func (m *model) namespaceMatches() []string {
 	if m.agent == nil {
 		return nil
 	}
-	if time.Since(m.namespaceNamesLast) > 30*time.Second || m.namespaceNamesLast.IsZero() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		names, err := m.agent.ListNamespaces(ctx)
-		if err != nil {
-			return nil
-		}
-		m.namespaceNames = names
-		m.namespaceNamesLast = time.Now()
-	}
+	// Pure cache read: fetching happens asynchronously in
+	// maybeFetchNamespaces. This function is called on every keystroke and
+	// every render, so it must never block on the cluster.
 	var matches []string
 	for _, n := range m.namespaceNames {
 		if strings.HasPrefix(n, prefix) {
@@ -3985,6 +4003,40 @@ func (m *model) namespaceMatches() []string {
 		}
 	}
 	return matches
+}
+
+// nsCompletionsMsg carries the async result of a namespace-completion fetch.
+type nsCompletionsMsg struct {
+	names []string
+	err   error
+}
+
+// maybeFetchNamespaces returns a tea.Cmd that refreshes the namespace cache
+// in the background when the draft is a /namespace (or /ns) command and the
+// cache is stale. Successful results cache for 30s; failures are
+// negative-cached for 5s so an unreachable cluster doesn't retry on every
+// keystroke.
+func (m *model) maybeFetchNamespaces() tea.Cmd {
+	if m.agent == nil || m.namespacesFetching {
+		return nil
+	}
+	v := m.input.Value()
+	if !strings.HasPrefix(v, "/namespace ") && !strings.HasPrefix(v, "/ns ") {
+		return nil
+	}
+	if time.Since(m.namespaceNamesLast) < 30*time.Second && !m.namespaceNamesLast.IsZero() {
+		return nil
+	}
+	if time.Since(m.namespaceNamesErrAt) < 5*time.Second {
+		return nil
+	}
+	m.namespacesFetching = true
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		names, err := m.agent.ListNamespaces(ctx)
+		return nsCompletionsMsg{names: names, err: err}
+	}
 }
 
 // contextMatches returns kube context names matching the partial after
