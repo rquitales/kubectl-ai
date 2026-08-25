@@ -60,6 +60,9 @@ func BuildRootCommand(opt *Options) (*cobra.Command, error) {
 		Long:  "kubectl-ai is a command-line tool that allows you to interact with your Kubernetes cluster using natural language queries. It leverages large language models to understand your intent and translate it into kubectl",
 		Args:  cobra.MaximumNArgs(1), // Only one positional arg is allowed.
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if cmd.Flags().Changed("model") {
+				opt.ModelFlagSet = true
+			}
 			return RunRootCommand(cmd.Context(), *opt, args)
 		},
 	}
@@ -82,6 +85,10 @@ func BuildRootCommand(opt *Options) (*cobra.Command, error) {
 type Options struct {
 	ProviderID string `json:"llmProvider,omitempty"`
 	ModelID    string `json:"model,omitempty"`
+	// ModelFlagSet is true when --model was passed explicitly (not from the
+	// config file or default), so a resumed session's stored model must not
+	// override it.
+	ModelFlagSet bool `json:"-"`
 	// SkipPermissions is a flag to skip asking for confirmation before executing kubectl commands
 	// that modifies resources in the cluster.
 	SkipPermissions bool `json:"skipPermissions,omitempty"`
@@ -440,10 +447,35 @@ func RunRootCommand(ctx context.Context, opt Options, args []string) error {
 		return fmt.Errorf("failed to create session manager: %w", err)
 	}
 
+	// Resolve the resume target BEFORE pruning, so the startup sweep can't
+	// delete the very session being resumed (it may have no model-sourced
+	// messages yet, e.g. after an LLM error on the first turn).
+	if opt.ResumeSession != "" {
+		if opt.ResumeSession == "latest" {
+			session, err = sessionManager.GetLatestSession()
+			if err != nil {
+				return fmt.Errorf("failed to get latest session: %w", err)
+			}
+			if session == nil {
+				// No latest session found, create a new one
+				klog.Info("No previous session found to resume. Creating new session.")
+			}
+		} else {
+			session, err = sessionManager.FindSessionByID(opt.ResumeSession)
+			if err != nil {
+				return fmt.Errorf("session %s not found: %w", opt.ResumeSession, err)
+			}
+		}
+	}
+
 	// Sweep accumulated empty sessions (no real conversation) so the
 	// session list only contains sessions worth keeping.
 	if opt.SessionBackend == "filesystem" {
-		if pruned, err := sessionManager.PruneEmptySessions(); err != nil {
+		var exclude []string
+		if session != nil {
+			exclude = append(exclude, session.ID)
+		}
+		if pruned, err := sessionManager.PruneEmptySessions(exclude...); err != nil {
 			klog.Warningf("Failed to prune empty sessions: %v", err)
 		} else if pruned > 0 {
 			klog.Infof("Pruned %d empty session(s)", pruned)
@@ -465,6 +497,7 @@ func RunRootCommand(ctx context.Context, opt Options, args []string) error {
 
 		return &agent.Agent{
 			Model:              opt.ModelID,
+			ModelPinned:        opt.ModelFlagSet,
 			Provider:           opt.ProviderID,
 			Kubeconfig:         opt.KubeConfigPath,
 			LLM:                client,
@@ -489,24 +522,6 @@ func RunRootCommand(ctx context.Context, opt Options, args []string) error {
 
 	// Register cleanup for all sessions and agents
 	defer agentManager.Close()
-
-	if opt.ResumeSession != "" {
-		if opt.ResumeSession == "latest" {
-			session, err = sessionManager.GetLatestSession()
-			if err != nil {
-				return fmt.Errorf("failed to get latest session: %w", err)
-			}
-			if session == nil {
-				// No latest session found, create a new one
-				klog.Info("No previous session found to resume. Creating new session.")
-			}
-		} else {
-			session, err = sessionManager.FindSessionByID(opt.ResumeSession)
-			if err != nil {
-				return fmt.Errorf("session %s not found: %w", opt.ResumeSession, err)
-			}
-		}
-	}
 
 	var defaultAgent *agent.Agent
 
