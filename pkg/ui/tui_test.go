@@ -4036,3 +4036,31 @@ func TestNamespaceCompletionNeverBlocksOnCluster(t *testing.T) {
 		t.Error("expected negative caching to suppress an immediate refetch")
 	}
 }
+
+func TestExitStateQuitsProgram(t *testing.T) {
+	// Regression: /exit set AgentStateExited and closed Output, but nothing
+	// ever returned tea.Quit — the TUI kept running as a zombie.
+	a := &agent.Agent{Session: &api.Session{ID: "test", AgentState: api.AgentStateExited}}
+	m := newModel(a)
+	m.width, m.height = 100, 40
+	m.resize()
+
+	_, cmd := m.handleAgentMsg(&api.Message{
+		Source:  api.MessageSourceAgent,
+		Type:    api.MessageTypeText,
+		Payload: "It has been a pleasure assisting you. Have a great day!",
+	})
+	if cmd == nil {
+		t.Fatal("expected a quit command when the agent state is Exited")
+	}
+	if msg := cmd(); msg == nil {
+		t.Fatal("expected the command to produce quit-related messages")
+	}
+
+	// The channel-close path quits too.
+	m2 := newModel(a)
+	_, cmd2 := m2.Update(agentExitedMsg{})
+	if cmd2 == nil {
+		t.Fatal("expected a quit command on agentExitedMsg")
+	}
+}

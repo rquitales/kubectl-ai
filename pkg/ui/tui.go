@@ -163,6 +163,9 @@ func (u *TUI) Run(ctx context.Context) error {
 				return
 			case msg, ok := <-u.agent.Output:
 				if !ok {
+					// Agent loop returned and closed the channel (e.g.
+					// /exit) — make sure the program actually quits.
+					u.program.Send(agentExitedMsg{})
 					return
 				}
 				u.program.Send(msg)
@@ -524,6 +527,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmd = tea.Batch(cmd, cmd2)
 		}
 		return m2, cmd
+
+	case agentExitedMsg:
+		m.quitting = true
+		return m, tea.Batch(tea.Quit, tea.DisableMouse)
 
 	case tea.MouseMsg:
 		return m.handleMouse(msg)
@@ -2601,6 +2608,14 @@ func (m *model) handleAgentMsg(msg *api.Message) (tea.Model, tea.Cmd) {
 		return m, m.spinner.Tick
 	}
 
+	// The agent exited (/exit, /quit, palette "Quit"): the farewell message
+	// has been processed above, so leave now instead of idling as a zombie
+	// UI that swallows input into a channel nobody reads.
+	if session.AgentState == api.AgentStateExited {
+		m.quitting = true
+		return m, tea.Batch(tea.Quit, tea.DisableMouse)
+	}
+
 	// A turn just finished (idle/done). A /context or /namespace meta
 	// command may have changed the active kubeconfig override; refresh
 	// the status bar's kube context immediately instead of waiting up to
@@ -2609,6 +2624,11 @@ func (m *model) handleAgentMsg(msg *api.Message) (tea.Model, tea.Cmd) {
 
 	return m, nil
 }
+
+// agentExitedMsg is sent by the output-reader goroutine when the agent
+// closes its Output channel (agent loop returned) without a final message
+// carrying the Exited state — e.g. some RunOnce/quiet paths.
+type agentExitedMsg struct{}
 
 func (m *model) refresh() {
 	if !m.dirty {
