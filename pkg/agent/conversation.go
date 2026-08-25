@@ -2264,9 +2264,12 @@ func (c *Agent) DispatchToolCalls(ctx context.Context) error {
 			return err
 		}
 
-		// Handle timeout message using UI blocks
+		// Note the timeout AFTER the response, not between the request and
+		// it: a mid-pair error message breaks the transcript's
+		// request/response grouping (the request box would spin forever).
+		timedOut := false
 		if execResult, ok := output.(*sandbox.ExecResult); ok && execResult != nil && execResult.StreamType == "timeout" {
-			c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "\nTimeout reached after 7 seconds\n")
+			timedOut = true
 		}
 		// Add the tool call result to maintain conversation flow
 		var payload any
@@ -2299,6 +2302,9 @@ func (c *Agent) DispatchToolCalls(ctx context.Context) error {
 		// representative.
 		payload = capToolResultOutput(payload)
 		c.addMessage(api.MessageSourceAgent, api.MessageTypeToolCallResponse, payload)
+		if timedOut {
+			c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "\nTimeout reached after 7 seconds\n")
+		}
 	}
 	return nil
 }

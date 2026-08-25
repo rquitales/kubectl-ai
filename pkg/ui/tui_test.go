@@ -4407,3 +4407,54 @@ func TestShellModeTrimsLeadingWhitespace(t *testing.T) {
 		t.Error("shellMode must trim leading whitespace (the agent does)")
 	}
 }
+
+func TestWheelScrollsOpenPanelNotTranscript(t *testing.T) {
+	m := newBrowserModel()
+	for i := 0; i < 10; i++ {
+		m.browserSessions = append(m.browserSessions, api.SessionInfo{ID: fmt.Sprintf("s%d", i)})
+	}
+	m.browserOpen = true
+	m.browserIndex = 5
+
+	m.handleMouse(tea.MouseMsg{Button: tea.MouseButtonWheelUp})
+	if m.browserIndex != 4 {
+		t.Errorf("wheel-up with browser open: index = %d, want 4", m.browserIndex)
+	}
+	m.handleMouse(tea.MouseMsg{Button: tea.MouseButtonWheelDown})
+	m.handleMouse(tea.MouseMsg{Button: tea.MouseButtonWheelDown})
+	if m.browserIndex != 6 {
+		t.Errorf("wheel-down with browser open: index = %d, want 6", m.browserIndex)
+	}
+}
+
+func TestWheelRevealsAndRehidesClearedTranscript(t *testing.T) {
+	m := newBrowserModel()
+	for i := 0; i < 40; i++ {
+		m.messages = append(m.messages, &api.Message{Source: api.MessageSourceAgent, Type: api.MessageTypeText, Payload: fmt.Sprintf("line %d", i)})
+	}
+	m.dirty = true
+	m.refresh()
+	m.viewport.GotoBottom()
+
+	// Clear, then wheel up: history reveals (previously only PgUp did this).
+	m.clearedAt = 30
+	m.refresh()
+	m.handleMouse(tea.MouseMsg{Button: tea.MouseButtonWheelUp})
+	if !m.revealAll {
+		t.Error("wheel-up after Ctrl+L should reveal the hidden transcript")
+	}
+}
+
+func TestCtrlLExcludesTrailingStreamDelta(t *testing.T) {
+	// The in-flight reply's delta entry must not count toward the clear
+	// boundary — its final message (same ID) would land above the marker.
+	m := newBrowserModel()
+	m.messages = append(m.messages,
+		&api.Message{ID: "u1", Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "q"},
+		&api.Message{ID: "s1", Source: api.MessageSourceModel, Type: api.MessageTypeTextDelta, Payload: "streaming…"},
+	)
+	m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlL})
+	if m.clearedAt != 1 {
+		t.Errorf("clearedAt = %d, want 1 (the ephemeral delta entry excluded)", m.clearedAt)
+	}
+}
