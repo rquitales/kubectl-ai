@@ -3752,6 +3752,16 @@ func TestNamespaceAutocomplete(t *testing.T) {
 		t.Errorf("expected no matches outside /namespace, got %v", got)
 	}
 
+	// The cache starts cold; warm it via the async fetch path (Update has a
+	// value receiver, so apply the returned model).
+	m.input.SetValue("/namespace ")
+	fetchCmd := m.maybeFetchNamespaces()
+	if fetchCmd == nil {
+		t.Fatal("expected a namespace fetch to be triggered for a /namespace draft")
+	}
+	updated, _ := m.Update(fetchCmd())
+	m = updated.(model)
+
 	// Prefix matches and hint.
 	m.input.SetValue("/namespace pay")
 	if got := m.namespaceMatches(); len(got) != 1 || got[0] != "payments" {
@@ -3972,5 +3982,57 @@ func TestChoiceKindStoredFromRequest(t *testing.T) {
 	}
 	if m.choiceType != "model" {
 		t.Errorf("choiceType = %q, want %q", m.choiceType, "model")
+	}
+}
+
+type slowExecutor struct{ delay time.Duration }
+
+func (e *slowExecutor) Execute(ctx context.Context, _ string, _ []string, _ string) (*sandbox.ExecResult, error) {
+	select {
+	case <-time.After(e.delay):
+		return &sandbox.ExecResult{Stdout: "default\n"}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (e *slowExecutor) Close(ctx context.Context) error { return nil }
+
+func TestNamespaceCompletionNeverBlocksOnCluster(t *testing.T) {
+	// Regression: namespaceMatches used to shell out to kubectl synchronously
+	// on the UI goroutine (10s timeout, no negative caching), freezing all
+	// input/rendering on slow or unreachable clusters.
+	a := &agent.Agent{
+		Session:  &api.Session{ID: "test", AgentState: api.AgentStateIdle},
+		Executor: &slowExecutor{delay: 10 * time.Second},
+	}
+	m := newModel(a)
+	m.width, m.height = 100, 40
+	m.resize()
+	m.input.SetValue("/namespace pay")
+
+	start := time.Now()
+	for i := 0; i < 100; i++ {
+		_ = m.namespaceMatches()
+		_ = m.completionHintVisible()
+		_ = m.completionHint()
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("300 completion-path calls took %v; the UI goroutine must never block on the cluster", elapsed)
+	}
+
+	// The fetch is triggered asynchronously instead.
+	if cmd := m.maybeFetchNamespaces(); cmd == nil {
+		t.Fatal("expected an async fetch to be triggered")
+	}
+
+	// An error result is negative-cached: no immediate refetch.
+	m2, _ := m.Update(nsCompletionsMsg{err: fmt.Errorf("cluster unreachable")})
+	m = m2.(model)
+	if m.namespacesFetching {
+		t.Error("fetching flag should clear on result")
+	}
+	if cmd := m.maybeFetchNamespaces(); cmd != nil {
+		t.Error("expected negative caching to suppress an immediate refetch")
 	}
 }
