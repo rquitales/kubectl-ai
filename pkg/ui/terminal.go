@@ -80,6 +80,11 @@ type TerminalUI struct {
 	// showToolOutput disables truncation of tool output.
 	showToolOutput bool
 
+	// streamPrinted tracks how much of each live stream (keyed by message
+	// ID) has been printed, so text deltas print only their new suffix and
+	// the final message doesn't re-print the whole reply.
+	streamPrinted map[string]int
+
 	agent *agent.Agent
 }
 
@@ -135,6 +140,7 @@ func NewTerminalUI(agent *agent.Agent, useTTYForInput bool, showToolOutput bool,
 		useTTYForInput:   useTTYForInput, // Store this flag
 		agent:            agent,
 		showToolOutput:   showToolOutput,
+		streamPrinted:    make(map[string]int),
 	}
 
 	return u, nil
@@ -248,8 +254,42 @@ func (u *TerminalUI) handleMessage(msg *api.Message) {
 	var styleOptions []styleOption
 
 	switch msg.Type {
+	case api.MessageTypeTextDelta:
+		// Live-streamed model text: the payload is cumulative, so print only
+		// the new suffix. The final (stored) message carries the same ID and
+		// only adds a trailing newline — the content is already on screen.
+		payload, ok := msg.Payload.(string)
+		if !ok {
+			return
+		}
+		printed := u.streamPrinted[msg.ID]
+		if len(payload) > printed {
+			fmt.Print(payload[printed:])
+			u.streamPrinted[msg.ID] = len(payload)
+		}
+		return
+	case api.MessageTypeThinkingDelta:
+		// Live reasoning deltas stay silent on the plain CLI.
+		return
+	case api.MessageTypeThinking:
+		// The final thinking block: a one-line note, not the full trace.
+		payload, _ := msg.Payload.(string)
+		lines := strings.Count(payload, "\n") + 1
+		fmt.Printf("\033[90m💭 thought for %d lines\033[0m\n", lines)
+		return
 	case api.MessageTypeText:
-		text = msg.Payload.(string)
+		payload, ok := msg.Payload.(string)
+		if !ok {
+			return
+		}
+		// The final message of a live stream only closes the line — its
+		// content was printed via the deltas.
+		if _, streamed := u.streamPrinted[msg.ID]; streamed && msg.Source == api.MessageSourceModel {
+			delete(u.streamPrinted, msg.ID)
+			fmt.Println()
+			return
+		}
+		text = payload
 		switch msg.Source {
 		case api.MessageSourceUser:
 			// styleOptions = append(styleOptions, Foreground(ColorWhite))
@@ -262,10 +302,18 @@ func (u *TerminalUI) handleMessage(msg *api.Message) {
 		}
 	case api.MessageTypeError:
 		styleOptions = append(styleOptions, foreground(colorRed))
-		text = msg.Payload.(string)
+		payload, ok := msg.Payload.(string)
+		if !ok {
+			return
+		}
+		text = sanitizeTerminal(payload)
 	case api.MessageTypeToolCallRequest:
 		styleOptions = append(styleOptions, foreground(colorGreen))
-		text = fmt.Sprintf("\n  Running: %s\n", msg.Payload.(string))
+		payload, ok := msg.Payload.(string)
+		if !ok {
+			return
+		}
+		text = fmt.Sprintf("\n  Running: %s\n", payload)
 	case api.MessageTypeToolCallResponse:
 		if !u.showToolOutput {
 			return
@@ -279,7 +327,7 @@ func (u *TerminalUI) handleMessage(msg *api.Message) {
 			return
 		}
 
-		responseText := formatToolCallResponse(output)
+		responseText := sanitizeTerminal(formatToolCallResponse(output))
 		text = fmt.Sprintf("%s\n", responseText)
 
 	case api.MessageTypeUserInputRequest:
@@ -416,6 +464,15 @@ func (u *TerminalUI) handleMessage(msg *api.Message) {
 			if input == "n" || input == "no" {
 				input = "3"
 			}
+			// "a" maps to the "Always allow <tool>" option when one exists.
+			if input == "a" || input == "always" {
+				for i, opt := range choiceRequest.Options {
+					if strings.HasPrefix(opt.Value, "always_allow_") {
+						input = strconv.Itoa(i + 1)
+						break
+					}
+				}
+			}
 
 			choiceIdx, err := strconv.Atoi(input)
 			if err == nil && choiceIdx > 0 && choiceIdx <= len(choiceRequest.Options) {
@@ -427,6 +484,39 @@ func (u *TerminalUI) handleMessage(msg *api.Message) {
 		}
 		u.agent.Input <- &api.UserChoiceResponse{Choice: choice}
 		return
+	case api.MessageTypeSessionPickerRequest:
+		// Without this the agent waits in WaitingForInput forever and the
+		// user sees nothing but a log warning.
+		req, ok := msg.Payload.(*api.SessionPickerRequest)
+		if !ok {
+			return
+		}
+		fmt.Println("\nSessions:")
+		for i, s := range req.Sessions {
+			label := fmt.Sprintf("%s (%s) • %d msgs", s.ID, s.ModelID, s.MessageCount)
+			if s.Name != "" {
+				label = fmt.Sprintf("%s (%s) • %s • %d msgs", s.Name, s.ModelID, s.ID, s.MessageCount)
+			}
+			fmt.Printf("  %d. %s\n", i+1, label)
+		}
+		fmt.Println()
+		for {
+			line, ok := u.readInputLine("Enter session number (or 'c' to cancel): ")
+			if !ok {
+				return
+			}
+			input := strings.TrimSpace(strings.ToLower(line))
+			if input == "c" || input == "cancel" || input == "" {
+				u.agent.Input <- &api.SessionPickerResponse{Cancelled: true}
+				return
+			}
+			idx, err := strconv.Atoi(input)
+			if err == nil && idx > 0 && idx <= len(req.Sessions) {
+				u.agent.Input <- &api.SessionPickerResponse{SessionID: req.Sessions[idx-1].ID}
+				return
+			}
+			fmt.Println("Invalid choice. Please try again.")
+		}
 	default:
 		klog.Warningf("unsupported message type: %v", msg.Type)
 		return
@@ -469,6 +559,49 @@ func (u *TerminalUI) handleMessage(msg *api.Message) {
 
 func (u *TerminalUI) ClearScreen() {
 	fmt.Print("\033[H\033[2J")
+}
+
+// readInputLine reads one input line from readline (or /dev/tty when stdin
+// was consumed by the initial query). ok=false means the user aborted
+// (Ctrl+C/Ctrl+D) or a read error occurred — the agent has been notified.
+func (u *TerminalUI) readInputLine(prompt string) (string, bool) {
+	if u.useTTYForInput {
+		tReader, err := u.ttyReader()
+		if err != nil {
+			klog.Errorf("Failed to get TTY reader: %v", err)
+			return "", false
+		}
+		fmt.Print(prompt)
+		line, err := tReader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				u.agent.Input <- io.EOF
+			} else {
+				u.agent.Input <- fmt.Errorf("error reading from TTY: %w", err)
+			}
+			return "", false
+		}
+		return line, true
+	}
+	rlInstance, err := u.readlineInstance()
+	if err != nil {
+		klog.Errorf("Failed to create readline instance: %v", err)
+		u.agent.Input <- fmt.Errorf("error creating readline instance: %w", err)
+		return "", false
+	}
+	rlInstance.SetPrompt(prompt)
+	line, err := rlInstance.Readline()
+	if err != nil {
+		klog.Infof("Readline error: %v", err)
+		switch err {
+		case readline.ErrInterrupt, io.EOF:
+			u.agent.Input <- io.EOF
+		default:
+			u.agent.Input <- err
+		}
+		return "", false
+	}
+	return line, true
 }
 
 func formatToolCallResponse(payload map[string]any) string {
