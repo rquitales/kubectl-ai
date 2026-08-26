@@ -282,10 +282,15 @@ func (u *TerminalUI) handleMessage(msg *api.Message) {
 		if !ok {
 			return
 		}
-		// The final message of a live stream only closes the line — its
-		// content was printed via the deltas.
-		if _, streamed := u.streamPrinted[msg.ID]; streamed && msg.Source == api.MessageSourceModel {
+		// The final message of a live stream: the agent throttles delta
+		// emission, so the tail between the last delta and the complete
+		// text may never have streamed — print the missing suffix, then
+		// close the line. (No full re-render: that would duplicate.)
+		if printed, streamed := u.streamPrinted[msg.ID]; streamed && msg.Source == api.MessageSourceModel {
 			delete(u.streamPrinted, msg.ID)
+			if len(payload) > printed {
+				fmt.Print(payload[printed:])
+			}
 			fmt.Println()
 			return
 		}

@@ -102,3 +102,23 @@ func TestTerminalUISafeOnNonStringPayloads(t *testing.T) {
 		u.handleMessage(&api.Message{Source: api.MessageSourceAgent, Type: api.MessageTypeToolCallRequest, Payload: nil})
 	})
 }
+
+func TestTerminalUIFinalMessagePrintsUnstreamedTail(t *testing.T) {
+	// Regression: the agent throttles delta emission (150ms), so the tail
+	// between the last delta and the final message may never stream. The
+	// final message must print that missing suffix, not just close the line.
+	u := newTestTerminalUI(t)
+
+	out := captureStdout(t, func() {
+		u.handleMessage(&api.Message{ID: "s1", Source: api.MessageSourceModel, Type: api.MessageTypeTextDelta, Payload: "Here's "})
+		// No more deltas (throttled) — the final message carries the rest.
+		u.handleMessage(&api.Message{ID: "s1", Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "Here's the full answer."})
+	})
+
+	if !strings.Contains(out, "the full answer.") {
+		t.Errorf("unstreamed tail lost — output was %q", out)
+	}
+	if got := strings.Count(out, "Here's "); got != 1 {
+		t.Errorf("streamed prefix duplicated: %q", out)
+	}
+}
