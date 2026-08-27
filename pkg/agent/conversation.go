@@ -162,6 +162,14 @@ type Agent struct {
 	// choice request is outstanding; the next UserChoiceResponse resolves it.
 	pendingIterationContinue bool
 
+	// contextCompactedThisTurn tracks the one-shot auto-compact recovery on
+	// context-length errors (at most once per turn).
+	contextCompactedThisTurn bool
+	// currTurnQuery holds the user query that started the current turn, so
+	// the context-overflow recovery can restart the turn after compaction
+	// (currChatContent is cleared once streaming begins).
+	currTurnQuery any
+
 	// titleAttempted ensures an LLM-generated session title is requested at
 	// most once per agent lifetime.
 	titleAttempted bool
@@ -659,6 +667,8 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 				c.setAgentState(api.AgentStateRunning)
 				runCtx = c.StartRun(ctx)
 				c.currIteration = 0
+				c.contextCompactedThisTurn = false
+				c.currTurnQuery = initialQuery
 				c.currChatContent = []any{initialQuery}
 				c.pendingFunctionCalls = []ToolCallAnalysis{}
 			}
@@ -766,6 +776,8 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 					c.setAgentState(api.AgentStateRunning)
 					runCtx = c.StartRun(ctx)
 					c.currIteration = 0
+					c.contextCompactedThisTurn = false
+					c.currTurnQuery = llmQuery
 					// Preserve any pending observations (e.g. shell escape
 					// output) so the LLM sees them with this query.
 					c.currChatContent = append(c.currChatContent, llmQuery)
@@ -918,6 +930,9 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 				// we run the agentic loop for one iteration
 				stream, err := c.llmChat.SendStreaming(runCtx, c.currChatContent...)
 				if err != nil {
+					if c.recoverContextLength(ctx, err) {
+						continue
+					}
 					log.Error(err, "error sending streaming LLM response")
 					c.setAgentState(api.AgentStateDone)
 					c.pendingFunctionCalls = []ToolCallAnalysis{}
@@ -1059,6 +1074,9 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 					}
 				}
 				if llmError != nil {
+					if c.recoverContextLength(ctx, llmError) {
+						continue
+					}
 					log.Error(llmError, "error streaming LLM response")
 					c.setAgentState(api.AgentStateDone)
 					c.pendingFunctionCalls = []ToolCallAnalysis{}
@@ -1531,6 +1549,45 @@ func (c *Agent) compactConversation(ctx context.Context) (answer string, handled
 		return "Nothing to compact yet.", true, nil
 	}
 
+	// Surface an ephemeral status message so the user sees the compact is
+	// in progress (the summarization LLM call can take a few seconds and
+	// otherwise appears to hang with no feedback). It goes straight to the
+	// output channel and is NOT stored, so an LLM error leaves the history
+	// intact and the message vanishes on the next snapshot.
+	c.Output <- &api.Message{
+		Source:    api.MessageSourceAgent,
+		Type:      api.MessageTypeText,
+		Payload:   "⏳ Compacting conversation…",
+		Timestamp: time.Now(),
+	}
+	// Flip to Running so the TUI shows the spinner (and the bottom-divider
+	// scroll cue) during the summarization call, then back to Done so the
+	// input box returns. The call runs on a run context so Esc interrupts
+	// it for real (CancelRun cancels runCtx).
+	runCtx := c.StartRun(ctx)
+	c.setAgentState(api.AgentStateRunning)
+	defer func() {
+		c.endRun()
+		c.setAgentState(api.AgentStateDone)
+	}()
+
+	_, err = c.doCompact(runCtx, messages)
+	if err != nil {
+		if runCtx.Err() != nil {
+			return "⚠ Compact interrupted.", true, nil
+		}
+		return "", false, err
+	}
+
+	return fmt.Sprintf("Conversation compacted (~%d messages summarized).", len(messages)), true, nil
+}
+
+// doCompact performs the compaction itself: summarize the messages, replace
+// the stored history with the summary, and re-initialize the chat. The
+// transcript excludes ephemeral/display-only messages and renders tool
+// calls/results explicitly so the record of actions taken survives.
+func (c *Agent) doCompact(ctx context.Context, messages []*api.Message) (string, error) {
+
 	// Build a plain-text transcript of the conversation, keeping at most the
 	// last ~100KB so the summarization request stays a reasonable size.
 	// Ephemeral/display-only messages (thinking, /help output) are excluded;
@@ -1570,29 +1627,7 @@ func (c *Agent) compactConversation(ctx context.Context) (answer string, handled
 		conversation = conversation[cut:]
 	}
 
-	// Surface an ephemeral status message so the user sees the compact is
-	// in progress (the summarization LLM call can take a few seconds and
-	// otherwise appears to hang with no feedback). It goes straight to the
-	// output channel and is NOT stored, so an LLM error leaves the history
-	// intact and the message vanishes on the next snapshot.
-	c.Output <- &api.Message{
-		Source:    api.MessageSourceAgent,
-		Type:      api.MessageTypeText,
-		Payload:   "⏳ Compacting conversation…",
-		Timestamp: time.Now(),
-	}
-	// Flip to Running so the TUI shows the spinner (and the bottom-divider
-	// scroll cue) during the summarization call, then back to Done so the
-	// input box returns. The call runs on a run context so Esc interrupts
-	// it for real (CancelRun cancels runCtx).
-	runCtx := c.StartRun(ctx)
-	c.setAgentState(api.AgentStateRunning)
-	defer func() {
-		c.endRun()
-		c.setAgentState(api.AgentStateDone)
-	}()
-
-	completion, err := c.LLM.GenerateCompletion(runCtx, &gollm.CompletionRequest{
+	completion, err := c.LLM.GenerateCompletion(ctx, &gollm.CompletionRequest{
 		Model: c.Model,
 		Prompt: `Summarize this Kubernetes debugging/operations conversation so the task can continue without losing state.
 
@@ -1609,20 +1644,17 @@ Conversation:
 ` + conversation,
 	})
 	if err != nil {
-		if runCtx.Err() != nil {
-			return "⚠ Compact interrupted.", true, nil
-		}
-		return "", false, fmt.Errorf("summarizing conversation: %w", err)
+		return "", fmt.Errorf("summarizing conversation: %w", err)
 	}
 	summary := strings.TrimSpace(completion.Response())
 	if summary == "" {
-		return "", false, fmt.Errorf("summarizing conversation: empty response from LLM")
+		return "", fmt.Errorf("summarizing conversation: empty response from LLM")
 	}
 
 	c.sessionMu.Lock()
 	if err := c.Session.ChatMessageStore.ClearChatMessages(); err != nil {
 		c.sessionMu.Unlock()
-		return "Failed to compact the conversation", false, err
+		return "", fmt.Errorf("failed to compact the conversation: %w", err)
 	}
 	c.sessionMu.Unlock()
 
@@ -1636,11 +1668,11 @@ Conversation:
 	c.sessionMu.Lock()
 	if err := c.llmChat.Initialize(c.Session.ChatMessageStore.ChatMessages()); err != nil {
 		c.sessionMu.Unlock()
-		return "", false, fmt.Errorf("re-initializing chat after compact: %w", err)
+		return "", fmt.Errorf("re-initializing chat after compact: %w", err)
 	}
 	c.sessionMu.Unlock()
 
-	return fmt.Sprintf("Conversation compacted (~%d messages summarized).", len(messages)), true, nil
+	return summary, nil
 }
 
 // createAndSwitchSession creates a new session, switches the agent to it,
@@ -2398,6 +2430,59 @@ func (c *Agent) DispatchToolCalls(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// recoverContextLength auto-compacts the conversation and restarts the
+// current turn when the provider reports the context window is full
+// (at most once per turn; works in RunOnce too — unattended jobs need it
+// most). Returns true when the turn should retry.
+func (c *Agent) recoverContextLength(ctx context.Context, err error) bool {
+	if err == nil || c.contextCompactedThisTurn {
+		return false
+	}
+	if !looksLikeContextLengthError(err) {
+		return false
+	}
+	c.contextCompactedThisTurn = true
+
+	firstContent := c.currTurnQuery // the original user query
+	if firstContent == nil {
+		return false
+	}
+	c.sessionMu.Lock()
+	messages := c.Session.ChatMessageStore.ChatMessages()
+	c.sessionMu.Unlock()
+	if len(messages) == 0 {
+		return false
+	}
+	if _, cerr := c.doCompact(ctx, messages); cerr != nil {
+		klog.Warningf("auto-compact on context-length error failed: %v", cerr)
+		return false
+	}
+	c.addMessage(api.MessageSourceAgent, api.MessageTypeText, "⚠ Context window was full — compacted the conversation; retrying your request.")
+	c.currChatContent = []any{firstContent}
+	c.pendingFunctionCalls = []ToolCallAnalysis{}
+	c.setAgentState(api.AgentStateRunning)
+	return true
+}
+
+// looksLikeContextLengthError matches the common provider phrasings of a
+// context-window overflow.
+func looksLikeContextLengthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, needle := range []string{
+		"context length", "context_length", "maximum context", "context window",
+		"prompt is too long", "too many tokens", "request too large",
+		"input is too long", "reduce the length",
+	} {
+		if strings.Contains(msg, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 // appendToolResult adds a tool call's result to the LLM-bound content,
