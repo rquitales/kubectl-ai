@@ -40,8 +40,28 @@ func (jrt *journalingRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 	// Log the outgoing request — with credentials redacted: trace files and
 	// V(2) logs previously recorded Authorization/x-api-key headers in
 	// plaintext.
+	//
+	// Read and restore the body ourselves: req.Clone shares the Body reader,
+	// so DumpRequestOut on a clone drains the REAL request's body (the actual
+	// call then went out with ContentLength set but an empty body → API 400s).
+	var bodyBytes []byte
+	if req.Body != nil && req.Body != http.NoBody {
+		var err error
+		bodyBytes, err = io.ReadAll(req.Body)
+		req.Body.Close()
+		if err != nil {
+			klog.Errorf("Error reading request body (for logging): %v", err)
+		}
+		// Restore the body for the real network call.
+		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		req.ContentLength = int64(len(bodyBytes))
+	}
 	reqForLog := req.Clone(req.Context())
 	reqForLog.Header = req.Header.Clone()
+	if bodyBytes != nil {
+		reqForLog.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		reqForLog.ContentLength = int64(len(bodyBytes))
+	}
 	for _, h := range []string{"Authorization", "X-Api-Key", "X-Goog-Api-Key", "Api-Key", "X-Amz-Security-Token"} {
 		if reqForLog.Header.Get(h) != "" {
 			reqForLog.Header.Set(h, "REDACTED")
@@ -95,7 +115,7 @@ func (jrt *journalingRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 	}
 
 	// Read the entire response body so we can log it and then pass it along.
-	bodyBytes, err := io.ReadAll(resp.Body)
+	respBodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		// handle error
 		klog.Errorf("Error reading response body (for logging): %v", err)
@@ -107,7 +127,7 @@ func (jrt *journalingRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 	logPayload := map[string]any{
 		"status":  resp.Status,
 		"headers": resp.Header,
-		"body":    string(bodyBytes),
+		"body":    string(respBodyBytes),
 	}
 
 	// Write the final event to the journal.
@@ -121,7 +141,7 @@ func (jrt *journalingRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 	}
 
 	// IMPORTANT: Return the original, untouched body to the client.
-	resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+	resp.Body = io.NopCloser(bytes.NewBuffer(respBodyBytes))
 	return resp, nil
 }
 

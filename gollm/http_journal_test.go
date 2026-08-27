@@ -114,3 +114,42 @@ func TestJournalTeesStreamInsteadOfBuffering(t *testing.T) {
 		t.Error("streamed body was not journaled after completion")
 	}
 }
+
+func TestJournalPreservesRequestBodyForTheRealCall(t *testing.T) {
+	// Regression: dumping a shallow-cloned request drained the shared Body —
+	// the real API call went out with ContentLength set but an empty body,
+	// and providers rejected it with 400s.
+	rec := &captureRecorder{}
+	var gotBody []byte
+	jrt := &journalingRoundTripper{next: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		var err error
+		gotBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("downstream read: %v", err)
+		}
+		return &http.Response{
+			Status: "200 OK",
+			Header: http.Header{},
+			Body:   io.NopCloser(strings.NewReader(`{}`)),
+		}, nil
+	})}
+
+	payload := `{"model":"kimi","messages":[{"role":"user","content":"hello"}]}`
+	req, _ := http.NewRequest("POST", "https://api.example.com/v1/chat", strings.NewReader(payload))
+	req.Header.Set("Authorization", "Bearer sk-secret")
+	req = req.WithContext(journal.ContextWithRecorder(req.Context(), rec))
+
+	resp, err := jrt.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	resp.Body.Close()
+
+	if string(gotBody) != payload {
+		t.Errorf("downstream received body %q, want the full %d-byte payload", gotBody, len(payload))
+	}
+	// And the log still got the (redacted) request.
+	if len(rec.events) == 0 {
+		t.Fatal("no request event recorded")
+	}
+}
