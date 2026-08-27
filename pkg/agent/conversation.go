@@ -2356,13 +2356,17 @@ func (c *Agent) DispatchToolCalls(ctx context.Context) error {
 		if execResult, ok := output.(*sandbox.ExecResult); ok && execResult != nil && execResult.StreamType == "timeout" {
 			timedOut = true
 		}
-		// Add the tool call result to maintain conversation flow
+		// Cap oversized tool output BEFORE it reaches the model — a massive
+		// stdout (kubectl get -A across many clusters) otherwise floods the
+		// context window (the turn then dies on context-length errors), and
+		// the in-memory provider history retains it for the whole process.
+		// The same capped copy goes to the store/UI.
 		var payload any
 		if c.EnableToolUseShim {
 			// Add the error as an observation
-			observation := fmt.Sprintf("Result of running %q:\n%v",
+			observation := capToolResultOutput(fmt.Sprintf("Result of running %q:\n%v",
 				call.FunctionCall.Name,
-				output)
+				output))
 			c.currChatContent = append(c.currChatContent, observation)
 			payload = observation
 		} else {
@@ -2373,16 +2377,10 @@ func (c *Agent) DispatchToolCalls(ctx context.Context) error {
 				c.appendToolResult(call.FunctionCall, map[string]any{"error": err.Error()})
 				continue
 			}
-			payload = result
-			c.appendToolResult(call.FunctionCall, result)
+			capped, _ := capToolResultOutput(result).(map[string]any)
+			payload = capped
+			c.appendToolResult(call.FunctionCall, capped)
 		}
-		// Cap oversized tool output before it enters the session history so a
-		// massive stdout (e.g. kubectl get -A across many clusters) can't
-		// bloat the context and brick the session past the model's context
-		// limit. The full output was already delivered to the LLM via
-		// currChatContent above; the stored/Ui copy only needs to be
-		// representative.
-		payload = capToolResultOutput(payload)
 		c.addMessage(api.MessageSourceAgent, api.MessageTypeToolCallResponse, payload)
 		if timedOut {
 			c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "\nTimeout reached after 7 seconds\n")
@@ -2425,7 +2423,9 @@ func capToolResultOutput(payload any) any {
 		}
 		return p
 	case map[string]any:
-		for _, k := range []string{"stdout", "stderr"} {
+		// MCP tool results arrive under "content" — include it so chatty
+		// MCP servers can't flood the context either.
+		for _, k := range []string{"stdout", "stderr", "content"} {
 			if s, ok := p[k].(string); ok && len(s) > maxToolOutputBytes {
 				p[k] = s[:maxToolOutputBytes] + fmt.Sprintf("\n[+%d bytes truncated]\n", len(s)-maxToolOutputBytes)
 			}

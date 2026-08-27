@@ -1639,3 +1639,60 @@ func TestAgent_LoadSession_PinnedModelWins(t *testing.T) {
 		t.Errorf("Model = %q, want pinned %q", a.Model, "flag-model")
 	}
 }
+
+func TestLLMBoundToolOutputIsCapped(t *testing.T) {
+	// Regression: the cap only applied to the stored copy — the multi-MB
+	// output went verbatim into currChatContent (and thus the next
+	// SendStreaming and the provider's in-memory history).
+	a := &Agent{
+		Session: &api.Session{ChatMessageStore: sessions.NewInMemoryChatStore()},
+		workDir: t.TempDir(),
+		Output:  make(chan any, 10),
+	}
+	go func() {
+		for range a.Output {
+		}
+	}()
+
+	var toolset tools.Tools
+	toolset.Init()
+	toolset.RegisterTool(&bigOutputTool{})
+	a.Tools = toolset
+
+	// Drive the dispatch path with a real tool returning a huge result.
+	parsed, err := a.Tools.ParseToolInvocation(context.Background(), "bigoutput", map[string]any{})
+	if err != nil {
+		t.Fatalf("ParseToolInvocation: %v", err)
+	}
+	a.pendingFunctionCalls = []ToolCallAnalysis{
+		{FunctionCall: gollm.FunctionCall{ID: "1", Name: "bigoutput"}, ParsedToolCall: parsed, ModifiesResourceStr: "no"},
+	}
+	if err := a.DispatchToolCalls(context.Background()); err != nil {
+		t.Fatalf("DispatchToolCalls: %v", err)
+	}
+
+	if len(a.currChatContent) != 1 {
+		t.Fatalf("expected 1 content entry, got %d", len(a.currChatContent))
+	}
+	fcr, ok := a.currChatContent[0].(gollm.FunctionCallResult)
+	if !ok {
+		t.Fatalf("content type = %T, want FunctionCallResult", a.currChatContent[0])
+	}
+	stdout, _ := fcr.Result["stdout"].(string)
+	if len(stdout) > maxToolOutputBytes+1024 {
+		t.Errorf("LLM-facing stdout = %d bytes, want <= ~%d", len(stdout), maxToolOutputBytes+1024)
+	}
+	if !strings.Contains(stdout, "truncated") {
+		t.Error("expected the truncation marker in the LLM-facing output")
+	}
+}
+
+func TestCapIncludesMCPContentKey(t *testing.T) {
+	big := strings.Repeat("y", 32*1024)
+	payload := map[string]any{"content": big}
+	got := capToolResultOutput(payload).(map[string]any)
+	capped := got["content"].(string)
+	if len(capped) >= len(big) {
+		t.Errorf("MCP content key was not capped (%d bytes)", len(capped))
+	}
+}
