@@ -600,3 +600,80 @@ func TestAgentToleratesUsageOnlyStreamChunk(t *testing.T) {
 		}
 	}
 }
+
+func TestAgentUnknownToolIsFedBackNotFatal(t *testing.T) {
+	// Regression: a hallucinated tool name used to abort the turn with
+	// "tool not recognized" and leave an unanswered function call that
+	// poisoned every later turn on strict providers. Now the error is fed
+	// back and the model recovers within the same turn.
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	store := sessions.NewInMemoryChatStore()
+	client := mocks.NewMockClient(ctrl)
+	chat := mocks.NewMockChat(ctrl)
+
+	client.EXPECT().StartChat(gomock.Any(), "test-model").Return(chat)
+	chat.EXPECT().Initialize(gomock.Any()).Return(nil)
+	chat.EXPECT().SetFunctionDefinitions(gomock.Any()).Return(nil)
+	client.EXPECT().GenerateCompletion(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+	chat.EXPECT().IsRetryableError(gomock.Any()).Return(false).AnyTimes()
+
+	// Turn 1: the model hallucinates a tool. Turn 2 (same run): it answers.
+	firstIter := gollm.ChatResponseIterator(func(yield func(gollm.ChatResponse, error) bool) {
+		yield(chatWith(fCalls("nosuchtool", map[string]any{"command": "x"})), nil)
+	})
+	secondIter := gollm.ChatResponseIterator(func(yield func(gollm.ChatResponse, error) bool) {
+		yield(chatWith(fText("sorry, recovering")), nil)
+	})
+	var secondContents []any
+	gomock.InOrder(
+		chat.EXPECT().SendStreaming(gomock.Any(), gomock.Any()).Return(firstIter, nil),
+		chat.EXPECT().SendStreaming(gomock.Any(), gomock.Any()).DoAndReturn(func(_ context.Context, contents ...any) (gollm.ChatResponseIterator, error) {
+			secondContents = contents
+			return secondIter, nil
+		}),
+	)
+
+	a := &Agent{
+		ChatMessageStore: store,
+		LLM:              client,
+		Model:            "test-model",
+		MaxIterations:    4,
+		Session:          &api.Session{ID: "test-session", ChatMessageStore: store, AgentState: api.AgentStateIdle},
+	}
+	if err := a.Init(ctx); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := a.Run(ctx, ""); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if m := recvMsg(t, ctx, a.Output); m.Type != api.MessageTypeUserInputRequest {
+		t.Fatalf("expected user-input-request, got %v", m.Type)
+	}
+	a.Input <- &api.UserInputResponse{Query: "go"}
+
+	final := recvUntil(t, ctx, a.Output, func(m *api.Message) bool {
+		return m.Type == api.MessageTypeText && m.Source == api.MessageSourceModel && m.Payload == "sorry, recovering"
+	})
+	if final == nil {
+		t.Fatalf("model never recovered after the unknown tool call")
+	}
+
+	// The second LLM call must include the error result for the bad call.
+	foundErr := false
+	for _, c := range secondContents {
+		if fcr, ok := c.(gollm.FunctionCallResult); ok {
+			if fcr.Name == "nosuchtool" {
+				foundErr = true
+			}
+		}
+	}
+	if !foundErr {
+		t.Error("no FunctionCallResult for the hallucinated tool reached the model")
+	}
+}
