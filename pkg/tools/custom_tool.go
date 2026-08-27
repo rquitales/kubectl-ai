@@ -130,7 +130,10 @@ func (t *CustomTool) Run(ctx context.Context, args map[string]any) (any, error) 
 	if !ok {
 		return nil, fmt.Errorf("command not found in args")
 	}
-	command = cmdVal.(string)
+	command, ok = cmdVal.(string)
+	if !ok {
+		return nil, fmt.Errorf("command must be a string, got %T", cmdVal)
+	}
 
 	command, err := t.addCommandPrefix(command)
 	if err != nil {
