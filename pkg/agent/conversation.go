@@ -165,6 +165,11 @@ type Agent struct {
 	// contextCompactedThisTurn tracks the one-shot auto-compact recovery on
 	// context-length errors (at most once per turn).
 	contextCompactedThisTurn bool
+
+	// Loop detection: signature of the last dispatched tool-call batch and
+	// how many times it has repeated consecutively this turn.
+	lastToolCallSignature string
+	sameToolCallCount     int
 	// currTurnQuery holds the user query that started the current turn, so
 	// the context-overflow recovery can restart the turn after compaction
 	// (currChatContent is cleared once streaming begins).
@@ -1164,6 +1169,17 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 						log.Info("Empty response with no tool calls from LLM.")
 						c.addMessage(api.MessageSourceAgent, api.MessageTypeText, "Empty response from LLM")
 					}
+					continue
+				}
+
+				// Loop detection: the model repeating the identical call over
+				// and over burns tokens and never converges. Track (tool, args)
+				// signatures; warn at 3 identical consecutive calls, stop at 5.
+				if c.detectToolCallLoop(functionCalls) {
+					c.setAgentState(api.AgentStateDone)
+					c.pendingFunctionCalls = []ToolCallAnalysis{}
+					c.addMessage(api.MessageSourceAgent, api.MessageTypeText, "Stopped: the model repeated the identical tool call 5 times in a row without progress.")
+					c.endRun()
 					continue
 				}
 
@@ -2467,6 +2483,35 @@ func (c *Agent) recoverContextLength(ctx context.Context, err error) bool {
 	c.pendingFunctionCalls = []ToolCallAnalysis{}
 	c.setAgentState(api.AgentStateRunning)
 	return true
+}
+
+// detectToolCallLoop tracks identical (tool, args) calls across the turn's
+// iterations. At 3 identical consecutive calls it injects a warning
+// observation so the model can change tack; at 5 it reports a loop (the
+// caller stops the turn). The counter resets whenever the call changes.
+func (c *Agent) detectToolCallLoop(calls []gollm.FunctionCall) bool {
+	if len(calls) == 0 {
+		return false
+	}
+	// Sign the whole batch; a single call is the common case.
+	var sb strings.Builder
+	for _, call := range calls {
+		fmt.Fprintf(&sb, "%s|%v;", call.Name, call.Arguments)
+	}
+	sig := sb.String()
+	if sig == c.lastToolCallSignature {
+		c.sameToolCallCount++
+	} else {
+		c.lastToolCallSignature = sig
+		c.sameToolCallCount = 0
+	}
+	switch {
+	case c.sameToolCallCount >= 4: // 5th identical call
+		return true
+	case c.sameToolCallCount == 2: // 3rd identical call
+		c.currChatContent = append(c.currChatContent, "Note: you have issued the identical tool call three times with unchanged results. Do not repeat it; change approach or report what you know.")
+	}
+	return false
 }
 
 // looksLikeContextLengthError matches the common provider phrasings of a
