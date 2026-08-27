@@ -248,7 +248,10 @@ func (c *bedrockChat) SendStreaming(ctx context.Context, contents ...any) (ChatR
 		return nil, errors.New("no content provided")
 	}
 
-	// Process and append contents to conversation history
+	// Stage the contents WITHOUT committing them to history yet — the
+	// retry decorator re-invokes this method, and appending before the
+	// call would duplicate the contents in history on every attempt.
+	messagesBefore := len(c.messages)
 	if err := c.addContentsToHistory(contents); err != nil {
 		return nil, err
 	}
@@ -277,6 +280,8 @@ func (c *bedrockChat) SendStreaming(ctx context.Context, contents ...any) (ChatR
 	// Start the streaming request
 	output, err := c.client.client.ConverseStream(ctx, input)
 	if err != nil {
+		// Roll back the staged contents so a retried call starts clean.
+		c.messages = c.messages[:messagesBefore]
 		return nil, fmt.Errorf("bedrock stream error: %w", err)
 	}
 
