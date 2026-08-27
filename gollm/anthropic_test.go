@@ -380,11 +380,19 @@ func TestAnthropicStreamResponseUsageMetadata(t *testing.T) {
 		}
 	})
 
-	t.Run("usage-only response returns nil candidates", func(t *testing.T) {
+	t.Run("usage-only response yields one empty candidate", func(t *testing.T) {
+		// The agentic loop treats zero candidates as a fatal error, which
+		// used to kill every successful Anthropic turn (and drop the turn's
+		// accumulated tool calls). Like bedrock, a usage-only chunk now
+		// yields one candidate with no parts.
 		usage := &anthropic.Usage{InputTokens: 5, OutputTokens: 15}
 		r := &anthropicStreamResponse{usage: usage}
-		if r.Candidates() != nil {
-			t.Error("expected nil Candidates for usage-only response")
+		cands := r.Candidates()
+		if len(cands) != 1 {
+			t.Fatalf("expected 1 empty candidate for usage-only response, got %d", len(cands))
+		}
+		if len(cands[0].Parts()) != 0 {
+			t.Errorf("usage-only candidate should have no parts, got %d", len(cands[0].Parts()))
 		}
 	})
 }
