@@ -20,6 +20,8 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"syscall"
+	"time"
 
 	"k8s.io/klog/v2"
 )
@@ -46,6 +48,21 @@ func (e *Local) Execute(ctx context.Context, command string, env []string, workD
 		cmd = exec.CommandContext(cmdCtx, os.Getenv("COMSPEC"), "/c", command)
 	} else {
 		cmd = exec.CommandContext(cmdCtx, lookupBashBin(), "-c", command)
+		// Run the command in its own process group and kill the WHOLE group
+		// on cancel/timeout: exec.CommandContext's default kill targets only
+		// the shell, so pipelined grandchildren (kubectl logs -f | grep x)
+		// survive — and cmd.Wait() then blocks forever on their pipe writes.
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		cmd.Cancel = func() error {
+			if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil {
+				return cmd.Process.Kill() // fall back to just the shell
+			}
+			return nil
+		}
+		// Belt and braces: if a grandchild somehow keeps the pipes open even
+		// after the group kill, Wait returns after this delay instead of
+		// blocking forever.
+		cmd.WaitDelay = 3 * time.Second
 	}
 	cmd.Dir = workDir
 	cmd.Env = env
