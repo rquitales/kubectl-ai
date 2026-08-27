@@ -86,6 +86,40 @@ func (sm *SessionManager) ListSessions() ([]*api.Session, error) {
 	return sm.store.ListSessions()
 }
 
+// ForkSession copies a session's metadata and full message history under a
+// new ID and returns the new session — try a risky approach, then go back.
+func (sm *SessionManager) ForkSession(sourceID string) (*api.Session, error) {
+	src, err := sm.FindSessionByID(sourceID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find session %q to fork: %w", sourceID, err)
+	}
+
+	fork, err := sm.NewSession(Metadata{
+		ProviderID: src.ProviderID,
+		ModelID:    src.ModelID,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if src.Name != "" {
+		if err := sm.SetSessionName(fork.ID, src.Name+" (fork)", false); err != nil {
+			klog.Warningf("failed to name forked session: %v", err)
+		}
+	}
+
+	// Copy the message history.
+	if src.ChatMessageStore != nil && fork.ChatMessageStore != nil {
+		for _, msg := range src.ChatMessageStore.ChatMessages() {
+			if err := fork.ChatMessageStore.AddChatMessage(msg); err != nil {
+				return nil, fmt.Errorf("failed to copy message history: %w", err)
+			}
+		}
+	}
+
+	return fork, nil
+}
+
 func (sm *SessionManager) FindSessionByID(id string) (*api.Session, error) {
 	return sm.store.GetSession(id)
 }

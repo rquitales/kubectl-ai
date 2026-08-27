@@ -444,3 +444,27 @@ func TestListSessionsSkipsCorrupt(t *testing.T) {
 		t.Errorf("ListSessions = %v, want only the good session", sessions)
 	}
 }
+
+func TestForkSessionCopiesHistory(t *testing.T) {
+	manager := &SessionManager{store: newMemoryStore()}
+	src, _ := manager.NewSession(Metadata{ModelID: "m"})
+	_ = src.ChatMessageStore.AddChatMessage(&api.Message{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "q"})
+	_ = src.ChatMessageStore.AddChatMessage(&api.Message{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "a"})
+
+	fork, err := manager.ForkSession(src.ID)
+	if err != nil {
+		t.Fatalf("ForkSession: %v", err)
+	}
+	if fork.ID == src.ID {
+		t.Error("fork must get a new ID")
+	}
+	msgs := fork.ChatMessageStore.ChatMessages()
+	if len(msgs) != 2 {
+		t.Fatalf("fork history = %d messages, want 2", len(msgs))
+	}
+	// The fork is independent: writing to it must not touch the original.
+	_ = fork.ChatMessageStore.AddChatMessage(&api.Message{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "fork-only"})
+	if n := len(src.ChatMessageStore.ChatMessages()); n != 2 {
+		t.Errorf("original session grew to %d messages after fork write", n)
+	}
+}
