@@ -894,6 +894,7 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 						c.setAgentState(api.AgentStateDone)
 						c.pendingFunctionCalls = []ToolCallAnalysis{}
 						c.addMessage(api.MessageSourceAgent, api.MessageTypeText, "Maximum number of iterations reached.")
+						c.lastErr = fmt.Errorf("maximum number of iterations reached")
 						c.endRun()
 						continue
 					}
@@ -2309,6 +2310,20 @@ func (c *Agent) DispatchToolCalls(ctx context.Context) error {
 	log := klog.FromContext(ctx)
 	// execute all pending function calls
 	for _, call := range c.pendingFunctionCalls {
+		// Calls that failed to resolve (hallucinated tool name, malformed
+		// args): feed the error back so the model can self-correct — never
+		// leave an unanswered function call to poison later turns.
+		if call.ParseError != nil {
+			c.addMessage(api.MessageSourceAgent, api.MessageTypeToolCallResponse,
+				fmt.Sprintf("Error: %v", call.ParseError))
+			c.appendToolResult(call.FunctionCall, map[string]any{
+				"error":     call.ParseError.Error(),
+				"status":    "failed",
+				"retryable": true,
+			})
+			continue
+		}
+
 		// Only show "Running" message and proceed with execution for non-interactive commands
 		toolDescription := call.ParsedToolCall.Description()
 
@@ -2321,9 +2336,17 @@ func (c *Agent) DispatchToolCalls(ctx context.Context) error {
 		})
 
 		if err != nil {
+			// A failed call must not abort the rest of the batch (their
+			// results would orphan into the next turn) nor be hidden from
+			// the model (it can't self-correct what it can't see).
 			log.Error(err, "error executing action", "output", output)
 			c.addMessage(api.MessageSourceAgent, api.MessageTypeToolCallResponse, err.Error())
-			return err
+			c.appendToolResult(call.FunctionCall, map[string]any{
+				"error":     err.Error(),
+				"status":    "failed",
+				"retryable": false,
+			})
+			continue
 		}
 
 		// Note the timeout AFTER the response, not between the request and
@@ -2347,14 +2370,11 @@ func (c *Agent) DispatchToolCalls(ctx context.Context) error {
 			result, err := tools.ToolResultToMap(output)
 			if err != nil {
 				log.Error(err, "error converting tool result to map", "output", output)
-				return err
+				c.appendToolResult(call.FunctionCall, map[string]any{"error": err.Error()})
+				continue
 			}
 			payload = result
-			c.currChatContent = append(c.currChatContent, gollm.FunctionCallResult{
-				ID:     call.FunctionCall.ID,
-				Name:   call.FunctionCall.Name,
-				Result: result,
-			})
+			c.appendToolResult(call.FunctionCall, result)
 		}
 		// Cap oversized tool output before it enters the session history so a
 		// massive stdout (e.g. kubectl get -A across many clusters) can't
@@ -2369,6 +2389,22 @@ func (c *Agent) DispatchToolCalls(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// appendToolResult adds a tool call's result to the LLM-bound content,
+// using the provider-native FunctionCallResult form (with the call's ID for
+// pairing) or the shim's plain-text observation form.
+func (c *Agent) appendToolResult(call gollm.FunctionCall, result map[string]any) {
+	if c.EnableToolUseShim {
+		observation := fmt.Sprintf("Result of running %q:\n%v", call.Name, result)
+		c.currChatContent = append(c.currChatContent, observation)
+		return
+	}
+	c.currChatContent = append(c.currChatContent, gollm.FunctionCallResult{
+		ID:     call.ID,
+		Name:   call.Name,
+		Result: result,
+	})
 }
 
 // maxToolOutputBytes is the cap on a single tool-call result's stdout/stderr
@@ -2410,6 +2446,10 @@ type ToolCallAnalysis struct {
 	IsInteractive       bool
 	IsInteractiveError  error
 	ModifiesResourceStr string
+	// ParseError is set when the call couldn't be resolved (unknown tool,
+	// malformed arguments). It is fed back to the model as an error result
+	// instead of aborting the turn.
+	ParseError error
 }
 
 func (c *Agent) analyzeToolCalls(ctx context.Context, toolCalls []gollm.FunctionCall) ([]ToolCallAnalysis, error) {
@@ -2418,7 +2458,12 @@ func (c *Agent) analyzeToolCalls(ctx context.Context, toolCalls []gollm.Function
 		toolCallAnalysis[i].FunctionCall = call
 		toolCall, err := c.Tools.ParseToolInvocation(ctx, call.Name, call.Arguments)
 		if err != nil {
-			return nil, fmt.Errorf("error parsing tool call: %w", err)
+			// Not fatal: an invented tool name or malformed args must not
+			// kill the turn (and leave an unanswered function call that
+			// poisons every later turn on strict providers). The error is
+			// fed back to the model in DispatchToolCalls.
+			toolCallAnalysis[i].ParseError = err
+			continue
 		}
 		toolCallAnalysis[i].IsInteractive, err = toolCall.GetTool().IsInteractive(call.Arguments)
 		if err != nil {
@@ -2526,15 +2571,16 @@ func (c *Agent) handleChoice(ctx context.Context, choice *api.UserChoiceResponse
 		c.setSkipPermissionsEnabled(true)
 		dispatchToolCalls = true
 	case 3:
-		c.currChatContent = append(c.currChatContent, gollm.FunctionCallResult{
-			ID:   c.pendingFunctionCalls[0].FunctionCall.ID,
-			Name: c.pendingFunctionCalls[0].FunctionCall.Name,
-			Result: map[string]any{
+		// Decline EVERY pending call, not just the first: unanswered
+		// function calls violate provider pairing (Gemini rejects the next
+		// turn), and the model should know the whole batch was declined.
+		for _, call := range c.pendingFunctionCalls {
+			c.appendToolResult(call.FunctionCall, map[string]any{
 				"error":     "User declined to run this operation.",
 				"status":    "declined",
 				"retryable": false,
-			},
-		})
+			})
+		}
 		c.pendingFunctionCalls = []ToolCallAnalysis{}
 		dispatchToolCalls = false
 		c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Operation was skipped. User declined to run this operation.")
