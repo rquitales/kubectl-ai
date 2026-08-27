@@ -140,9 +140,10 @@ func (c *OpenAIClient) StartChat(systemPrompt, model string) Chat {
 		}
 
 		return &openAIResponseChatSession{
-			client:  c.client,
-			history: history,
-			model:   selectedModel,
+			client:       c.client,
+			history:      history,
+			model:        selectedModel,
+			systemPrompt: systemPrompt,
 			// functionDefinitions and tools will be set later via SetFunctionDefinitions
 			params: responses.ResponseNewParams{
 				Model:           selectedModel,
@@ -164,9 +165,10 @@ func (c *OpenAIClient) StartChat(systemPrompt, model string) Chat {
 	}
 
 	return &openAIChatSession{
-		client:  c.client,
-		history: history,
-		model:   selectedModel,
+		client:       c.client,
+		history:      history,
+		model:        selectedModel,
+		systemPrompt: systemPrompt,
 		// functionDefinitions and tools will be set later via SetFunctionDefinitions
 	}
 }
@@ -245,6 +247,7 @@ type openAIChatSession struct {
 	client              openai.Client
 	history             []openai.ChatCompletionMessageParamUnion
 	model               string
+	systemPrompt        string                           // re-prepended by Initialize (which rebuilds history)
 	functionDefinitions []*FunctionDefinition            // Stored in gollm format
 	tools               []openai.ChatCompletionToolParam // Stored in OpenAI format
 }
@@ -469,7 +472,13 @@ func (cs *openAIChatSession) IsRetryableError(err error) bool {
 // be replayed: tool-call requests/responses lack the call IDs needed for
 // OpenAI tool-call pairing and are skipped (same approach as Anthropic).
 func (cs *openAIChatSession) Initialize(messages []*api.Message) error {
-	cs.history = make([]openai.ChatCompletionMessageParamUnion, 0, len(messages))
+	cs.history = make([]openai.ChatCompletionMessageParamUnion, 0, len(messages)+1)
+	// The system prompt must survive: history is rebuilt wholesale here, so
+	// without re-prepending it, every resume/compact/clear/model-switch
+	// silently dropped kubectl-ai's instructions.
+	if cs.systemPrompt != "" {
+		cs.history = append(cs.history, openai.SystemMessage(cs.systemPrompt))
+	}
 
 	for _, msg := range messages {
 		// Ephemeral messages (thinking blocks, local command output) are

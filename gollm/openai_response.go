@@ -33,6 +33,7 @@ type openAIResponseChatSession struct {
 	client              openai.Client
 	history             responses.ResponseInputParam
 	model               string
+	systemPrompt        string                     // re-prepended by Initialize (which rebuilds history)
 	functionDefinitions []*FunctionDefinition      // Stored in gollm format
 	tools               []responses.ToolUnionParam // Stored in OpenAI format
 
@@ -149,7 +150,18 @@ func (cs *openAIResponseChatSession) IsRetryableError(err error) bool {
 // be replayed: tool-call requests/responses lack the call IDs needed for
 // tool-call pairing and are skipped (same approach as Anthropic).
 func (cs *openAIResponseChatSession) Initialize(messages []*api.Message) error {
-	cs.history = make(responses.ResponseInputParam, 0, len(messages))
+	cs.history = make(responses.ResponseInputParam, 0, len(messages)+1)
+	// The system prompt must survive the wholesale history rebuild.
+	if cs.systemPrompt != "" {
+		cs.history = append(cs.history, responses.ResponseInputItemUnionParam{
+			OfMessage: &responses.EasyInputMessageParam{
+				Content: responses.EasyInputMessageContentUnionParam{
+					OfString: openai.String(cs.systemPrompt),
+				},
+				Role: responses.EasyInputMessageRoleSystem,
+			},
+		})
+	}
 
 	for _, msg := range messages {
 		// Ephemeral messages (thinking blocks, local command output) are
