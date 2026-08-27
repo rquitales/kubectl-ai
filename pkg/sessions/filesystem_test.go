@@ -352,3 +352,38 @@ func TestPruneNeverDeletesUnreadableHistory(t *testing.T) {
 		t.Error("corrupt-history session was pruned — data loss")
 	}
 }
+
+func TestWriteMessagesAtomicKeepsBackup(t *testing.T) {
+	dir := t.TempDir()
+	store := &FileChatMessageStore{Path: dir}
+
+	first := &api.Message{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "v1"}
+	if err := store.SetChatMessages([]*api.Message{first}); err != nil {
+		t.Fatalf("SetChatMessages v1: %v", err)
+	}
+	second := &api.Message{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "v2"}
+	if err := store.SetChatMessages([]*api.Message{second}); err != nil {
+		t.Fatalf("SetChatMessages v2: %v", err)
+	}
+
+	// The rewrite replaced the content...
+	msgs := store.ChatMessages()
+	if len(msgs) != 1 || msgs[0].Payload != "v2" {
+		t.Fatalf("got %v, want [v2]", msgs)
+	}
+	// ...and the previous version survives as .bak.
+	bak, err := os.ReadFile(store.HistoryPath() + ".bak")
+	if err != nil {
+		t.Fatalf("no .bak after rewrite: %v", err)
+	}
+	if !strings.Contains(string(bak), "v1") {
+		t.Errorf(".bak does not contain the pre-rewrite history: %s", bak)
+	}
+	// No temp files left behind.
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".tmp") {
+			t.Errorf("temp file left behind: %s", e.Name())
+		}
+	}
+}

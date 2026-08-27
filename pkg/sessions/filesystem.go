@@ -354,28 +354,46 @@ func (s *FileChatMessageStore) readMessages() ([]*api.Message, error) {
 	return messages, nil
 }
 
+// writeMessages rewrites the history file atomically: the new content goes
+// to a temp file (fsynced) which is then renamed over history.json, and the
+// previous history is kept as history.json.bak. O_TRUNC-in-place meant a
+// crash during a rewrite (e.g. /compact) destroyed the transcript.
 func (s *FileChatMessageStore) writeMessages(messages []*api.Message) error {
 	if err := os.MkdirAll(s.Path, 0o755); err != nil {
 		return err
 	}
 
-	f, err := os.OpenFile(s.HistoryPath(), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	historyPath := s.HistoryPath()
+	tmp, err := os.CreateTemp(s.Path, "history-*.json.tmp")
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath) // no-op after a successful rename
 
 	for _, msg := range messages {
 		data, err := json.Marshal(msg)
 		if err != nil {
+			tmp.Close()
 			return err
 		}
-		if _, err := f.Write(data); err != nil {
-			return err
-		}
-		if _, err := f.WriteString("\n"); err != nil {
+		if _, err := tmp.Write(append(data, '\n')); err != nil {
+			tmp.Close()
 			return err
 		}
 	}
-	return nil
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+
+	// Keep the previous history as a backup before replacing it.
+	if _, err := os.Stat(historyPath); err == nil {
+		_ = os.Remove(historyPath + ".bak")
+		_ = os.Link(historyPath, historyPath+".bak")
+	}
+	return os.Rename(tmpPath, historyPath)
 }
