@@ -25,6 +25,7 @@ import (
 	"sync"
 
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
+	"k8s.io/klog/v2"
 	"sigs.k8s.io/yaml"
 )
 
@@ -334,7 +335,12 @@ func (s *FileChatMessageStore) readMessages() ([]*api.Message, error) {
 		}
 		var msg api.Message
 		if err := json.Unmarshal(line, &msg); err != nil {
-			return nil, err
+			// A torn trailing line (crash/kill mid-append) must not wipe the
+			// whole session: skip unparseable lines and keep the rest. With
+			// the old behavior the session read as EMPTY — and the startup
+			// prune then deleted it. Data loss from one bad line.
+			klog.Warningf("Skipping unparseable history line in %s: %v", f.Name(), err)
+			continue
 		}
 		messages = append(messages, &msg)
 	}

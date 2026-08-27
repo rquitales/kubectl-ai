@@ -18,9 +18,11 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"os"
 	"time"
 
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
+	"k8s.io/klog/v2"
 )
 
 type SessionManager struct {
@@ -180,6 +182,16 @@ func (sm *SessionManager) PruneEmptySessions(excludeIDs ...string) (int, error) 
 		}
 		if HasConversationMessages(s.ChatMessageStore.ChatMessages()) {
 			continue
+		}
+		// Never delete a session whose on-disk history has content: a
+		// history that fails to parse (or parses to only non-conversation
+		// messages after skipping torn lines) must survive the sweep —
+		// deleting it would be unrecoverable data loss.
+		if fs, ok := s.ChatMessageStore.(interface{ HistoryPath() string }); ok {
+			if info, err := os.Stat(fs.HistoryPath()); err == nil && info.Size() > 0 {
+				klog.Warningf("Keeping session %s: history file exists (%d bytes) but no conversation messages parsed", s.ID, info.Size())
+				continue
+			}
 		}
 		if err := sm.store.DeleteSession(s.ID); err != nil {
 			return pruned, fmt.Errorf("failed to delete session %s: %w", s.ID, err)
