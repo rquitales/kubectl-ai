@@ -58,8 +58,21 @@ func (s *KubernetesSandbox) Execute(ctx context.Context, command string, env []s
 		fullCommand = fmt.Sprintf("mkdir -p %q && cd %q && %s", workDir, workDir, fullCommand)
 	}
 
+	// Only a small allowlist is exported into the pod — splicing the entire
+	// local environment in (a) transmits local secrets into the cluster's
+	// API/audit logs, and (b) unquoted values with spaces/$()/newlines
+	// corrupt or inject into the in-pod shell. Note KUBECONFIG is never
+	// forwarded: the pod's own /etc/kube/config must win (a host path is
+	// meaningless inside the pod).
 	for _, envVar := range env {
-		fullCommand = fmt.Sprintf("export %s; %s", envVar, fullCommand)
+		name, value, ok := strings.Cut(envVar, "=")
+		if !ok || value == "" {
+			continue
+		}
+		switch name {
+		case "PATH", "HOME", "LANG", "LC_ALL", "TZ":
+			fullCommand = fmt.Sprintf("export %s=%s; %s", name, shellQuote(value), fullCommand)
+		}
 	}
 
 	cmd := s.CommandContext(ctx, fullCommand)
@@ -99,6 +112,11 @@ type Cmd struct {
 type Option func(*KubernetesSandbox) error
 
 // NewKubernetesSandbox creates a new KubernetesSandbox instance with the given name and options
+// shellQuote single-quotes a string for POSIX shells.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
 func NewKubernetesSandbox(name string, opts ...Option) (*KubernetesSandbox, error) {
 	s := &KubernetesSandbox{
 		name:      name,

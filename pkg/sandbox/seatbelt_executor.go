@@ -40,11 +40,15 @@ func (e *Seatbelt) Execute(ctx context.Context, command string, env []string, wo
 	// Use the provided context directly
 	cmdCtx := ctx
 
-	// This profile allows reading/writing to the working directory and /tmp,
-	// but denies writing to other system locations by default (implicitly, though 'allow default' is permissive).
-
-	// Use a basic profile for now.
-	wrappedCommand := fmt.Sprintf("sandbox-exec -p %q /bin/bash -c %q", "(version 1) (allow default)", command)
+	// Deny-by-default profile: process/network allowed (kubectl needs the
+	// network), file writes restricted to the working directory and /tmp.
+	// ('(allow default)' restricted NOTHING — the sandbox was decorative.)
+	profile := fmt.Sprintf(`(version 1)
+(deny default)
+(allow process* network* signal)
+(allow file-read* file-read-metadata)
+(allow file-write* (subpath %s) (subpath "/tmp") (subpath "/private/tmp") (subpath "/dev"))`, shellQuote(workDir))
+	wrappedCommand := "sandbox-exec -p " + shellQuote(profile) + " /bin/bash -c " + shellQuote(command)
 	cmd := exec.CommandContext(cmdCtx, "/bin/bash", "-c", wrappedCommand)
 	cmd.Dir = workDir
 	cmd.Env = env
