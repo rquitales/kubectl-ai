@@ -98,6 +98,13 @@ func (t *Tools) RegisterTool(tool Tool) {
 	t.tools[name] = tool
 }
 
+// ReplaceTool registers (or replaces) a tool without panicking. Used when
+// re-binding executor-bound built-ins to a new executor after a session
+// switch (the clone still points at the old executor).
+func (t *Tools) ReplaceTool(tool Tool) {
+	t.tools[tool.Name()] = tool
+}
+
 // CloneWithExecutor creates a shallow copy of the Tools collection,
 // but clones any tools that need a session-specific executor (like CustomTool).
 func (t *Tools) CloneWithExecutor(executor sandbox.Executor) Tools {
