@@ -74,7 +74,7 @@ func (f *filesystemStore) CreateSession(session *api.Session) error {
 		// Refuse to clobber an existing session's metadata.
 		return fmt.Errorf("%w: %s", ErrSessionExists, session.ID)
 	}
-	if err := os.MkdirAll(sessionPath, 0o755); err != nil {
+	if err := os.MkdirAll(sessionPath, 0o700); err != nil {
 		return err
 	}
 
@@ -95,7 +95,7 @@ func (f *filesystemStore) CreateSession(session *api.Session) error {
 		return err
 	}
 
-	return writeFileAtomic(filepath.Join(sessionPath, "metadata.yaml"), data, 0o644)
+	return writeFileAtomic(filepath.Join(sessionPath, "metadata.yaml"), data, 0o600)
 }
 
 func (f *filesystemStore) UpdateSession(session *api.Session) error {
@@ -126,7 +126,7 @@ func (f *filesystemStore) UpdateSession(session *api.Session) error {
 		return err
 	}
 
-	return writeFileAtomic(metadataPath, data, 0o644)
+	return writeFileAtomic(metadataPath, data, 0o600)
 }
 
 // writeFileAtomic writes data to path atomically via a temp file + rename, so
@@ -140,6 +140,15 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	defer os.Remove(tmpPath)
 
 	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	// The perm argument was previously dead (CreateTemp's 0600 masked it).
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
 		tmp.Close()
 		return err
 	}
@@ -166,7 +175,10 @@ func (f *filesystemStore) ListSessions() ([]*api.Session, error) {
 
 		session, err := f.GetSession(entry.Name())
 		if err != nil {
-			return nil, err
+			// One corrupt session must not brick listing, the picker,
+			// GetLatestSession, or the startup prune.
+			klog.Warningf("Skipping corrupt session %q: %v", entry.Name(), err)
+			continue
 		}
 		sessions = append(sessions, session)
 	}
@@ -205,7 +217,7 @@ func (s *FileChatMessageStore) AddChatMessage(record *api.Message) error {
 	defer s.mu.Unlock()
 
 	// Ensure directory exists
-	if err := os.MkdirAll(s.Path, 0o755); err != nil {
+	if err := os.MkdirAll(s.Path, 0o700); err != nil {
 		return err
 	}
 
@@ -240,7 +252,7 @@ func (s *FileChatMessageStore) AddChatMessage(record *api.Message) error {
 	}
 	data = append(data, '\n')
 
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
@@ -359,7 +371,7 @@ func (s *FileChatMessageStore) readMessages() ([]*api.Message, error) {
 // previous history is kept as history.json.bak. O_TRUNC-in-place meant a
 // crash during a rewrite (e.g. /compact) destroyed the transcript.
 func (s *FileChatMessageStore) writeMessages(messages []*api.Message) error {
-	if err := os.MkdirAll(s.Path, 0o755); err != nil {
+	if err := os.MkdirAll(s.Path, 0o700); err != nil {
 		return err
 	}
 
