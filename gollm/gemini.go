@@ -492,12 +492,15 @@ func (c *GeminiChat) SendStreaming(ctx context.Context, contents ...any) (ChatRe
 func (c *GeminiChat) Initialize(messages []*api.Message) error {
 	klog.Info("Initializing gemini chat")
 	c.history = make([]*genai.Content, 0, len(messages))
-	for _, msg := range messages {
-		content, err := c.messageToContent(msg)
-		if err != nil {
-			continue
+	for _, seed := range SeedableMessages(messages) {
+		role := "user"
+		if seed.Role == "assistant" {
+			role = "model"
 		}
-		c.history = append(c.history, content)
+		c.history = append(c.history, &genai.Content{
+			Role:  role,
+			Parts: []*genai.Part{genai.NewPartFromText(seed.Content)},
+		})
 	}
 	return nil
 }

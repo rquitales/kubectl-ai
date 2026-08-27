@@ -100,9 +100,10 @@ func (c *GrokClient) StartChat(systemPrompt, model string) Chat {
 	}
 
 	return &grokChatSession{
-		client:  c.client,
-		history: history,
-		model:   model,
+		client:       c.client,
+		history:      history,
+		model:        model,
+		systemPrompt: systemPrompt,
 	}
 }
 
@@ -172,6 +173,7 @@ type grokChatSession struct {
 	client              openai.Client
 	history             []openai.ChatCompletionMessageParamUnion
 	model               string
+	systemPrompt        string
 	functionDefinitions []*FunctionDefinition            // Stored in gollm format
 	tools               []openai.ChatCompletionToolParam // Stored in OpenAI format
 }
@@ -404,7 +406,18 @@ func (cs *grokChatSession) IsRetryableError(err error) bool {
 }
 
 func (cs *grokChatSession) Initialize(messages []*api.Message) error {
-	klog.Warning("chat history persistence is not supported for provider 'grok', using in-memory chat history")
+	// Seed the conversation from the persisted session (openai-compatible
+	// history format; system prompt preserved).
+	if cs.systemPrompt != "" {
+		cs.history = append(cs.history, openai.SystemMessage(cs.systemPrompt))
+	}
+	for _, seed := range SeedableMessages(messages) {
+		if seed.Role == "assistant" {
+			cs.history = append(cs.history, openai.AssistantMessage(seed.Content))
+		} else {
+			cs.history = append(cs.history, openai.UserMessage(seed.Content))
+		}
+	}
 	return nil
 }
 

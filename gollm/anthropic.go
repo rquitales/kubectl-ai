@@ -177,35 +177,14 @@ var _ Chat = (*anthropicChatSession)(nil)
 func (c *anthropicChatSession) Initialize(history []*api.Message) error {
 	c.messages = make([]anthropic.MessageParam, 0, len(history))
 
-	for _, msg := range history {
-		var role anthropic.MessageParamRole
-		switch msg.Source {
-		case api.MessageSourceUser:
-			role = anthropic.MessageParamRoleUser
-		case api.MessageSourceModel, api.MessageSourceAgent:
+	for _, seed := range SeedableMessages(history) {
+		role := anthropic.MessageParamRoleUser
+		if seed.Role == "assistant" {
 			role = anthropic.MessageParamRoleAssistant
-		default:
-			continue
 		}
-
-		if msg.Type != api.MessageTypeText || msg.Payload == nil {
-			continue
-		}
-
-		var content string
-		if textPayload, ok := msg.Payload.(string); ok {
-			content = textPayload
-		} else {
-			content = fmt.Sprintf("%v", msg.Payload)
-		}
-
-		if content == "" {
-			continue
-		}
-
 		param := anthropic.MessageParam{
 			Role:    role,
-			Content: []anthropic.ContentBlockParamUnion{anthropic.NewTextBlock(content)},
+			Content: []anthropic.ContentBlockParamUnion{anthropic.NewTextBlock(seed.Content)},
 		}
 		c.messages = append(c.messages, param)
 	}
@@ -743,12 +722,12 @@ func (r *anthropicCompletionResponse) UsageMetadata() any {
 }
 
 func getAnthropicModel(model string) string {
-	if model != "" && strings.HasPrefix(model, "claude") {
+	// An explicitly provided model always wins — the claude-prefix gate
+	// silently discarded explicit choices (e.g. via a gateway/proxy model
+	// name) with only a V(2) log.
+	if model != "" {
 		klog.V(4).Infof("Using explicitly provided Anthropic model: %s", model)
 		return model
-	}
-	if model != "" {
-		klog.V(2).Infof("Ignoring non-Claude model %q, falling back to default", model)
 	}
 	if anthropicDefaultModel != "" {
 		klog.V(2).Infof("Using Anthropic model from environment: %s", anthropicDefaultModel)

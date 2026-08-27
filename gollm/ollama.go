@@ -210,7 +210,11 @@ func (c *OllamaChat) SendStreaming(ctx context.Context, contents ...any) (ChatRe
 }
 
 func (c *OllamaChat) Initialize(messages []*kctlApi.Message) error {
-	klog.Warning("chat history persistence is not supported for provider 'ollama', using in-memory chat history")
+	// Seed the conversation from the persisted session (resume used to start
+	// with zero context here — silent amnesia).
+	for _, seed := range SeedableMessages(messages) {
+		c.history = append(c.history, api.Message{Role: seed.Role, Content: seed.Content})
+	}
 	return nil
 }
 

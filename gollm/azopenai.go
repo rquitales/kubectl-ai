@@ -262,6 +262,14 @@ func (c *AzureOpenAIChat) Send(ctx context.Context, contents ...any) (ChatRespon
 		return nil, fmt.Errorf("no response from Azure OpenAI: %v", resp)
 	}
 
+	// Record the assistant's reply so the model sees its own prior answers.
+	if resp.Choices[0].Message != nil && resp.Choices[0].Message.Content != nil {
+		msg := azopenai.ChatRequestAssistantMessage{
+			Content: azopenai.NewChatRequestAssistantMessageContent(*resp.Choices[0].Message.Content),
+		}
+		c.history = append(c.history, &msg)
+	}
+
 	return &AzureOpenAIChatResponse{azureOpenAIResponse: resp}, nil
 }
 
@@ -271,7 +279,20 @@ func (c *AzureOpenAIChat) IsRetryableError(err error) bool {
 }
 
 func (c *AzureOpenAIChat) Initialize(messages []*api.Message) error {
-	klog.Warning("chat history persistence is not supported for provider 'azopenai', using in-memory chat history")
+	// Seed the conversation from the persisted session.
+	for _, seed := range SeedableMessages(messages) {
+		if seed.Role == "assistant" {
+			msg := azopenai.ChatRequestAssistantMessage{
+				Content: azopenai.NewChatRequestAssistantMessageContent(seed.Content),
+			}
+			c.history = append(c.history, &msg)
+		} else {
+			msg := azopenai.ChatRequestUserMessage{
+				Content: azopenai.NewChatRequestUserMessageContent(seed.Content),
+			}
+			c.history = append(c.history, &msg)
+		}
+	}
 	return nil
 }
 
