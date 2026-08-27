@@ -1707,11 +1707,12 @@ func (c *Agent) NewSession() (string, error) {
 		c.Executor = sb
 		klog.Info("Created new sandbox for new session", "name", sandboxName)
 
-		// Re-bind all tools to the new executor
+		// Re-bind all tools to the new executor. The clone still carries the
+		// OLD executor-bound bash/kubectl instances, so replace them
+		// (RegisterTool would panic on duplicates).
 		c.Tools = c.Tools.CloneWithExecutor(c.Executor)
-
-		c.Tools.RegisterTool(tools.NewBashTool(c.Executor))
-		c.Tools.RegisterTool(tools.NewKubectlTool(c.Executor))
+		c.Tools.ReplaceTool(tools.NewBashTool(c.Executor))
+		c.Tools.ReplaceTool(tools.NewKubectlTool(c.Executor))
 		c.sessionMu.Unlock()
 	}
 
@@ -1802,6 +1803,12 @@ func (c *Agent) LoadSession(sessionID string) error {
 	c.Session.Messages = session.ChatMessageStore.ChatMessages()
 	c.Session.LastModified = time.Now()
 
+	// A session-scoped kube override (/context, /namespace) must not leak
+	// into a different session; outstanding pickers/prompts from the old
+	// session must not consume the next choice either.
+	c.pendingModelChoice = nil
+	c.pendingIterationContinue = false
+
 	// Reset state if it was left running (e.g. from a crash)
 	if c.Session.AgentState == api.AgentStateRunning || c.Session.AgentState == api.AgentStateInitializing {
 		c.Session.AgentState = api.AgentStateIdle
@@ -1821,6 +1828,10 @@ func (c *Agent) LoadSession(sessionID string) error {
 		return fmt.Errorf("failed to update session metadata: %w", err)
 	}
 	c.sessionMu.Unlock()
+
+	// Clear the session-scoped kube override (back to the pinned snapshot).
+	// Must run after the lock is released: it takes sessionMu itself.
+	c.resetKubeOverride()
 
 	if c.llmChat != nil {
 		if modelChanged && !c.ModelPinned {

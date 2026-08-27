@@ -49,3 +49,14 @@ func TestToolCallDescriptionSafeOnMalformedArgs(t *testing.T) {
 	tc := &ToolCall{tool: tool, name: "bash", arguments: map[string]any{"command": 42}}
 	_ = tc.Description()
 }
+
+func TestReplaceToolNoPanic(t *testing.T) {
+	var toolset Tools
+	toolset.Init()
+	toolset.RegisterTool(NewBashTool(nil))
+	// Must not panic; the new instance replaces the old.
+	toolset.ReplaceTool(NewBashTool(nil))
+	if n := len(toolset.AllTools()); n != 1 {
+		t.Errorf("tools = %d, want 1 after replace", n)
+	}
+}

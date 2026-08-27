@@ -1696,3 +1696,43 @@ func TestCapIncludesMCPContentKey(t *testing.T) {
 		t.Errorf("MCP content key was not capped (%d bytes)", len(capped))
 	}
 }
+
+func TestLoadSessionClearsOverrideAndPendingChoices(t *testing.T) {
+	// Regression: a /context override (and the KUBECONFIG env) survived
+	// switching sessions, so the new session silently ran against the old
+	// session's cluster; and a /model picker left open consumed the next
+	// permission answer as a model selection.
+	base := writeAgentKubeConfig(t, "prod", "prod", "staging")
+	t.Setenv("KUBECONFIG", base)
+
+	manager, err := sessions.NewSessionManager("memory")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := manager.NewSession(sessions.Metadata{ModelID: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	a := &Agent{
+		Session:        &api.Session{ID: "current", ChatMessageStore: sessions.NewInMemoryChatStore()},
+		SessionBackend: "memory",
+		Kubeconfig:     base,
+		workDir:        t.TempDir(),
+	}
+	a.pinSessionKubeconfig()
+	if err := a.applyKubeOverride("staging", ""); err != nil {
+		t.Fatalf("applyKubeOverride: %v", err)
+	}
+	a.pendingModelChoice = []string{"m1", "m2"}
+
+	if err := a.LoadSession(other.ID); err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	if a.pendingModelChoice != nil {
+		t.Error("pendingModelChoice survived the session switch")
+	}
+	if c, _, _ := kube.CurrentContext(a.ActiveKubeconfig()); c != "prod" {
+		t.Errorf("after switch context = %q, want prod (pinned snapshot, not the staging override)", c)
+	}
+}
