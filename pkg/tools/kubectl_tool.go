@@ -98,8 +98,8 @@ Possible values:
 }
 
 func (t *Kubectl) Run(ctx context.Context, args map[string]any) (any, error) {
-	kubeconfig := ctx.Value(KubeconfigKey).(string)
-	workDir := ctx.Value(WorkDirKey).(string)
+	kubeconfig, _ := ctx.Value(KubeconfigKey).(string)
+	workDir, _ := ctx.Value(WorkDirKey).(string)
 
 	// Add nil check for command
 	commandVal, ok := args["command"]

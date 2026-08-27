@@ -132,7 +132,9 @@ func (t *ToolCall) Description() string {
 	// Check if this is an MCP tool and format accordingly
 	if mcpTool, ok := t.tool.(*MCPTool); ok {
 		if command, ok := t.arguments["command"]; ok {
-			return fmt.Sprintf("[MCP: %s] %s", mcpTool.serverName, command.(string))
+			if cs, ok := command.(string); ok {
+				return fmt.Sprintf("[MCP: %s] %s", mcpTool.serverName, cs)
+			}
 		}
 		var args []string
 		for k, v := range t.arguments {
@@ -144,7 +146,9 @@ func (t *ToolCall) Description() string {
 
 	// Default formatting for non-MCP tools
 	if command, ok := t.arguments["command"]; ok {
-		return command.(string)
+		if cs, ok := command.(string); ok {
+			return cs
+		}
 	}
 	var args []string
 	for k, v := range t.arguments {

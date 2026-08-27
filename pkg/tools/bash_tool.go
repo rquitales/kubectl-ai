@@ -86,9 +86,18 @@ Possible values:
 }
 
 func (t *BashTool) Run(ctx context.Context, args map[string]any) (any, error) {
-	kubeconfig := ctx.Value(KubeconfigKey).(string)
-	workDir := ctx.Value(WorkDirKey).(string)
-	command := args["command"].(string)
+	kubeconfig, _ := ctx.Value(KubeconfigKey).(string)
+	workDir, _ := ctx.Value(WorkDirKey).(string)
+	// Malformed model arguments (missing/non-string command) must not panic
+	// the process — return the error as a tool result the model can see.
+	commandVal, ok := args["command"]
+	if !ok || commandVal == nil {
+		return &sandbox.ExecResult{Command: "", Error: "bash command not provided or is nil"}, nil
+	}
+	command, ok := commandVal.(string)
+	if !ok {
+		return &sandbox.ExecResult{Command: "", Error: fmt.Sprintf("bash command must be a string, got %T", commandVal)}, nil
+	}
 
 	if err := validateCommand(command); err != nil {
 		return &sandbox.ExecResult{Command: command, Error: err.Error()}, nil
