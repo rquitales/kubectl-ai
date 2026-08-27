@@ -16,6 +16,7 @@ package sessions
 
 import (
 	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -290,5 +291,64 @@ func TestPruneEmptySessionsExcludesResumeTarget(t *testing.T) {
 	}
 	if got, _ := manager.FindSessionByID(empty.ID); got != nil {
 		t.Error("non-excluded empty session should have been pruned")
+	}
+}
+
+func TestTornHistoryLineDoesNotWipeSession(t *testing.T) {
+	// Regression: one torn JSONL line (crash mid-append) used to fail the
+	// whole history parse, the session read as empty, and the startup prune
+	// then deleted it — permanent loss of the full transcript.
+	manager := &SessionManager{store: newMemoryStore()}
+	_ = manager // (memory store covered below via the fs store)
+
+	dir := t.TempDir()
+	store := &FileChatMessageStore{Path: dir}
+	good := &api.Message{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "real answer"}
+	if err := store.AddChatMessage(good); err != nil {
+		t.Fatalf("AddChatMessage: %v", err)
+	}
+	// Simulate a crash mid-append: torn final line.
+	f, err := os.OpenFile(store.HistoryPath(), os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(`{"ID":"x","Source":"model","Type":"text","Paylo`); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	msgs := store.ChatMessages()
+	if len(msgs) != 1 || msgs[0].Payload != "real answer" {
+		t.Fatalf("torn line wiped the history: got %d messages", len(msgs))
+	}
+}
+
+func TestPruneNeverDeletesUnreadableHistory(t *testing.T) {
+	// A session whose history.json has content but parses to zero
+	// conversation messages (fully torn/corrupt) must survive the sweep.
+	manager := &SessionManager{store: newFilesystemStore(t.TempDir())}
+
+	sess, err := manager.NewSession(Metadata{ModelID: "m"})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	// Write garbage directly into the history file.
+	fs, ok := sess.ChatMessageStore.(interface{ HistoryPath() string })
+	if !ok {
+		t.Fatalf("session store does not expose HistoryPath")
+	}
+	if err := os.WriteFile(fs.HistoryPath(), []byte("not-json\n{\"partial\":"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	pruned, err := manager.PruneEmptySessions()
+	if err != nil {
+		t.Fatalf("PruneEmptySessions: %v", err)
+	}
+	if pruned != 0 {
+		t.Errorf("pruned = %d, want 0 (corrupt-history session must survive)", pruned)
+	}
+	if got, _ := manager.FindSessionByID(sess.ID); got == nil {
+		t.Error("corrupt-history session was pruned — data loss")
 	}
 }
