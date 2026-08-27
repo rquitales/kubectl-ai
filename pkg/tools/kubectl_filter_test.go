@@ -222,8 +222,8 @@ func TestKubectlCommandParsing(t *testing.T) {
 		{"literal kubectl", "kubectl get pods", "no", "standard kubectl command"},
 		{"kubectl.exe", "kubectl.exe get pods", "no", "Windows executable"},
 		{"Unix path", "/usr/bin/kubectl get pods", "no", "Full Unix path"},
-		{"relative path", "./kubectl get services", "no", "relative path"},
-		{"nested path", "../bin/kubectl describe pod nginx", "no", "nested relative path"},
+		{"relative path", "./kubectl get services", "unknown", "relative path"},
+		{"nested path", "../bin/kubectl describe pod nginx", "unknown", "nested relative path"},
 
 		// Windows paths with forward slashes (works cross-platform)
 		{"Windows forward slash", "C:/tools/kubectl.exe delete pod nginx", "yes", "Windows path with forward slash"},

@@ -15,6 +15,8 @@
 package tools
 
 import (
+	"path/filepath"
+	"regexp"
 	"strings"
 
 	"k8s.io/klog/v2"
@@ -234,9 +236,12 @@ func analyzeCall(call *syntax.CallExpr) string {
 		return "unknown"
 	}
 
-	// Check if this is kubectl
-	if !strings.Contains(firstArg, "kubectl") {
-		klog.V(2).Infof("analyzeCall: first arg does not contain kubectl: %q", firstArg)
+	// Check if this is kubectl — strictly: an arbitrary binary whose path
+	// merely contains "kubectl" (e.g. /tmp/evil-kubectl) must never inherit
+	// kubectl's read-only classification. Relative paths (./kubectl) are
+	// rejected too: the agent's own workdir is writable by earlier commands.
+	if strings.HasPrefix(firstArg, ".") || !kubectlBinaryName(filepath.Base(firstArg)) {
+		klog.V(2).Infof("analyzeCall: first arg is not a trusted kubectl: %q", firstArg)
 		return "unknown"
 	}
 
@@ -277,11 +282,35 @@ func analyzeCall(call *syntax.CallExpr) string {
 	return "unknown"
 }
 
-// parseKubectlArgs extracts verb, subverb, and dry-run flag from kubectl arguments
+// kubectlBinaryName matches kubectl and versioned wrappers (kubectl-1.28,
+// kubectl.1.24, kubectl.exe) but never arbitrary names containing "kubectl"
+// (evil-kubectl).
+var kubectlBinaryName = regexp.MustCompile(`^kubectl([.-][0-9][0-9.]*)?(\.exe)?$`).MatchString
+
+// parseKubectlArgs extracts verb, subverb, and dry-run flag from kubectl
+// arguments. Flag scanning stops at the first bare "--" — for exec/cp/debug
+// everything after it is the in-pod payload, not kubectl flags. Only
+// --dry-run=client/server/true count as a dry run: "none" and "false"
+// perform the mutation, so they must not suppress the permission prompt.
 func parseKubectlArgs(args []string) (verb, subVerb string, hasDryRun bool) {
-	for _, arg := range args {
-		if strings.HasPrefix(arg, "--dry-run") {
-			hasDryRun = true
+	for i, arg := range args {
+		if arg == "--" {
+			break
+		}
+		if v, ok := strings.CutPrefix(arg, "--dry-run="); ok {
+			hasDryRun = v == "client" || v == "server" || v == "true"
+			continue
+		}
+		if arg == "--dry-run" {
+			// Spaced form: the next arg is the value. Bare trailing
+			// "--dry-run" makes kubectl error out (no mutation happens).
+			if i+1 < len(args) {
+				v := args[i+1]
+				hasDryRun = v == "client" || v == "server" || v == "true"
+			} else {
+				hasDryRun = true // kubectl errors; nothing is mutated
+			}
+			continue
 		}
 		if !strings.HasPrefix(arg, "-") {
 			if verb == "" {
