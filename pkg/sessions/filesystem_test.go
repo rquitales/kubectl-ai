@@ -17,6 +17,7 @@ package sessions
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -385,5 +386,61 @@ func TestWriteMessagesAtomicKeepsBackup(t *testing.T) {
 		if strings.HasSuffix(e.Name(), ".tmp") {
 			t.Errorf("temp file left behind: %s", e.Name())
 		}
+	}
+}
+
+func TestSessionFilesArePrivate(t *testing.T) {
+	// Transcripts can contain secrets (kubectl get secret -o yaml output);
+	// session dirs and history files must not be world-readable.
+	dir := t.TempDir()
+	store := newFilesystemStore(dir)
+	manager := &SessionManager{store: store}
+	sess, err := manager.NewSession(Metadata{ModelID: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.ChatMessageStore.AddChatMessage(&api.Message{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "secret-ish"}); err != nil {
+		t.Fatal(err)
+	}
+
+	fs := sess.ChatMessageStore.(interface{ HistoryPath() string })
+	info, err := os.Stat(fs.HistoryPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		t.Errorf("history.json mode = %o, want no group/other bits", info.Mode().Perm())
+	}
+	dinfo, err := os.Stat(filepath.Join(dir, sess.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dinfo.Mode().Perm()&0o077 != 0 {
+		t.Errorf("session dir mode = %o, want no group/other bits", dinfo.Mode().Perm())
+	}
+}
+
+func TestListSessionsSkipsCorrupt(t *testing.T) {
+	// One malformed metadata.yaml must not brick listing/pruning/picker.
+	dir := t.TempDir()
+	manager := &SessionManager{store: newFilesystemStore(dir)}
+	good, err := manager.NewSession(Metadata{ModelID: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad, err := manager.NewSession(Metadata{ModelID: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, bad.ID, "metadata.yaml"), []byte("{{{not yaml"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	sessions, err := manager.ListSessions()
+	if err != nil {
+		t.Fatalf("ListSessions failed on corrupt session: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].ID != good.ID {
+		t.Errorf("ListSessions = %v, want only the good session", sessions)
 	}
 }
