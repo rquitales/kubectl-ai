@@ -22,6 +22,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/kubectl-ai/gollm"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/sandbox"
+	"mvdan.cc/sh/v3/syntax"
 )
 
 type Kubectl struct {
@@ -130,22 +131,83 @@ func (t *Kubectl) Run(ctx context.Context, args map[string]any) (any, error) {
 	return ExecuteWithStreamingHandling(ctx, t.executor, command, workDir, env, DetectKubectlStreaming)
 }
 
-// DetectKubectlStreaming checks if a kubectl command is a streaming command
+// DetectKubectlStreaming checks if a kubectl command is a streaming command.
+// Detection parses the command's arguments (substring matching missed the
+// long forms): get --watch/-w, logs --follow/-f, attach, proxy, and wait
+// without an explicit --timeout all stream or block indefinitely. Without a
+// bound these hang the turn forever — unrecoverable in RunOnce mode.
 func DetectKubectlStreaming(command string) (bool, string) {
-	isWatch := strings.Contains(command, " get ") && strings.Contains(command, " -w")
-	isLogs := strings.Contains(command, " logs ") && strings.Contains(command, " -f")
-	isAttach := strings.Contains(command, " attach ")
+	parser := syntax.NewParser()
+	file, err := parser.Parse(strings.NewReader(command), "")
+	if err != nil {
+		return false, ""
+	}
+	isStreaming := false
+	streamType := ""
+	syntax.Walk(file, func(node syntax.Node) bool {
+		call, ok := node.(*syntax.CallExpr)
+		if !ok || len(call.Args) == 0 {
+			return true
+		}
+		var args []string
+		for _, arg := range call.Args {
+			lit := arg.Lit()
+			if lit == "" {
+				var sb strings.Builder
+				syntax.NewPrinter().Print(&sb, arg)
+				lit = strings.Trim(sb.String(), "'\"")
+			}
+			if lit != "" {
+				args = append(args, lit)
+			}
+		}
 
-	if isWatch {
-		return true, "watch"
-	}
-	if isLogs {
-		return true, "logs"
-	}
-	if isAttach {
-		return true, "attach"
-	}
-	return false, ""
+		verb := ""
+		watch, follow, hasTimeout := false, false, false
+		for i, arg := range args {
+			if arg == "--" {
+				break // the payload of exec-style calls, not kubectl flags
+			}
+			switch {
+			case arg == "-w" || arg == "--watch":
+				watch = true
+			case arg == "-f" || arg == "--follow":
+				follow = true
+			case strings.HasPrefix(arg, "--watch=") && !strings.HasSuffix(arg, "=false"):
+				watch = true
+			case strings.HasPrefix(arg, "--follow=") && !strings.HasSuffix(arg, "=false"):
+				follow = true
+			case arg == "--timeout" || strings.HasPrefix(arg, "--timeout="):
+				hasTimeout = true
+			}
+			if i == 0 || strings.HasPrefix(arg, "-") {
+				continue
+			}
+			// First positional after the binary name and any value-flags.
+			if verb == "" {
+				switch arg {
+				case "get", "logs", "attach", "proxy", "wait", "watch":
+					verb = arg
+				}
+			}
+		}
+		switch {
+		case verb == "get" && watch:
+			isStreaming, streamType = true, "watch"
+		case verb == "logs" && follow:
+			isStreaming, streamType = true, "logs"
+		case verb == "attach":
+			isStreaming, streamType = true, "attach"
+		case verb == "proxy":
+			isStreaming, streamType = true, "proxy"
+		case verb == "wait" && !hasTimeout:
+			isStreaming, streamType = true, "wait"
+		case verb == "watch":
+			isStreaming, streamType = true, "watch"
+		}
+		return !isStreaming
+	})
+	return isStreaming, streamType
 }
 
 func (t *Kubectl) IsInteractive(args map[string]any) (bool, error) {
