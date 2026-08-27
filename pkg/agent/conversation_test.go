@@ -1736,3 +1736,89 @@ func TestLoadSessionClearsOverrideAndPendingChoices(t *testing.T) {
 		t.Errorf("after switch context = %q, want prod (pinned snapshot, not the staging override)", c)
 	}
 }
+
+func TestLooksLikeContextLengthError(t *testing.T) {
+	if !looksLikeContextLengthError(fmt.Errorf("API Error: Status=400, Message='context_length_exceeded: maximum context length is 128000 tokens'")) {
+		t.Error("context_length_exceeded not detected")
+	}
+	if !looksLikeContextLengthError(fmt.Errorf("prompt is too long: 200000 tokens > 128000 maximum")) {
+		t.Error("'prompt is too long' not detected")
+	}
+	if looksLikeContextLengthError(fmt.Errorf("connection refused")) {
+		t.Error("unrelated error misdetected as context-length")
+	}
+	if looksLikeContextLengthError(nil) {
+		t.Error("nil error misdetected")
+	}
+}
+
+func TestAutoCompactOnContextLengthError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	store := sessions.NewInMemoryChatStore()
+	client := mocks.NewMockClient(ctrl)
+	chat := mocks.NewMockChat(ctrl)
+
+	client.EXPECT().StartChat(gomock.Any(), "test-model").Return(chat)
+	chat.EXPECT().Initialize(gomock.Any()).Return(nil).AnyTimes()
+	chat.EXPECT().SetFunctionDefinitions(gomock.Any()).Return(nil)
+	chat.EXPECT().IsRetryableError(gomock.Any()).Return(false).AnyTimes()
+	// The compact summarization call.
+	client.EXPECT().GenerateCompletion(gomock.Any(), gomock.Any()).Return(&fakeCompletionResponse{text: "the summary"}, nil).AnyTimes()
+
+	// Turn 1 fails with context-length; the retried turn succeeds.
+	firstIter := gollm.ChatResponseIterator(func(yield func(gollm.ChatResponse, error) bool) {
+		yield(nil, fmt.Errorf("API Error: Status=400, Message='context_length_exceeded: maximum context length'"))
+	})
+	secondIter := gollm.ChatResponseIterator(func(yield func(gollm.ChatResponse, error) bool) {
+		yield(chatWith(fText("recovered answer")), nil)
+	})
+	gomock.InOrder(
+		chat.EXPECT().SendStreaming(gomock.Any(), gomock.Any()).Return(firstIter, nil),
+		chat.EXPECT().SendStreaming(gomock.Any(), gomock.Any()).Return(secondIter, nil),
+	)
+
+	a := &Agent{
+		ChatMessageStore: store,
+		LLM:              client,
+		Model:            "test-model",
+		MaxIterations:    4,
+		Session:          &api.Session{ID: "test-session", ChatMessageStore: store, AgentState: api.AgentStateIdle},
+	}
+	if err := a.Init(ctx); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	// Seed some history so compact has something to summarize.
+	_ = store.AddChatMessage(&api.Message{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "earlier question"})
+	_ = store.AddChatMessage(&api.Message{Source: api.MessageSourceModel, Type: api.MessageTypeText, Payload: "earlier answer"})
+
+	if err := a.Run(ctx, ""); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if m := recvMsg(t, ctx, a.Output); m.Type != api.MessageTypeUserInputRequest {
+		t.Fatalf("expected user-input-request, got %v", m.Type)
+	}
+	a.Input <- &api.UserInputResponse{Query: "the failing query"}
+
+	final := recvUntil(t, ctx, a.Output, func(m *api.Message) bool {
+		return m.Type == api.MessageTypeText && m.Source == api.MessageSourceModel && m.Payload == "recovered answer"
+	})
+	if final == nil {
+		t.Fatalf("turn did not recover after auto-compact")
+	}
+
+	// The history was compacted: the summary seed is present.
+	var foundSummary bool
+	for _, m := range store.ChatMessages() {
+		if s, ok := m.Payload.(string); ok && strings.Contains(s, "summary of our conversation") {
+			foundSummary = true
+		}
+	}
+	if !foundSummary {
+		t.Error("history was not compacted during recovery")
+	}
+}
