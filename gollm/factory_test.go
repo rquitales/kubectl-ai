@@ -133,3 +133,23 @@ func TestRetryChatDoesNotDuplicateHistory(t *testing.T) {
 		t.Errorf("history has %d copies of the query after retries, want 1", len(underlying.history))
 	}
 }
+
+func TestRetryInvokesOnRetryCallback(t *testing.T) {
+	underlying := &stubRetryChat{errs: []error{errStubRetryable}}
+	var retries []time.Duration
+	chat := NewRetryChat(underlying, RetryConfig{
+		MaxAttempts:    2,
+		InitialBackoff: time.Millisecond,
+		MaxBackoff:     5 * time.Millisecond,
+		BackoffFactor:  1,
+		OnRetry: func(attempt int, err error, wait time.Duration) {
+			retries = append(retries, wait)
+		},
+	})
+	if _, err := chat.SendStreaming(context.Background(), "hi"); err != nil {
+		t.Fatalf("SendStreaming: %v", err)
+	}
+	if len(retries) != 1 {
+		t.Fatalf("OnRetry called %d times, want 1", len(retries))
+	}
+}

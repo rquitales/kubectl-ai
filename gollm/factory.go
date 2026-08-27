@@ -216,6 +216,9 @@ type RetryConfig struct {
 	MaxBackoff     time.Duration
 	BackoffFactor  float64
 	Jitter         bool
+	// OnRetry, when set, is invoked before each backoff sleep so callers can
+	// surface the wait (a silent 10-70s backoff reads as a hung UI).
+	OnRetry func(attempt int, err error, wait time.Duration)
 }
 
 // DefaultRetryConfig provides sensible defaults (same as before)
@@ -280,6 +283,10 @@ func Retry[T any](
 		}
 
 		log.V(2).Info("Waiting before next retry attempt", "waitTime", waitTime, "nextAttempt", attempt+1, "maxAttempts", config.MaxAttempts)
+
+		if config.OnRetry != nil {
+			config.OnRetry(attempt, lastErr, waitTime)
+		}
 
 		// Wait or react to context cancellation
 		select {

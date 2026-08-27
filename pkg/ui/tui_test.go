@@ -4573,3 +4573,34 @@ func TestStatusClickIgnoredWhilePanelOpen(t *testing.T) {
 		t.Error("status clicks must be no-ops while an overlay is open")
 	}
 }
+
+func TestToolResultsCachedWithToggleAwareKey(t *testing.T) {
+	// Regression: making tool responses uncacheable re-rendered every tool
+	// result on every 150ms streaming refresh — visibly laggy streaming on
+	// sessions with many tool calls.
+	m := newBrowserModel()
+	m.width, m.height = 100, 40
+	m.resize()
+	msg := &api.Message{ID: "r1", Source: api.MessageSourceAgent, Type: api.MessageTypeToolCallResponse, Payload: map[string]any{"stdout": "some output"}}
+	r, _ := m.cache.getRenderer(80)
+
+	first := m.renderMessage(msg, r, 80)
+	if _, ok := m.cache.get("r1"); !ok {
+		t.Fatal("collapsed tool response should be cached")
+	}
+	if got := m.renderMessage(msg, r, 80); got != first {
+		t.Error("collapsed re-render did not hit the cache")
+	}
+
+	// Toggling expands — a different cache entry, and the orphan-response
+	// fix still holds (the toggle re-renders).
+	m.expandToolResults = true
+	_ = m.renderMessage(msg, r, 80)
+	if _, ok := m.cache.get("r1|expanded"); !ok {
+		t.Fatal("expanded tool response should be cached under the toggle-aware key")
+	}
+	m.expandToolResults = false
+	if got := m.renderMessage(msg, r, 80); got != first {
+		t.Error("collapsing again should hit the original cache entry")
+	}
+}

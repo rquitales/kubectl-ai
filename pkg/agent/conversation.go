@@ -487,15 +487,25 @@ func (s *Agent) rebuildChat(ctx context.Context) error {
 		return fmt.Errorf("generating system prompt: %w", err)
 	}
 
-	// Start a new chat session
+	// Start a new chat session. Interactive tuning: short initial backoff,
+	// and surface every retry — a silent 10-70s backoff otherwise reads as
+	// a hung/laggy UI with zero feedback.
 	s.llmChat = gollm.NewRetryChat(
 		s.LLM.StartChat(systemPrompt, s.Model),
 		gollm.RetryConfig{
 			MaxAttempts:    3,
-			InitialBackoff: 10 * time.Second,
-			MaxBackoff:     60 * time.Second,
+			InitialBackoff: 2 * time.Second,
+			MaxBackoff:     20 * time.Second,
 			BackoffFactor:  2,
 			Jitter:         true,
+			OnRetry: func(attempt int, err error, wait time.Duration) {
+				s.Output <- &api.Message{
+					Source:    api.MessageSourceAgent,
+					Type:      api.MessageTypeText,
+					Payload:   fmt.Sprintf("⏳ %v — retrying in %s (attempt %d/3)…", err, wait.Round(time.Second), attempt+1),
+					Timestamp: time.Now(),
+				}
+			},
 		},
 	)
 	if err := s.llmChat.Initialize(s.Session.ChatMessageStore.ChatMessages()); err != nil {

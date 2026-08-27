@@ -3072,14 +3072,19 @@ func (m model) renderMessage(msg *api.Message, r *glamour.TermRenderer, w int) s
 
 	// Check cache (except tool calls which show status, and text deltas
 	// whose content changes per chunk; the final text message shares the
-	// delta's ID and must render fresh).
+	// delta's ID and must render fresh). Tool responses ARE cacheable, but
+	// under a toggle-aware key: they render differently expanded vs
+	// collapsed, and making them uncacheable entirely re-rendered every
+	// tool result on every streaming refresh — the laggy-streaming
+	// regression.
 	cacheable := msg.ID != "" && msg.Type != api.MessageTypeToolCallRequest && msg.Type != api.MessageTypeTextDelta &&
-		msg.Type != api.MessageTypeThinking && msg.Type != api.MessageTypeThinkingDelta &&
-		// Tool responses depend on the expandToolResults toggle — caching
-		// them froze orphan (post-Ctrl+L-split) responses in one state.
-		msg.Type != api.MessageTypeToolCallResponse
+		msg.Type != api.MessageTypeThinking && msg.Type != api.MessageTypeThinkingDelta
+	cacheKey := msg.ID
+	if msg.Type == api.MessageTypeToolCallResponse && m.expandToolResults {
+		cacheKey += "|expanded"
+	}
 	if cacheable {
-		if cached, ok := m.cache.get(msg.ID); ok {
+		if cached, ok := m.cache.get(cacheKey); ok {
 			return cached
 		}
 	}
@@ -3098,7 +3103,7 @@ func (m model) renderMessage(msg *api.Message, r *glamour.TermRenderer, w int) s
 
 	// Cache result
 	if cacheable && result != "" {
-		m.cache.set(msg.ID, result)
+		m.cache.set(cacheKey, result)
 	}
 	return result
 }
