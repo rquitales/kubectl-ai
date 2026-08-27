@@ -1303,6 +1303,7 @@ var slashCommands = map[string]string{
 	"resume":         "resume-session",
 	"delete":         "delete-session",
 	"delete-session": "delete-session",
+	"fork":           "fork-session",
 	"context":        "context",
 	"contexts":       "context",
 	"namespace":      "namespace",
@@ -1523,6 +1524,24 @@ func (c *Agent) handleMetaQuery(ctx context.Context, query string) (answer strin
 	if query == "namespace" || query == "ns" || strings.HasPrefix(query, "namespace ") || strings.HasPrefix(query, "ns ") {
 		name := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(query, "namespace"), "ns"))
 		return c.handleNamespaceQuery(ctx, name)
+	}
+
+	if query == "fork-session" {
+		manager, err := sessions.NewSessionManager(c.SessionBackend)
+		if err != nil {
+			return "", false, err
+		}
+		c.sessionMu.Lock()
+		currentID := c.Session.ID
+		c.sessionMu.Unlock()
+		fork, err := manager.ForkSession(currentID)
+		if err != nil {
+			return "", false, err
+		}
+		if err := c.LoadSession(fork.ID); err != nil {
+			return "", false, err
+		}
+		return fmt.Sprintf("Forked the session and switched to the copy (%s). The original is unchanged.", fork.ID), true, nil
 	}
 
 	if query == "delete-session" || strings.HasPrefix(query, "delete-session ") {
