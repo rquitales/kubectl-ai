@@ -443,6 +443,9 @@ func (s *Agent) Init(ctx context.Context) error {
 
 	s.Tools.RegisterTool(tools.NewBashTool(s.Executor))
 	s.Tools.RegisterTool(tools.NewKubectlTool(s.Executor))
+	// Manifest authoring without heredoc quoting fights.
+	s.Tools.RegisterTool(tools.NewWriteFileTool())
+	s.Tools.RegisterTool(tools.NewReadFileTool())
 
 	// MCP tools must be registered BEFORE rebuildChat so the chat's
 	// function definitions include them.
