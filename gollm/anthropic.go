@@ -547,7 +547,14 @@ func (r *anthropicStreamResponse) UsageMetadata() any {
 
 func (r *anthropicStreamResponse) Candidates() []Candidate {
 	if r.text == "" && r.functionCall == nil && r.thinking == "" {
-		return nil
+		if r.usage == nil {
+			return nil
+		}
+		// A usage-only final chunk still yields one (empty) candidate:
+		// the agentic loop treats zero candidates as a fatal error, which
+		// used to kill every successful Anthropic turn — and drop the tool
+		// calls accumulated in that turn before they could dispatch.
+		return []Candidate{&anthropicStreamCandidate{}}
 	}
 	return []Candidate{&anthropicStreamCandidate{
 		text:         r.text,

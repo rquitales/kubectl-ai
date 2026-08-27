@@ -498,3 +498,105 @@ func TestAgentRetainsPartialStreamOnError(t *testing.T) {
 		t.Errorf("stored model texts = %v, want [partial answer so far]", texts)
 	}
 }
+
+// usageOnlyResponse mimics the Anthropic provider's final stream chunk: no
+// candidates, only usage metadata.
+type usageOnlyResponse struct{}
+
+func (usageOnlyResponse) UsageMetadata() any            { return map[string]any{"input_tokens": 10} }
+func (usageOnlyResponse) Candidates() []gollm.Candidate { return nil }
+
+func TestAgentToleratesUsageOnlyStreamChunk(t *testing.T) {
+	// Regression: a zero-candidate chunk carrying usage metadata ended the
+	// turn as "no candidates in response" — and silently dropped the tool
+	// calls accumulated in that same turn (Anthropic streams this chunk at
+	// the end of every successful response).
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	store := sessions.NewInMemoryChatStore()
+	client := mocks.NewMockClient(ctrl)
+	chat := mocks.NewMockChat(ctrl)
+
+	client.EXPECT().StartChat(gomock.Any(), "test-model").Return(chat)
+	chat.EXPECT().Initialize(gomock.Any()).Return(nil)
+	chat.EXPECT().SetFunctionDefinitions(gomock.Any()).Return(nil)
+	client.EXPECT().GenerateCompletion(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+	chat.EXPECT().IsRetryableError(gomock.Any()).Return(false).AnyTimes()
+
+	// Turn 1: a tool call followed by a usage-only chunk (stream ends); the
+	// call must still dispatch. Turn 2: usage chunk then the final text.
+	firstIter := gollm.ChatResponseIterator(func(yield func(gollm.ChatResponse, error) bool) {
+		if !yield(chatWith(fCalls("mocktool", map[string]any{"command": "get"})), nil) {
+			return
+		}
+		yield(usageOnlyResponse{}, nil)
+	})
+	secondIter := gollm.ChatResponseIterator(func(yield func(gollm.ChatResponse, error) bool) {
+		if !yield(usageOnlyResponse{}, nil) {
+			return
+		}
+		yield(chatWith(fText("done")), nil)
+	})
+	gomock.InOrder(
+		chat.EXPECT().SendStreaming(gomock.Any(), gomock.Any()).Return(firstIter, nil),
+		chat.EXPECT().SendStreaming(gomock.Any(), gomock.Any()).Return(secondIter, nil),
+	)
+
+	tool := mocks.NewMockTool(ctrl)
+	tool.EXPECT().Name().Return("mocktool").AnyTimes()
+	tool.EXPECT().Description().Return("mock tool").AnyTimes()
+	tool.EXPECT().FunctionDefinition().Return(&gollm.FunctionDefinition{Name: "mocktool"}).AnyTimes()
+	tool.EXPECT().IsInteractive(gomock.Any()).Return(false, nil).AnyTimes()
+	tool.EXPECT().CheckModifiesResource(gomock.Any()).Return("no").AnyTimes()
+	tool.EXPECT().Run(gomock.Any(), gomock.Any()).Return(map[string]any{"result": "ok"}, nil)
+
+	var toolset tools.Tools
+	toolset.Init()
+	toolset.RegisterTool(tool)
+
+	a := &Agent{
+		ChatMessageStore: store,
+		LLM:              client,
+		Model:            "test-model",
+		Tools:            toolset,
+		MaxIterations:    4,
+		Session:          &api.Session{ID: "test-session", ChatMessageStore: store, AgentState: api.AgentStateIdle},
+	}
+	if err := a.Init(ctx); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := a.Run(ctx, ""); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if m := recvMsg(t, ctx, a.Output); m.Type != api.MessageTypeUserInputRequest {
+		t.Fatalf("expected user-input-request, got %v", m.Type)
+	}
+	a.Input <- &api.UserInputResponse{Query: "go"}
+
+	final := recvUntil(t, ctx, a.Output, func(m *api.Message) bool {
+		return m.Type == api.MessageTypeText && m.Source == api.MessageSourceModel && m.Payload == "done"
+	})
+	if final == nil {
+		t.Fatalf("turn did not complete after the usage-only chunk")
+	}
+	// No spurious error may appear before the next input prompt.
+	for {
+		select {
+		case v := <-a.Output:
+			m := v.(*api.Message)
+			if m.Type == api.MessageTypeError {
+				t.Fatalf("spurious error message after usage-only chunk: %v", m.Payload)
+			}
+			if m.Type == api.MessageTypeUserInputRequest {
+				return // done
+			}
+		case <-ctx.Done():
+			t.Fatalf("timeout waiting for the post-turn input prompt")
+		}
+	}
+}

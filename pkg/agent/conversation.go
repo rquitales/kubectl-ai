@@ -992,6 +992,13 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 					}
 
 					if len(response.Candidates()) == 0 {
+						// A usage-only/heartbeat chunk is not an error —
+						// skipping it keeps the turn (and any tool calls
+						// accumulated so far) alive.
+						if response.UsageMetadata() != nil {
+							lastUsage = response.UsageMetadata()
+							continue
+						}
 						llmError = fmt.Errorf("no candidates in response")
 						log.Error(nil, "No candidates in response")
 						c.setAgentState(api.AgentStateDone)
