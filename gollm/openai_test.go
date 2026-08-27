@@ -649,3 +649,29 @@ func TestOpenAIResponseChatSessionInitializeSeedsHistory(t *testing.T) {
 		t.Fatalf("expected 2 seeded messages, got %d", len(cs.history))
 	}
 }
+
+func TestInitializePreservesSystemPrompt(t *testing.T) {
+	// Regression: Initialize rebuilt history wholesale, wiping the system
+	// message StartChat had just added — every resume/compact/clear and
+	// EVERY fresh chat (rebuildChat calls StartChat then Initialize) sent
+	// requests with no system prompt at all.
+	cs := &openAIChatSession{systemPrompt: "you are a kubectl expert"}
+	if err := cs.Initialize([]*api.Message{
+		{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "hi"},
+	}); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	if len(cs.history) != 2 {
+		t.Fatalf("history len = %d, want 2 (system + user)", len(cs.history))
+	}
+
+	cs2 := &openAIChatSession{}
+	if err := cs2.Initialize([]*api.Message{
+		{Source: api.MessageSourceUser, Type: api.MessageTypeText, Payload: "hi"},
+	}); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	if len(cs2.history) != 1 {
+		t.Fatalf("history len = %d, want 1 (no system prompt configured)", len(cs2.history))
+	}
+}
