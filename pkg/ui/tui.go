@@ -3062,9 +3062,8 @@ func (m model) renderMessage(msg *api.Message, r *glamour.TermRenderer, w int) s
 			return ""
 		}
 	}
-	if msg.Type == api.MessageTypeToolCallResponse {
-		return m.renderToolResult(msg)
-	}
+	// (Tool responses render through the cacheable path below — they must be
+	// cached or every 150ms streaming refresh re-renders every result.)
 	// Skip choice requests - they're rendered in the input area instead
 	if msg.Type == api.MessageTypeUserChoiceRequest || msg.Type == api.MessageTypeSessionPickerRequest {
 		return ""
@@ -3091,6 +3090,8 @@ func (m model) renderMessage(msg *api.Message, r *glamour.TermRenderer, w int) s
 
 	var result string
 	switch msg.Type {
+	case api.MessageTypeToolCallResponse:
+		result = m.renderToolResult(msg)
 	case api.MessageTypeToolCallRequest:
 		result = m.renderToolCall(msg, w)
 	case api.MessageTypeError:
