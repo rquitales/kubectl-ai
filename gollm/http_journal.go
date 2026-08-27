@@ -19,6 +19,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httputil"
+	"strings"
 
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/journal"
 
@@ -36,8 +37,17 @@ type journalingRoundTripper struct {
 func (jrt *journalingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	recorder := journal.RecorderFromContext(req.Context())
 
-	// Log the outgoing request.
-	reqBytes, err := httputil.DumpRequestOut(req, true)
+	// Log the outgoing request — with credentials redacted: trace files and
+	// V(2) logs previously recorded Authorization/x-api-key headers in
+	// plaintext.
+	reqForLog := req.Clone(req.Context())
+	reqForLog.Header = req.Header.Clone()
+	for _, h := range []string{"Authorization", "X-Api-Key", "X-Goog-Api-Key", "Api-Key", "X-Amz-Security-Token"} {
+		if reqForLog.Header.Get(h) != "" {
+			reqForLog.Header.Set(h, "REDACTED")
+		}
+	}
+	reqBytes, err := httputil.DumpRequestOut(reqForLog, true)
 	if err == nil {
 		err = recorder.Write(req.Context(), &journal.Event{
 			Action:  journal.ActionHTTPRequest,
@@ -60,6 +70,28 @@ func (jrt *journalingRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 		}
 		klog.Errorf("RoundTripper error: %v", err)
 		return nil, err
+	}
+
+	// Streaming (SSE) responses must NOT be buffered here: buffering delays
+	// the stream until generation completes (time-to-first-token becomes the
+	// full generation time) and trips the client's total timeout on long
+	// generations. Tee the body instead: record chunks as they pass through
+	// and journal the assembled body when the stream finishes.
+	if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+		resp.Body = &teeReadCloser{
+			ReadCloser: resp.Body,
+			onDone: func(body []byte) {
+				payload := map[string]any{
+					"status":  resp.Status,
+					"headers": resp.Header,
+					"body":    string(body),
+				}
+				if err := recorder.Write(req.Context(), &journal.Event{Action: journal.ActionHTTPResponse, Payload: payload}); err != nil {
+					klog.Errorf("Error writing streamed response to journal: %v", err)
+				}
+			},
+		}
+		return resp, nil
 	}
 
 	// Read the entire response body so we can log it and then pass it along.
@@ -102,4 +134,38 @@ func withJournaling(client *http.Client) *http.Client {
 	}
 
 	return client
+}
+
+// teeReadCloser accumulates response bytes as they are read and invokes
+// onDone with the assembled body when the stream reaches EOF or is closed.
+type teeReadCloser struct {
+	io.ReadCloser
+	buf    bytes.Buffer
+	onDone func(body []byte)
+	done   bool
+}
+
+func (t *teeReadCloser) Read(p []byte) (int, error) {
+	n, err := t.ReadCloser.Read(p)
+	if n > 0 {
+		t.buf.Write(p[:n])
+	}
+	if err == io.EOF {
+		t.finish()
+	}
+	return n, err
+}
+
+func (t *teeReadCloser) Close() error {
+	err := t.ReadCloser.Close()
+	t.finish()
+	return err
+}
+
+func (t *teeReadCloser) finish() {
+	if t.done {
+		return
+	}
+	t.done = true
+	t.onDone(t.buf.Bytes())
 }
