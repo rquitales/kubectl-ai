@@ -296,7 +296,11 @@ func (c *LlamaCppChat) IsRetryableError(err error) bool {
 }
 
 func (c *LlamaCppChat) Initialize(messages []*api.Message) error {
-	klog.Warning("chat history persistence is not supported for provider 'llamacpp', using in-memory chat history")
+	// Seed the conversation from the persisted session.
+	for _, seed := range SeedableMessages(messages) {
+		content := seed.Content
+		c.history = append(c.history, llamacppChatMessage{Role: seed.Role, Content: &content})
+	}
 	return nil
 }
 
