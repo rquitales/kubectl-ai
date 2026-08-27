@@ -322,6 +322,7 @@ func (cs *grokChatSession) SendStreaming(ctx context.Context, contents ...any) (
 
 	// Create and return the stream iterator
 	return func(yield func(ChatResponse, error) bool) {
+		defer stream.Close()
 		var lastResponseChunk *grokChatStreamResponse
 
 		// Process stream chunks
@@ -331,10 +332,32 @@ func (cs *grokChatSession) SendStreaming(ctx context.Context, contents ...any) (
 			// Update the accumulator with the new chunk
 			acc.AddChunk(chunk)
 
+			// Tool calls whose arguments finished accumulating as of this
+			// chunk (the openai provider does exactly the same). Note:
+			// JustFinishedToolCall does not clear its state — single check.
+			var completed []openai.ChatCompletionMessageToolCall
+			if tool, ok := acc.JustFinishedToolCall(); ok {
+				completed = append(completed, openai.ChatCompletionMessageToolCall{
+					ID: tool.ID,
+					Function: openai.ChatCompletionMessageToolCallFunction{
+						Name:      tool.Name,
+						Arguments: tool.Arguments,
+					},
+					Type: "function",
+				})
+			}
+
+			// Skip contentless chunks (usage/heartbeats): yielding them
+			// trips the agent's zero-candidate handling for no benefit.
+			if len(chunk.Choices) == 0 && len(completed) == 0 {
+				continue
+			}
+
 			// Create a streaming response for this chunk
 			streamResponse := &grokChatStreamResponse{
-				streamChunk: chunk,
-				accumulator: acc,
+				streamChunk:        chunk,
+				accumulator:        acc,
+				completedToolCalls: completed,
 			}
 
 			// Keep track of the last response to append to history
@@ -493,6 +516,10 @@ func (p *grokPart) AsThinking() (string, bool) {
 type grokChatStreamResponse struct {
 	streamChunk openai.ChatCompletionChunk
 	accumulator openai.ChatCompletionAccumulator
+	// completedToolCalls holds the tool calls that finished accumulating as
+	// of this chunk — the ONLY tool calls yielded. Raw deltas carry partial
+	// JSON arguments and must never be exposed as function calls.
+	completedToolCalls []openai.ChatCompletionMessageToolCall
 }
 
 // Ensure the streaming response implements ChatResponse interface.
@@ -515,14 +542,15 @@ func (r *grokChatStreamResponse) Candidates() []Candidate {
 
 	candidates := make([]Candidate, len(r.streamChunk.Choices))
 	for i, choice := range r.streamChunk.Choices {
-		candidates[i] = &grokStreamCandidate{streamChoice: choice}
+		candidates[i] = &grokStreamCandidate{streamChoice: choice, completedToolCalls: r.completedToolCalls}
 	}
 	return candidates
 }
 
 // grokStreamCandidate adapts a streaming chunk choice to the Candidate interface.
 type grokStreamCandidate struct {
-	streamChoice openai.ChatCompletionChunkChoice
+	streamChoice       openai.ChatCompletionChunkChoice
+	completedToolCalls []openai.ChatCompletionMessageToolCall
 }
 
 // Ensure the streaming candidate implements Candidate interface.
@@ -545,26 +573,11 @@ func (c *grokStreamCandidate) Parts() []Part {
 		})
 	}
 
-	// Include tool calls if present
-	if len(c.streamChoice.Delta.ToolCalls) > 0 {
-		// Convert ChatCompletionToolCallDelta to ChatCompletionMessageToolCall
-		toolCalls := make([]openai.ChatCompletionMessageToolCall, 0, len(c.streamChoice.Delta.ToolCalls))
-		for _, delta := range c.streamChoice.Delta.ToolCalls {
-			// Create a new ChatCompletionMessageToolCall directly
-			toolCall := openai.ChatCompletionMessageToolCall{
-				ID: delta.ID,
-				Function: openai.ChatCompletionMessageToolCallFunction{
-					Name:      delta.Function.Name,
-					Arguments: delta.Function.Arguments,
-				},
-				Type: "function", // The type is always "function" for function calls
-			}
-
-			toolCalls = append(toolCalls, toolCall)
-		}
-
+	// Include tool calls only once fully accumulated — raw deltas carry
+	// partial JSON arguments, and executing those corrupts/empties args.
+	if len(c.completedToolCalls) > 0 {
 		parts = append(parts, &grokStreamPart{
-			toolCalls: toolCalls,
+			toolCalls: c.completedToolCalls,
 		})
 	}
 
