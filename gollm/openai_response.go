@@ -82,7 +82,11 @@ func (cs *openAIResponseChatSession) Send(ctx context.Context, contents ...any) 
 func (cs *openAIResponseChatSession) SendStreaming(ctx context.Context, contents ...any) (ChatResponseIterator, error) {
 	klog.V(1).InfoS("Starting OpenAI streaming request", "model", cs.model)
 
-	// Process and append messages to history
+	// Marshal the messages WITHOUT committing them to history yet — the
+	// history append must happen only after the call succeeds, because the
+	// retry decorator re-invokes this method and would otherwise duplicate
+	// the user contents (and duplicate tool_call_id responses → API 400s).
+	historyBefore := len(cs.history)
 	if err := cs.addContentsToHistory(contents); err != nil {
 		return nil, err
 	}
@@ -98,6 +102,11 @@ func (cs *openAIResponseChatSession) SendStreaming(ctx context.Context, contents
 		"toolCount", len(cs.params.Tools))
 
 	resp, err := cs.client.Responses.New(ctx, cs.params)
+	if err != nil {
+		// Roll back: the retry decorator re-invokes SendStreaming, and
+		// keeping the pre-staged contents would duplicate them in history.
+		cs.history = cs.history[:historyBefore]
+	}
 	if err == nil {
 		for _, output := range resp.Output {
 			switch output.AsAny().(type) {

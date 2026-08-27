@@ -87,3 +87,49 @@ func TestRetryChatRetriesSendStreaming(t *testing.T) {
 		t.Fatalf("SendStreaming after exhaustion = %v, want %v", err, errStubRetryable)
 	}
 }
+
+type historyRecordingChat struct {
+	history []string
+	errs    []error
+	calls   int
+}
+
+func (s *historyRecordingChat) Send(context.Context, ...any) (ChatResponse, error) { return nil, nil }
+func (s *historyRecordingChat) SendStreaming(_ context.Context, contents ...any) (ChatResponseIterator, error) {
+	// Eager-history provider shape: contents land in history BEFORE the call.
+	for _, c := range contents {
+		if text, ok := c.(string); ok {
+			s.history = append(s.history, text)
+		}
+	}
+	s.calls++
+	if s.calls <= len(s.errs) {
+		// Correct behavior: roll back the staged contents on failure.
+		s.history = s.history[:len(s.history)-len(contents)]
+		return nil, s.errs[s.calls-1]
+	}
+	return ChatResponseIterator(func(func(ChatResponse, error) bool) {}), nil
+}
+func (s *historyRecordingChat) SetFunctionDefinitions([]*FunctionDefinition) error { return nil }
+func (s *historyRecordingChat) IsRetryableError(err error) bool {
+	return errors.Is(err, errStubRetryable)
+}
+func (s *historyRecordingChat) Initialize([]*api.Message) error { return nil }
+
+func TestRetryChatDoesNotDuplicateHistory(t *testing.T) {
+	// Eager providers stage the user contents before the API call; a retry
+	// must not leave N copies in the provider-side history.
+	underlying := &historyRecordingChat{errs: []error{errStubRetryable, errStubRetryable}}
+	chat := NewRetryChat(underlying, RetryConfig{
+		MaxAttempts:    3,
+		InitialBackoff: time.Millisecond,
+		MaxBackoff:     5 * time.Millisecond,
+		BackoffFactor:  1,
+	})
+	if _, err := chat.SendStreaming(context.Background(), "the query"); err != nil {
+		t.Fatalf("SendStreaming: %v", err)
+	}
+	if len(underlying.history) != 1 {
+		t.Errorf("history has %d copies of the query after retries, want 1", len(underlying.history))
+	}
+}
