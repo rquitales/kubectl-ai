@@ -205,17 +205,19 @@ func convertMCPToolsToTools(mcpTools []mcp.Tool) ([]Tool, error) {
 		}
 		// TODO: Annotations (give hints about e.g. read-only, destructive, idempotent, open-world)
 
-		if mcpTool.InputSchema.Type != "" {
-			schema, err := convertMCPInputSchema(&mcpTool.InputSchema)
-			if err != nil {
-				return nil, fmt.Errorf("converting MCP input schema to tool input schema: %w", err)
-			}
-			tool.InputSchema = schema
-		} else {
-			// TODO: Use RawInputSchema if available
-			// klog.Warningf("no input schema for tool %s", mcpTool.Name)
-			return nil, fmt.Errorf("no input schema for tool %s", mcpTool.Name)
+		// One malformed or unusual schema must not kill the server's whole
+		// tool list (previously it aborted discovery for ALL servers and
+		// failed agent startup). Skip-and-log instead.
+		if mcpTool.InputSchema.Type == "" {
+			klog.Warningf("MCP tool %q has no input schema; skipping", mcpTool.Name)
+			continue
 		}
+		schema, err := convertMCPInputSchema(&mcpTool.InputSchema)
+		if err != nil {
+			klog.Warningf("MCP tool %q has an unsupported input schema (%v); skipping", mcpTool.Name, err)
+			continue
+		}
+		tool.InputSchema = schema
 
 		tools = append(tools, tool)
 	}
@@ -227,8 +229,12 @@ func convertMCPInputSchema(mcpInputSchema *mcp.ToolInputSchema) (*gollm.Schema, 
 	switch mcpInputSchema.Type {
 	case "string":
 		gollmSchema.Type = gollm.TypeString
-	// case "number":
-	// 	gollmSchema.Type = gollm.TypeNumber
+	case "number":
+		gollmSchema.Type = gollm.TypeNumber
+	case "integer":
+		gollmSchema.Type = gollm.TypeInteger
+	case "array":
+		gollmSchema.Type = gollm.TypeArray
 	case "boolean":
 		gollmSchema.Type = gollm.TypeBoolean
 	case "object":
@@ -245,6 +251,10 @@ func convertMCPInputSchema(mcpInputSchema *mcp.ToolInputSchema) (*gollm.Schema, 
 					return nil, fmt.Errorf("converting MCP input schema to tool input schema: %w", err)
 				}
 				gollmSchema.Properties[key] = gollmValue
+			} else if valueBool, ok := value.(bool); ok {
+				// Boolean property schema: {"prop": true} — unconstrained.
+				_ = valueBool
+				gollmSchema.Properties[key] = &gollm.Schema{}
 			} else if valueMap, ok := value.(map[string]interface{}); ok && valueMap != nil {
 				gollmValue, err := convertMCPMapSchema(key, valueMap)
 				if err != nil {

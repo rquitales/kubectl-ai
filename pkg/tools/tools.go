@@ -283,6 +283,12 @@ func LoadAndRegisterCustomTools(configPath string) error {
 		}
 
 		for _, entry := range configPaths {
+			// Only YAML files are tool configs — a README.md or .DS_Store in
+			// the directory used to abort loading every tool.
+			name := strings.ToLower(entry.Name())
+			if entry.IsDir() || (!strings.HasSuffix(name, ".yaml") && !strings.HasSuffix(name, ".yml")) {
+				continue
+			}
 			if err := LoadAndRegisterCustomTools(filepath.Join(configPath, entry.Name())); err != nil {
 				return err
 			}
@@ -329,7 +335,11 @@ func LoadAndRegisterCustomTools(configPath string) error {
 
 // For CustomTool
 func (t *CustomTool) IsInteractive(args map[string]any) (bool, error) {
-	// Custom tools are not interactive by default
+	// Honor the tool's declared is_interactive config (previously the field
+	// was dead — a custom tool declared interactive was never flagged).
+	if t.config.IsInteractive {
+		return true, fmt.Errorf("custom tool %q is declared interactive", t.config.Name)
+	}
 	return false, nil
 }
 

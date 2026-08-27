@@ -115,8 +115,9 @@ func (t *CustomTool) addCommandPrefix(inputCmd string) (string, error) {
 		return inputCmd, nil
 	}
 
-	// If we get here, it's a simple command without the prefix
-	if strings.HasPrefix(inputCmd, t.config.Command) {
+	// If we get here, it's a simple command without the prefix. Word
+	// boundary: "helm" must not match "helmfile apply".
+	if inputCmd == t.config.Command || strings.HasPrefix(inputCmd, t.config.Command+" ") {
 		return inputCmd, nil
 	}
 
@@ -140,8 +141,13 @@ func (t *CustomTool) Run(ctx context.Context, args map[string]any) (any, error) 
 		return nil, fmt.Errorf("failed to process command: %w", err)
 	}
 
-	workDir := ctx.Value(WorkDirKey).(string)
+	workDir, _ := ctx.Value(WorkDirKey).(string)
 	env := os.Environ()
+	// Custom tools run kubectl-adjacent commands too; honor the session's
+	// kubeconfig like the built-in tools do.
+	if kubeconfig, _ := ctx.Value(KubeconfigKey).(string); kubeconfig != "" {
+		env = append(env, "KUBECONFIG="+kubeconfig)
+	}
 
 	// Use the injected executor, or fallback to local if not set (e.g. for global instance)
 	executor := t.executor
@@ -149,8 +155,9 @@ func (t *CustomTool) Run(ctx context.Context, args map[string]any) (any, error) 
 		executor = sandbox.NewLocalExecutor()
 	}
 
-	// Execute the command
-	return executor.Execute(ctx, command, env, workDir)
+	// Route through the shared wrapper so custom tools get the default
+	// timeout (a blocking custom command used to hang the turn forever).
+	return ExecuteWithStreamingHandling(ctx, executor, command, workDir, env, nil)
 }
 
 // CheckModifiesResource determines if the command modifies resources
