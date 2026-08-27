@@ -1822,3 +1822,28 @@ func TestAutoCompactOnContextLengthError(t *testing.T) {
 		t.Error("history was not compacted during recovery")
 	}
 }
+
+func TestToolCallLoopDetection(t *testing.T) {
+	a := &Agent{}
+	call := []gollm.FunctionCall{{ID: "1", Name: "kubectl", Arguments: map[string]any{"command": "get pods"}}}
+
+	if a.detectToolCallLoop(call) {
+		t.Fatal("first call must not be a loop")
+	}
+	a.detectToolCallLoop(call) // 2nd
+	warned := len(a.currChatContent) > 0
+	a.detectToolCallLoop(call) // 3rd → warning observation
+	if !warned && len(a.currChatContent) == 0 {
+		t.Error("expected a warning observation on the 3rd identical call")
+	}
+	a.detectToolCallLoop(call) // 4th
+	if !a.detectToolCallLoop(call) {
+		t.Error("5th identical call must be reported as a loop")
+	}
+
+	// A different call resets the counter.
+	other := []gollm.FunctionCall{{ID: "2", Name: "kubectl", Arguments: map[string]any{"command": "get svc"}}}
+	if a.detectToolCallLoop(other) {
+		t.Error("a different call must reset the loop counter")
+	}
+}
