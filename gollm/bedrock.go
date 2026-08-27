@@ -512,10 +512,13 @@ func (c *bedrockChat) SetFunctionDefinitions(functions []*FunctionDefinition) er
 		tools = append(tools, &types.ToolMemberToolSpec{Value: toolSpec})
 	}
 
+	// ToolChoice MUST NOT be Any: that forbids the model from ever answering
+	// with text, but the agent ends a turn precisely when the model replies
+	// without tool calls — so every Bedrock turn ran to the iteration cap.
 	c.toolConfig = &types.ToolConfiguration{
 		Tools: tools,
-		ToolChoice: &types.ToolChoiceMemberAny{
-			Value: types.AnyToolChoice{},
+		ToolChoice: &types.ToolChoiceMemberAuto{
+			Value: types.AutoToolChoice{},
 		},
 	}
 
