@@ -1532,12 +1532,26 @@ func (c *Agent) compactConversation(ctx context.Context) (answer string, handled
 
 	// Build a plain-text transcript of the conversation, keeping at most the
 	// last ~100KB so the summarization request stays a reasonable size.
+	// Ephemeral/display-only messages (thinking, /help output) are excluded;
+	// tool calls and results render explicitly so actions taken survive.
 	const maxTranscriptBytes = 100 * 1024
 	var transcript strings.Builder
 	for _, msg := range messages {
-		text, ok := msg.Payload.(string)
-		if !ok {
-			text = fmt.Sprintf("%v", msg.Payload)
+		if msg.Ephemeral {
+			continue
+		}
+		var text string
+		switch msg.Type {
+		case api.MessageTypeToolCallRequest:
+			text = "TOOL CALL: " + fmt.Sprintf("%v", msg.Payload)
+		case api.MessageTypeToolCallResponse:
+			text = "TOOL RESULT: " + fmt.Sprintf("%v", msg.Payload)
+		default:
+			t, ok := msg.Payload.(string)
+			if !ok {
+				continue // never dump non-text payloads as Go struct syntax
+			}
+			text = t
 		}
 		text = strings.TrimSpace(text)
 		if text == "" {
@@ -1547,7 +1561,12 @@ func (c *Agent) compactConversation(ctx context.Context) (answer string, handled
 	}
 	conversation := transcript.String()
 	if len(conversation) > maxTranscriptBytes {
-		conversation = conversation[len(conversation)-maxTranscriptBytes:]
+		// Cut on a line boundary (a byte cut can slice mid-rune/mid-line).
+		cut := len(conversation) - maxTranscriptBytes
+		if i := strings.Index(conversation[cut:], "\n"); i >= 0 {
+			cut += i + 1
+		}
+		conversation = conversation[cut:]
 	}
 
 	// Surface an ephemeral status message so the user sees the compact is
@@ -1573,8 +1592,20 @@ func (c *Agent) compactConversation(ctx context.Context) (answer string, handled
 	}()
 
 	completion, err := c.LLM.GenerateCompletion(runCtx, &gollm.CompletionRequest{
-		Model:  c.Model,
-		Prompt: "Summarize this conversation concisely for continuing the task. Keep key facts, decisions, and current state:\n\n" + conversation,
+		Model: c.Model,
+		Prompt: `Summarize this Kubernetes debugging/operations conversation so the task can continue without losing state.
+
+Preserve EXACTLY, as structured sections:
+- GOAL: what the user is trying to accomplish
+- ACTIONS TAKEN: every command/tool call run and its outcome (names, namespaces, resource names verbatim)
+- ERRORS: errors hit and how they were resolved
+- CURRENT STATE: what exists now (resources changed, pending operations)
+- NEXT STEPS: what was about to happen
+
+Be precise, not brief: exact resource names and commands matter more than brevity.
+
+Conversation:
+` + conversation,
 	})
 	if err != nil {
 		if runCtx.Err() != nil {
@@ -1594,8 +1625,12 @@ func (c *Agent) compactConversation(ctx context.Context) (answer string, handled
 	}
 	c.sessionMu.Unlock()
 
-	// Seed the compacted history with the summary as a model message.
-	c.addMessage(api.MessageSourceModel, api.MessageTypeText, "Previous conversation summary:\n\n"+summary)
+	// Seed the compacted history with the summary as a USER message: a
+	// model-role first message breaks providers that require the
+	// conversation to start with a user turn (Anthropic), and elsewhere the
+	// summary reads as "the model's own prior utterance" instead of
+	// instructions to continue from.
+	c.addMessage(api.MessageSourceUser, api.MessageTypeText, "Here is a summary of our conversation so far; continue the task from it:\n\n"+summary)
 
 	c.sessionMu.Lock()
 	if err := c.llmChat.Initialize(c.Session.ChatMessageStore.ChatMessages()); err != nil {

@@ -1086,8 +1086,8 @@ func TestCompactConversation(t *testing.T) {
 		t.Fatalf("expected history replaced by a single summary message, got %d", len(messages))
 	}
 	payload, ok := messages[0].Payload.(string)
-	if !ok || messages[0].Source != api.MessageSourceModel ||
-		!strings.Contains(payload, "Previous conversation summary:") || !strings.Contains(payload, summary) {
+	if !ok || messages[0].Source != api.MessageSourceUser ||
+		!strings.Contains(payload, "summary of our conversation") || !strings.Contains(payload, summary) {
 		t.Errorf("unexpected summary message: %+v", messages[0])
 	}
 
